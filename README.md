@@ -1,9 +1,6 @@
 # zcash-sdk-kmp
 
-Kotlin Multiplatform Zcash SDK for pcash, built on zkool's Rust core (`rlz`) instead of
-the ECC Android SDK.
-
-Ticket: MOBILE-738.
+Kotlin Multiplatform Zcash SDK, built on zkool's Rust core (`rlz`).
 
 ## Why not the ECC SDK
 

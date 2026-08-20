@@ -14,25 +14,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: linux-x64
+          - os: windows-2025
+            artifact: windows-x64
+          - os: macos-26
+            artifact: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
         with:
-          java-version: '21'
-          distribution: 'temurin'
+          java-version: "21"
+          distribution: temurin
           cache: gradle
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-
-      - run: chmod +x gradlew
-
-      # Host target only: the JNI bridge for desktop needs no Android NDK.
-      - name: Kotlin tests
+      - name: Test desktop target
+        shell: bash
         run: ./gradlew :zcash-sdk:desktopTest --console=plain
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact }}
+          path: zcash-sdk/build/rust/desktopResources/native
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install NDK and cargo-ndk
+        run: |
+          yes | sdkmanager --install "ndk;27.0.12077973"
+          cargo install cargo-ndk --locked
+      # Same command JitPack runs, so a green build here means the release is publishable.
+      - name: Publish to Maven local
+        run: ./gradlew :zcash-sdk:publishToMavenLocal --console=plain
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: aar
+          path: zcash-sdk/build/outputs/aar
+          if-no-files-found: error
