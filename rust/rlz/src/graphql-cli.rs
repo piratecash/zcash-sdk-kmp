@@ -1,0 +1,244 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+use clap::Parser;
+use figment::providers::{Format, Serialized, Toml};
+use figment::Figment;
+use jsonwebtoken::{DecodingKey, Validation};
+use juniper::RootNode;
+use juniper_graphql_ws::ConnectionConfig;
+use rlz::api::coin::Coin;
+use rlz::graphql::jwt::{AuthError, Claims};
+use rlz::graphql::mutation::run_mempool;
+use rlz::graphql::{mutation::Mutation, query::Query, subs::Subscription, Context};
+use serde::{Deserialize, Serialize};
+use warp::Filter;
+
+type Schema = RootNode<Query, Mutation, Subscription>;
+
+/// Validate JWT token and return claims, or AuthError if invalid
+fn validate_jwt(token: &str, decoding_key: &DecodingKey) -> Result<Claims, AuthError> {
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
+    validation.validate_exp = true;
+    jsonwebtoken::decode::<Claims>(token, decoding_key, &validation)
+        .map(|data| data.claims)
+        .map_err(|_| AuthError)
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Parser, Serialize, Deserialize, Debug)]
+pub struct Config {
+    #[clap(short, long, value_parser)]
+    pub config_path: Option<String>,
+    #[clap(short, long, value_parser)]
+    pub db_path: Option<String>,
+    #[clap(short, long, value_parser)]
+    pub lwd_url: Option<String>,
+    #[clap(short, long, value_parser)]
+    pub port: Option<u16>,
+    #[clap(short, long, value_parser, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub no_mempool: Option<bool>,
+    /// Use zebrad/zcashd JSON-RPC backend instead of lightwalletd gRPC.
+    /// When set, the --lwd-url should point to the zebra RPC endpoint.
+    #[clap(short = 'Z', long, value_parser, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub zebra: Option<bool>,
+    // Note: Once set in a config file, jwt_public_key_file
+    // cannot be unset by a later config source because
+    // None means skip
+    /// Coin type: 0=mainnet, 1=testnet, 2=regtest, 3=ZSA regtest.
+    /// Overrides auto-detection from database filename.
+    #[clap(short = 'C', long, value_parser)]
+    pub coin: Option<u8>,
+    #[clap(short, long, value_parser)]
+    pub jwt_public_key_file: Option<String>,
+    #[clap(long, value_parser)]
+    pub decode_tx: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
+    // Without an EnvFilter the subscriber is pinned at INFO and RUST_LOG is
+    // silently ignored, so no debug! output from the sync path is ever visible.
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .compact()
+        .finish();
+    let c = Config::parse();
+    let config_path = c.config_path.clone().unwrap_or("zkool.toml".to_string());
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    let config: Config = Figment::new()
+        .merge(Toml::file(&config_path))
+        .merge(Serialized::defaults(c))
+        .extract()?;
+    let Config {
+        db_path,
+        lwd_url,
+        port,
+        jwt_public_key_file,
+        no_mempool,
+        zebra,
+        coin,
+        decode_tx,
+        ..
+    } = config;
+
+    if let Some(hex) = decode_tx {
+        use zcash_primitives::transaction::OrchardBundle;
+        use zcash_primitives::transaction::Transaction;
+        use zcash_protocol::consensus::BranchId;
+        let bytes = hex::decode(hex.trim())?;
+        for branch in [
+            BranchId::Nu6_3,
+            BranchId::Nu6_2,
+            BranchId::Nu6,
+            BranchId::Nu5,
+        ] {
+            if let Ok(tx) = Transaction::read(&mut &bytes[..], branch) {
+                let txid = tx.txid();
+                eprintln!("TXID: {}", hex::encode(txid.as_ref()));
+                eprintln!("Branch: {branch:?}");
+                eprintln!("Version: {:?}", tx.version());
+                eprintln!("Consensus branch: {:?}", tx.consensus_branch_id());
+                eprintln!("Transparent: {}", tx.transparent_bundle().is_some());
+                eprintln!("Sapling: {}", tx.sapling_bundle().is_some());
+                let oa = tx
+                    .orchard_bundle()
+                    .map(|b| match b {
+                        OrchardBundle::OrchardVanilla(b) => b.actions().len(),
+                        OrchardBundle::OrchardZSA(b) => b.actions().len(),
+                    })
+                    .unwrap_or(0);
+                let iw = tx
+                    .ironwood_bundle()
+                    .map(|b| (b.actions().iter().count(), b.flags().clone()));
+                eprintln!("Orchard actions: {oa}");
+                if let Some((count, flags)) = iw {
+                    eprintln!("Ironwood actions: {count}, flags: {flags:?}");
+                } else {
+                    eprintln!("Ironwood: none");
+                }
+                break;
+            }
+        }
+        return Ok(());
+    }
+    let db_path = db_path.unwrap_or("zkool.db".to_string());
+    let lwd_url = lwd_url.unwrap_or("https://zec.rocks".to_string());
+    let port = port.unwrap_or(8000);
+    let no_mempool = no_mempool.unwrap_or_default();
+    let zebra = zebra.unwrap_or_default();
+
+    let decoding_key = jwt_public_key_file
+        .map(|path| {
+            let pem = std::fs::read_to_string(&path)?;
+            Ok::<_, anyhow::Error>(DecodingKey::from_ec_pem(pem.as_bytes())?)
+        })
+        .transpose()?;
+    if decoding_key.is_none() {
+        tracing::warn!("Server is running WITHOUT authentication. Everyone has full access.");
+    }
+    let decoding_key = Arc::new(decoding_key);
+
+    // Note: To generate a pk/sk pair
+    // sk: openssl ecparam -name prime256v1 -genkey -noout -out private.pem
+    // pk: openssl ec -in private.pem -pubout -out public.pem
+    // convert key format: openssl pkcs8 -topk8 -nocrypt -in private.pem -out private_p8.pem
+    // issue jwt: jwt encode --secret @private_p8.pem --alg ES256 --exp=<epoch secs> --sub=<account id> '{"write": true}'
+
+    // Download Sapling proving parameters to the default location
+    // (typically $HOME/.zcash-params/) if they are not already on disk.
+    let sapling_status = rlz::api::sapling::check_sapling_params();
+    if !sapling_status.downloaded {
+        tracing::info!("Sapling parameters not found, downloading …");
+        rlz::api::sapling::download_sapling_params().await?;
+        tracing::info!("Sapling parameters downloaded successfully");
+    }
+
+    let server_type: u8 = if zebra { 1 } else { 0 };
+    tracing::info!("db_path {db_path} lwd_url {lwd_url} port {port} zebra {zebra}");
+    let coin = Coin::new(coin)
+        .open_database(db_path, None)
+        .await?
+        .set_lwd(server_type, lwd_url)?;
+
+    let context = Context::new(coin);
+    if !no_mempool {
+        tokio::spawn(run_mempool(context.clone()));
+    }
+
+    let schema = Schema::new(Query {}, Mutation {}, Subscription {});
+
+    let ctx = context.clone();
+    let dk = Arc::clone(&decoding_key); // For HTTP
+    let context_extractor = warp::header::optional::<String>("authorization").and_then(
+        move |auth_header: Option<String>| {
+            let decoding_key = Arc::clone(&dk);
+            let base_ctx = ctx.clone();
+            async move {
+                let token = auth_header
+                    .and_then(|h| h.strip_prefix("Bearer ").map(str::trim).map(String::from));
+                let ctx = match (&*decoding_key, token) {
+                    (Some(key), Some(t)) => Context {
+                        auth: Some(validate_jwt(&t, key).map_err(warp::reject::custom)?),
+                        ..base_ctx
+                    },
+                    (Some(_), None) => return Err(warp::reject::custom(AuthError)),
+                    (None, _) => base_ctx,
+                };
+                Ok::<_, warp::reject::Rejection>(ctx)
+            }
+        },
+    );
+
+    let schema = Arc::new(schema);
+
+    let routes = (warp::post()
+        .and(warp::path("graphql"))
+        .and(juniper_warp::make_graphql_filter(
+            schema.clone(),
+            context_extractor.clone(),
+        )))
+    .or(
+        warp::path("subscriptions").and(juniper_warp::subscriptions::make_ws_filter(
+            schema,
+            move |variables: juniper::Variables| {
+                let base_ctx = context.clone();
+                let decoding_key = Arc::clone(&decoding_key);
+                async move {
+                    let auth_token = variables
+                        .get("authToken")
+                        .and_then(|v| v.convert::<String>().ok());
+
+                    let ctx = match (&*decoding_key, auth_token) {
+                        (Some(key), Some(token)) => Context {
+                            auth: Some(validate_jwt(&token, key)?),
+                            ..base_ctx
+                        },
+                        (Some(_), None) => return Err(AuthError),
+                        (None, _) => base_ctx,
+                    };
+
+                    Ok::<_, AuthError>(ConnectionConfig::new(ctx))
+                }
+            },
+        )),
+    )
+    .or(warp::get()
+        .and(warp::path("graphiql"))
+        .and(juniper_warp::graphiql_filter(
+            "/graphql",
+            Some("/subscriptions"),
+        )));
+
+    tracing::info!("Listening on 0.0.0.0:{port}");
+    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+
+    Ok(())
+}

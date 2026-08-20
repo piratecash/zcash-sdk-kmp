@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tab_balance">Balance</string>
+    <string name="tab_transactions">Transactions</string>
+    <string name="tab_send">Send</string>
+    <string name="tab_receive">Receive</string>
+
+    <string name="needs_seed">Seed phrase is not set. Add zcash.words to local.properties and rebuild.</string>
+    <string name="opening_wallet">Opening the wallet…</string>
+    <string name="error_open_failed">Could not open the wallet</string>
+    <string name="error_empty_address">Enter the recipient address</string>
+    <string name="error_invalid_amount">Invalid amount</string>
+
+    <string name="amount_zec">%1$s ZEC</string>
+
+    <string name="balance_total">Total</string>
+    <string name="balance_sync">Sync</string>
+    <string name="balance_chain_tip">Chain tip</string>
+    <string name="balance_account">Account</string>
+    <string name="action_sync">Sync</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_refresh">Refresh</string>
+    <string name="action_reset">Reset</string>
+    <string name="sync_stopped">Stopped</string>
+    <string name="sync_connecting">Connecting…</string>
+    <string name="sync_progress">%1$s / %2$s</string>
+    <string name="sync_synced">Synced</string>
+    <string name="sync_failed">Error: %1$s</string>
+
+    <string name="transactions_empty">No transactions yet — run a sync.</string>
+    <string name="transaction_block">block %1$s · %2$s…</string>
+    <string name="transaction_in_mempool">in mempool</string>
+
+    <string name="receive_not_loaded">Addresses are not loaded yet.</string>
+    <string name="address_unified">Unified</string>
+    <string name="address_sapling">Sapling</string>
+    <string name="address_orchard">Orchard</string>
+    <string name="address_transparent">Transparent</string>
+    <string name="action_copy">Copy</string>
+
+    <string name="send_address_label">Recipient address</string>
+    <string name="send_amount_label">Amount, ZEC</string>
+    <string name="send_review">Review</string>
+    <string name="send_reviewing">Checking…</string>
+    <string name="send_failed">Not sent: %1$s</string>
+    <string name="send_sent">Sent. txid: %1$s</string>
+    <string name="send_retry">Retry</string>
+    <string name="send_confirm">Send</string>
+    <string name="send_sending">Sending…</string>
+    <string name="plan_title">Transaction plan</string>
+    <string name="plan_recipient">Recipient</string>
+    <string name="plan_amount">Amount</string>
+    <string name="plan_fee">Fee</string>
+    <string name="plan_height">Height</string>
+    <string name="plan_input">Input · %1$s</string>
+    <string name="plan_output">Output · %1$s</string>
+</resources>

@@ -1,0 +1,12 @@
+jdk:
+  - openjdk21
+
+# The Rust bridge is cross-compiled during the Gradle build, so the toolchain and the NDK
+# have to exist before it starts. Chained in one command each: JitPack runs every line in
+# a fresh shell, so exports do not survive between them.
+before_install:
+  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && $HOME/.cargo/bin/rustup target add aarch64-linux-android armv7-linux-androideabi && $HOME/.cargo/bin/cargo install cargo-ndk --locked
+  - yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.0.12077973" || yes | sdkmanager --install "ndk;27.0.12077973"
+
+install:
+  - ./gradlew :zcash-sdk:publishToMavenLocal -PzcashSdk.rustRelease=true --no-daemon

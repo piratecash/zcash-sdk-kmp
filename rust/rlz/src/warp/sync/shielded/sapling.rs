@@ -1,0 +1,78 @@
+use crate::keys::sapling_ivk_nk_for_scope;
+use anyhow::Result;
+use sapling_crypto::{zip32::DiversifiableFullViewingKey, Note, NullifierDerivingKey, SaplingIvk};
+use sqlx::SqliteConnection;
+
+use crate::{
+    lwd::{CompactSaplingOutput, CompactSaplingSpend, CompactTx},
+    Hash32,
+};
+use zcash_trees::{network::Network, types};
+
+use crate::warp::{hasher::SaplingHasher, try_sapling_decrypt};
+
+use super::ShieldedProtocol;
+
+pub struct SaplingProtocol;
+
+impl ShieldedProtocol for SaplingProtocol {
+    type Hasher = SaplingHasher;
+    type IVK = SaplingIvk;
+    type NK = NullifierDerivingKey;
+    type Note = Note;
+    type Spend = CompactSaplingSpend;
+    type Output = CompactSaplingOutput;
+    type IssueAuth = ();
+
+    fn extract_inputs(tx: &CompactTx) -> &Vec<Self::Spend> {
+        &tx.spends
+    }
+
+    fn extract_outputs(tx: &CompactTx) -> &Vec<Self::Output> {
+        &tx.outputs
+    }
+
+    fn extract_nf(i: &Self::Spend) -> Hash32 {
+        i.clone().nf.try_into().unwrap()
+    }
+
+    fn extract_cmx(o: &Self::Output) -> Hash32 {
+        o.cmu.clone().try_into().unwrap()
+    }
+
+    async fn extract_ivk(
+        connection: &mut SqliteConnection,
+        account: u32,
+        scope: u8,
+    ) -> Result<Option<(Self::IVK, Self::NK)>> {
+        let vk: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT xvk FROM sapling_accounts WHERE account = ?")
+                .bind(account)
+                .fetch_optional(&mut *connection)
+                .await?;
+        let keys = vk.map(|(vk,)| {
+            let vk = DiversifiableFullViewingKey::from_bytes(&vk.try_into().unwrap()).unwrap();
+            let (ivk, nk) = sapling_ivk_nk_for_scope(scope, &vk);
+            (ivk, nk)
+        });
+        Ok(keys)
+    }
+
+    fn try_decrypt(
+        network: &Network,
+        account: u32,
+        scope: u8,
+        ivk: &Self::IVK,
+        height: u32,
+        ivtx: u32,
+        vout: u32,
+        output: &Self::Output,
+    ) -> Result<Option<(sapling_crypto::Note, types::Note)>> {
+        try_sapling_decrypt(network, account, scope, ivk, height, ivtx, vout, output)
+    }
+
+    fn derive_nf(nk: &Self::NK, position: u32, note: &mut Self::Note) -> Result<Hash32> {
+        let nf = note.nf(nk, position as u64);
+        Ok(nf.0)
+    }
+}

@@ -1,0 +1,323 @@
+use std::collections::BTreeMap;
+
+use crate::{api::pay::PcztPackage, Client};
+
+use crate::api::coin::Network;
+use anyhow::Result;
+use orchard::note::AssetBase;
+use pczt::{roles::verifier::Verifier, Pczt};
+use pool::PoolMask;
+use serde::{Deserialize, Serialize};
+use tracing::{info, span, Level};
+use zcash_keys::encoding::AddressCodec as _;
+use zcash_note_encryption::Domain;
+use zcash_protocol::consensus::BranchId;
+use zcash_transparent::address::TransparentAddress;
+
+pub mod error;
+pub mod fee;
+pub mod plan;
+pub mod pool;
+pub mod prepare;
+pub mod select;
+pub mod solve;
+
+#[derive(Clone, Default, Debug)]
+pub struct Recipient {
+    pub address: String,
+    pub amount: u64,
+    pub pools: Option<u8>,
+    pub user_memo: Option<String>,
+    pub memo_bytes: Option<Vec<u8>>,
+    pub price: Option<f64>,
+    pub asset_base: Vec<u8>,
+    pub asset_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecipientState {
+    pub recipient: Recipient,
+    pub remaining: u64,
+    pub pool_mask: PoolMask,
+    pub asset_base: Vec<u8>,
+}
+
+impl RecipientState {
+    pub fn new(recipient: Recipient) -> Result<Self> {
+        let amount = recipient.amount;
+        let pool_mask = PoolMask::from_address(&recipient.address)?.trim_transparent()?;
+        let pm = pool_mask.0;
+        assert!(pm == 1 || pm == 2 || pm == 12 || pm == 14);
+        let asset_base = if recipient.asset_base.is_empty() {
+            [0u8; 32].to_vec()
+        } else {
+            recipient.asset_base.clone()
+        };
+        Ok(Self {
+            recipient,
+            remaining: amount,
+            pool_mask,
+            asset_base,
+        })
+    }
+
+    pub fn for_fee(pool: u8, amount: u64) -> Self {
+        Self {
+            recipient: Recipient {
+                amount,
+                ..Recipient::default()
+            },
+            remaining: amount,
+            pool_mask: PoolMask::from_pool(pool),
+            asset_base: [0u8; 32].to_vec(),
+        }
+    }
+
+    pub fn to_inner(self) -> Recipient {
+        self.recipient
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InputNote {
+    pub id: u32,
+    pub height: u32,
+    pub amount: u64,
+    pub remaining: u64,
+    pub pool: u8,
+    pub id_asset: Option<u32>,
+    pub asset_base: Vec<u8>,
+    pub taddress: Option<u32>,
+}
+
+impl InputNote {
+    pub fn is_used(&self) -> bool {
+        self.remaining != self.amount
+    }
+}
+
+use zcash_address::unified::Receiver;
+
+/// A single receiver alternative within a decomposed recipient.
+/// Stores the raw `Receiver` to avoid wasteful encode→decode round-trips.
+#[derive(Clone, Debug)]
+pub struct ReceiverOption {
+    pub receiver: Receiver,
+    pub pool: u8,       // 1=Sapling, 2=Orchard, 3=Ironwood
+    pub remaining: u64, // amount selected from this receiver so far
+}
+
+/// A recipient decomposed into receiver alternatives (OR, not AND).
+/// Coin selection picks exactly one ReceiverOption per recipient.
+#[derive(Clone, Debug)]
+pub struct DecomposedRecipient {
+    pub address: String,
+    pub receiver: ReceiverOption,
+    pub amount: u64,
+    pub remaining: u64,
+    pub memo: Option<String>,
+    pub memo_bytes: Option<Vec<u8>>,
+    pub asset_base: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TxPlan {
+    pub height: u32,
+    pub inputs: Vec<TxPlanIn>,
+    pub outputs: Vec<TxPlanOut>,
+    pub fee: u64,
+    pub can_sign: bool,
+    pub can_broadcast: bool,
+}
+
+fn orchard_asset_name(proprietary: &BTreeMap<String, Vec<u8>>, asset: Option<AssetBase>) -> String {
+    proprietary
+        .get("asset_name")
+        .and_then(|value| String::from_utf8(value.clone()).ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| match asset {
+            Some(asset) if asset != AssetBase::zatoshi() => hex::encode(&asset.to_bytes()[..8]),
+            _ => "ZEC".to_string(),
+        })
+}
+
+fn append_orchard_plan<D: Domain>(
+    bundle: &orchard::pczt::Bundle<D>,
+    inputs: &mut Vec<TxPlanIn>,
+    outputs: &mut Vec<TxPlanOut>,
+    fee: &mut i64,
+) -> Result<()> {
+    for action in bundle.actions() {
+        let output_asset_name =
+            orchard_asset_name(action.output().proprietary(), action.output().asset());
+        // A ZIP-226 split spend is a proof-level padding action derived from
+        // an existing ZSA note, not another wallet input. Showing it here
+        // duplicates the source note in the human-readable transaction plan.
+        if action.spend().rseed_split_note().is_none() {
+            inputs.push(TxPlanIn {
+                pool: 2,
+                amount: action.spend().value().map(|value| value.inner()),
+                asset_name: orchard_asset_name(
+                    action.spend().proprietary(),
+                    action.spend().asset(),
+                ),
+            });
+        }
+        outputs.push(TxPlanOut {
+            pool: 2,
+            amount: action
+                .output()
+                .value()
+                .ok_or_else(|| anyhow::anyhow!("Orchard PCZT output is missing its value"))?
+                .inner(),
+            address: action
+                .output()
+                .user_address()
+                .as_ref()
+                .cloned()
+                .unwrap_or_default(),
+            asset_name: output_asset_name,
+        });
+    }
+    let value_sum: i64 = (*bundle.value_sum())
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Orchard PCZT value sum exceeds i64"))?;
+    *fee += value_sum;
+    Ok(())
+}
+
+impl TxPlan {
+    pub fn from_package(network: &Network, package: &PcztPackage) -> Result<Self> {
+        let mut inputs = vec![];
+        let mut outputs = vec![];
+
+        let pczt = Pczt::parse(&package.pczt)
+            .map_err(|error| anyhow::anyhow!("Failed to parse PCZT: {error:?}"))?;
+        let is_zsa = BranchId::try_from(*pczt.global().consensus_branch_id())
+            .is_ok_and(|branch_id| branch_id == BranchId::Nu7);
+        let height = *pczt.global().expiry_height();
+        let mut fee = 0i64;
+        let verifier = Verifier::new(pczt);
+
+        let verifier = verifier
+            .with_transparent(|bundle| {
+                for i in bundle.inputs().iter() {
+                    let value = i.value().into_u64();
+                    inputs.push(TxPlanIn {
+                        pool: 0,
+                        amount: Some(value),
+                        asset_name: "ZEC".to_string(),
+                    });
+                    fee += value as i64;
+                }
+                for o in bundle.outputs().iter() {
+                    let script_pubkey = o.script_pubkey();
+                    let address = TransparentAddress::from_script_pubkey(script_pubkey).unwrap();
+                    outputs.push(TxPlanOut {
+                        pool: 0,
+                        amount: o.value().into_u64(),
+                        address: address.encode(network),
+                        asset_name: "ZEC".to_string(),
+                    });
+                    fee -= o.value().into_u64() as i64;
+                }
+                Ok::<_, pczt::roles::verifier::TransparentError<()>>(())
+            })
+            .unwrap();
+
+        let verifier = verifier
+            .with_sapling(|bundle| {
+                for spend in bundle.spends().iter() {
+                    inputs.push(TxPlanIn {
+                        pool: 1,
+                        amount: spend.value().map(|v| v.inner()),
+                        asset_name: "ZEC".to_string(),
+                    });
+                }
+                for o in bundle.outputs().iter() {
+                    outputs.push(TxPlanOut {
+                        pool: 1,
+                        amount: o.value().unwrap().inner(),
+                        address: o.user_address().as_ref().cloned().unwrap_or_default(),
+                        asset_name: "ZEC".to_string(),
+                    });
+                }
+                fee += bundle.value_sum().to_raw() as i64;
+                Ok::<_, pczt::roles::verifier::SaplingError<()>>(())
+            })
+            .unwrap();
+
+        let verifier = if is_zsa {
+            verifier.with_orchard_zsa(|bundle| {
+                append_orchard_plan(bundle, &mut inputs, &mut outputs, &mut fee)
+                    .map_err(pczt::roles::verifier::OrchardError::Custom)
+            })
+        } else {
+            verifier.with_orchard(|bundle| {
+                append_orchard_plan(bundle, &mut inputs, &mut outputs, &mut fee)
+                    .map_err(pczt::roles::verifier::OrchardError::Custom)
+            })
+        }
+        .map_err(|error| anyhow::anyhow!("Failed to verify Orchard PCZT: {error:?}"))?;
+
+        let _verifier = verifier
+            .with_ironwood(|bundle| {
+                for a in bundle.actions().iter() {
+                    // Ironwood only supports ZEC (no ZSA tokens).
+                    inputs.push(TxPlanIn {
+                        pool: 3,
+                        amount: a.spend().value().map(|v| v.inner()),
+                        asset_name: "ZEC".to_string(),
+                    });
+                    outputs.push(TxPlanOut {
+                        pool: 3,
+                        amount: a.output().value().expect("value").inner(),
+                        address: a
+                            .output()
+                            .user_address()
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_default(),
+                        asset_name: "ZEC".to_string(),
+                    });
+                }
+                let f: i64 = (*bundle.value_sum()).try_into().unwrap();
+                fee += f;
+                Ok::<_, pczt::roles::verifier::OrchardError<()>>(())
+            })
+            .unwrap();
+
+        Ok(TxPlan {
+            height,
+            inputs,
+            outputs,
+            fee: fee as u64,
+            can_sign: package.can_sign,
+            can_broadcast: package.can_broadcast,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TxPlanIn {
+    pub pool: u8,
+    pub amount: Option<u64>,
+    pub asset_name: String, // "ZEC" for ZEC, asset name for ZSA
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TxPlanOut {
+    pub pool: u8,
+    pub amount: u64,
+    pub address: String,
+    pub asset_name: String, // "ZEC" for ZEC, asset name for ZSA
+}
+
+pub async fn send(client: &mut Client, height: u32, data: &[u8]) -> Result<String> {
+    let span = span!(Level::INFO, "transaction");
+    let txid = client.post_transaction(height, data).await?;
+    span.in_scope(|| {
+        info!("TXID: {}", txid);
+    });
+    Ok(txid)
+}

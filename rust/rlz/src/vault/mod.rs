@@ -1,0 +1,91 @@
+use anyhow::Result;
+
+// #[cfg(flutter)]
+pub mod crypto;
+#[cfg(feature = "flutter")]
+mod dart;
+
+#[async_trait]
+pub trait VaultIO {
+    /// Append a serialized log entry to the log file.
+    async fn append(&self, entry_bytes: Vec<u8>) -> Result<()>;
+}
+
+#[derive(Debug)]
+pub struct Vault<IO: VaultIO> {
+    pub(crate) io_handler: IO,
+}
+
+impl<IO: VaultIO> Vault<IO> {
+    pub async fn set_master_password(
+        old_password: Option<String>,
+        _new_password: String,
+        old_bytes: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        match (old_password, old_bytes) {
+            (None, None) => {
+                // New vault
+                return crypto::derive_master_key(&_new_password);
+            }
+            (Some(_old_password), Some(_bytes)) => {
+                // Existing vault
+                // Decrypt current vault with old_password
+                // Encrypt with new password
+            }
+            _ => unreachable!(),
+        }
+        Ok(vec![])
+    }
+
+    pub async fn register_device(
+        &self,
+        init_bytes: Vec<u8>,
+        master_password: String,
+        device_id_str: String,
+        prf_output: [u8; 32],
+    ) -> Result<()> {
+        let entry_bytes =
+            crypto::register_device(&init_bytes, &master_password, &device_id_str, prf_output)?;
+        self.io_handler.append(entry_bytes).await?;
+        Ok(())
+    }
+
+    pub async fn store_account(
+        &self,
+        timestamp: u32,
+        name: String,
+        seed: String,
+        aindex: u32,
+        use_internal: bool,
+        birth_height: u32,
+        pk: Vec<u8>,
+    ) -> Result<()> {
+        let mnemonic = bip39::Mnemonic::parse_normalized(&seed)?;
+        let (entropy_arr, entropy_len) = mnemonic.to_entropy_array();
+        if entropy_len == 32 {
+            let mut entropy = [0u8; 32];
+            entropy.copy_from_slice(&entropy_arr[..entropy_len]);
+
+            let xpk = x25519_dalek::PublicKey::from(
+                <[u8; 32]>::try_from(pk).map_err(|_| anyhow::anyhow!("Invalid pk length"))?,
+            );
+
+            let account = crypto::AccountPayload {
+                timestamp,
+                name,
+                entropy,
+                aindex,
+                use_internal,
+                birth_height,
+            };
+            let entry_bytes = crypto::encrypt_account(account, xpk)?;
+
+            self.io_handler.append(entry_bytes).await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "flutter")]
+pub use dart::DartVaultIO;
+use tonic::async_trait;

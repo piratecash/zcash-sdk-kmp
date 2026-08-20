@@ -1,0 +1,114 @@
+pub const COST_PER_ACTION: u64 = 5000;
+
+/// ZIP-317 creation cost per new asset, in equivalent logical actions.
+/// Zebra currently uses 0; this matches the upstream `FeeRule::standard()`
+/// constant but may diverge on networks where zebra configures it differently.
+pub const CREATION_COST: u64 = 0;
+
+#[derive(Clone, Default, Debug)]
+pub struct FeeManager {
+    pub num_inputs: [u8; 4],
+    pub num_outputs: [u8; 4],
+    /// Logical actions contributed by the issue bundle (ZIP-317).
+    /// Equal to `total_issue_note_count + CREATION_COST * asset_creation_count`.
+    pub issuance_actions: u64,
+    /// In migration mode (O→O self-sends), the Orchard V3 bundle disables
+    /// cross-address transfers, so actions are `spends + outputs` instead
+    /// of `max(spends, outputs)`.
+    pub migration: bool,
+}
+
+impl FeeManager {
+    // Add an input
+    pub fn add_input(&mut self, pool: u8) {
+        self.num_inputs[pool as usize] += 1;
+    }
+
+    // Add an output
+    pub fn add_output(&mut self, pool: u8) {
+        self.num_outputs[pool as usize] += 1;
+    }
+
+    // Remove an output
+    pub fn remove_output(&mut self, pool: u8) {
+        self.num_outputs[pool as usize] -= 1;
+    }
+
+    /// Add logical actions from the issue bundle.
+    /// `issue_note_count` — total number of issue notes across all issue actions.
+    /// `asset_creation_count` — number of new assets being created (first issuance).
+    pub fn add_issuance_actions(&mut self, issue_note_count: u64, asset_creation_count: u64) {
+        self.issuance_actions += issue_note_count + CREATION_COST * asset_creation_count;
+    }
+
+    // Return the current amount of fees
+    pub fn fee(&self) -> u64 {
+        let t = self.num_inputs[0].max(self.num_outputs[0]);
+        let s = if self.num_inputs[1] > 0 || self.num_outputs[1] > 0 {
+            // if any sapling, # bundle outputs = max(2, # outputs)
+            // if any input, # bundle inputs = max(1, # inputs)
+            // # logical sapling = max(# bundle in, bundle out) =
+            // max(2, # inputs, # outputs)
+            // I O -> BI BO -> L
+            // 0 0 -> 0  0  -> 0
+            // 1 0 -> 1  2  -> 2
+            // 0 1 -> 0  2  -> 2
+            // 1 1 -> 1  2  -> 2
+            // 2 1 -> 2  1  -> 2
+            // etc.
+            //
+            // basically it is max(# inputs, # outputs, 2) unless there
+            // is no input or output
+            self.num_inputs[1].max(self.num_outputs[1]).max(2)
+        } else {
+            0
+        };
+        let o = if self.num_inputs[2] > 0 || self.num_outputs[2] > 0 {
+            if self.migration {
+                (self.num_inputs[2] as u64 + self.num_outputs[2] as u64).max(2)
+            } else {
+                self.num_inputs[2].max(self.num_outputs[2]).max(2) as u64
+            }
+        } else {
+            0
+        };
+        let i = if self.num_inputs[3] > 0 || self.num_outputs[3] > 0 {
+            // Ironwood has same padding as Orchard: min 2 actions
+            self.num_inputs[3].max(self.num_outputs[3]).max(2)
+        } else {
+            0
+        };
+        let f = (t as u64 + s as u64 + o + i as u64).max(2); // minimum 2 logical actions
+                                                             // Issuance actions are counted by the builder as orchard actions,
+                                                             // so we don't add them separately here. The issuance counts are
+                                                             // informational for logging only.
+        f as u64 * COST_PER_ACTION
+    }
+
+    #[allow(dead_code)]
+    fn min_actions_padding(a: u8) -> u8 {
+        if a == 0 {
+            0
+        } else {
+            a.max(2)
+        }
+    }
+}
+
+impl std::fmt::Display for FeeManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fee: {}:{} {}:{} {}:{} {}:{} issuance:{}",
+            self.num_inputs[0],
+            self.num_outputs[0],
+            self.num_inputs[1],
+            self.num_outputs[1],
+            self.num_inputs[2],
+            self.num_outputs[2],
+            self.num_inputs[3],
+            self.num_outputs[3],
+            self.issuance_actions,
+        )
+    }
+}

@@ -1,0 +1,235 @@
+use anyhow::{anyhow, Result};
+use serde_json::Value;
+use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
+use std::time::Duration;
+
+fn coingecko_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("zkool/1.0")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+async fn get_historical_prices_all(currency: &str, api: &str) -> Result<Vec<PriceQuote>> {
+    // 1, 90 and 365 are the max day ranges per interval
+    let mut pqs = get_historical_prices(1, currency, api).await?;
+    pqs.extend(get_historical_prices(90, currency, api).await?);
+    pqs.extend(get_historical_prices(365, currency, api).await?);
+    pqs.sort_by_key(|pq| pq.time);
+    Ok(pqs)
+}
+
+async fn get_historical_prices(days: u32, currency: &str, api: &str) -> Result<Vec<PriceQuote>> {
+    let historical_price_url = format!(
+        "https://api.coingecko.com/api/v3/coins/zcash/market_chart?vs_currency={currency}&days={days}&x_cg_demo_api_key={api}"
+    );
+    let rep: Value = coingecko_client()
+        .get(&historical_price_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let prices = rep
+        .pointer("/prices")
+        .ok_or(anyhow!("No /prices"))?
+        .as_array()
+        .ok_or(anyhow!("prices not array"))?;
+    let mut pqs = vec![];
+    for p in prices {
+        let pt = p.as_array().ok_or(anyhow!("price/time not array"))?;
+        let time = pt[0].as_u64().ok_or(anyhow!("time not int"))? as u64;
+        let price = pt[1].as_f64().ok_or(anyhow!("price not double"))?;
+        let pq = PriceQuote {
+            time: (time / 1000) as u32,
+            price,
+        };
+        pqs.push(pq);
+    }
+
+    Ok(pqs)
+}
+
+async fn fetch_missing_tx_prices(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<Vec<TxUSD>> {
+    let txs = sqlx::query(
+        "SELECT id_tx, time FROM transactions
+            WHERE account = ?1 AND price IS NULL ORDER BY time",
+    )
+    .bind(account)
+    .map(|r: SqliteRow| {
+        let id: u32 = r.get(0);
+        let time: u32 = r.get(1);
+        TxUSD {
+            id,
+            time,
+            price: 0.0,
+        }
+    })
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(txs)
+}
+
+async fn fill_historical_prices(txs: &mut [TxUSD], pqs: &[PriceQuote]) -> Result<()> {
+    assert!(!pqs.is_empty());
+    let mut i = 0;
+    for tx in txs.iter_mut() {
+        loop {
+            let time = if i == pqs.len() {
+                u32::MAX
+            } else {
+                pqs[i].time
+            };
+            if time > tx.time {
+                break;
+            }
+            i += 1;
+        }
+        let pq = if i == 0 { &pqs[0] } else { &pqs[i - 1] };
+        tx.price = pq.price;
+    }
+    Ok(())
+}
+
+pub async fn store_tx_prices(connection: &mut SqliteConnection, txs: &[TxUSD]) -> Result<()> {
+    for tx in txs {
+        sqlx::query("UPDATE transactions SET price = ?2 WHERE id_tx = ?1")
+            .bind(tx.id)
+            .bind(tx.price)
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn fill_missing_tx_prices(
+    connection: &mut SqliteConnection,
+    account: u32,
+    currency: &str,
+    api: &str,
+) -> Result<u32> {
+    let mut txs = fetch_missing_tx_prices(&mut *connection, account).await?;
+    let n = txs.len() as u32;
+    let pqs = get_historical_prices_all(currency, api).await?;
+    fill_historical_prices(&mut txs, &pqs).await?;
+    store_tx_prices(&mut *connection, &txs).await?;
+    Ok(n)
+}
+
+/// Recompute every transaction's price column for a currency change.
+/// `exchange_rate` is the multiplier: new_price = old_price * exchange_rate
+/// (e.g. when changing from USD to EUR at 0.92 EUR per 1 USD, exchange_rate = 0.92).
+/// The currency prop is updated in the same transaction.
+pub async fn update_historical_prices(
+    connection: &mut SqliteConnection,
+    currency: &str,
+    exchange_rate: f64,
+) -> Result<()> {
+    sqlx::query("UPDATE transactions SET price = price * ?1 WHERE price IS NOT NULL")
+        .bind(exchange_rate)
+        .execute(&mut *connection)
+        .await?;
+    // Upsert the currency prop
+    sqlx::query("INSERT OR REPLACE INTO props (key, value) VALUES ('currency', ?1)")
+        .bind(currency)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+pub async fn merge_pending_txs(
+    connection: &mut SqliteConnection,
+    account: u32,
+    height: u32,
+) -> Result<()> {
+    sqlx::query(
+        "WITH upd AS (SELECT t.id_tx, p.price, p.category
+        FROM pending_txs p JOIN transactions t ON p.txid = t.txid
+        WHERE t.account = ?1)
+        UPDATE transactions SET price = upd.price, category = upd.category
+        FROM upd WHERE upd.id_tx = transactions.id_tx",
+    )
+    .bind(account)
+    .execute(&mut *connection)
+    .await?;
+    // delete pending txs that could not be merged for more than 100 blocks
+    // they were probably never mined
+    sqlx::query("DELETE FROM pending_txs WHERE account = ?1 AND height < ?2")
+        .bind(account)
+        .bind(height.saturating_sub(100))
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+pub async fn fetch_category_amounts(
+    connection: &mut SqliteConnection,
+    account: u32,
+    from: Option<u32>,
+    to: Option<u32>,
+) -> Result<Vec<(String, f64, bool)>> {
+    let category_amts = sqlx::query(
+        "SELECT c.name, SUM(value) * price / 1e8 AS amount, income
+        FROM transactions t
+        JOIN categories c ON c.id_category = t.category
+        WHERE account = ?1 AND t.time >= ?2
+        AND t.time < ?3
+        GROUP BY id_category",
+    )
+    .bind(account)
+    .bind(from.unwrap_or(0))
+    .bind(to.unwrap_or(u32::MAX))
+    .map(|r: SqliteRow| {
+        let category: String = r.get(0);
+        let amount: f64 = r.get(1);
+        let income: bool = r.get(2);
+        (category, amount, income)
+    })
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(category_amts)
+}
+
+pub async fn fetch_amounts(
+    connection: &mut SqliteConnection,
+    account: u32,
+    from: Option<u32>,
+    to: Option<u32>,
+    category: u32,
+) -> Result<Vec<(u32, f64)>> {
+    let amounts = sqlx::query(
+        "SELECT time, value * price / 1e8 AS amount
+    FROM transactions t
+    WHERE account = ?1 AND time >= ?2
+    AND time < ?3 AND category = ?4
+    ORDER BY time",
+    )
+    .bind(account)
+    .bind(from.unwrap_or(0))
+    .bind(to.unwrap_or(u32::MAX))
+    .bind(category)
+    .map(|r: SqliteRow| {
+        let time: u32 = r.get(0);
+        let amount: f64 = r.get(1);
+        (time, amount)
+    })
+    .fetch_all(connection)
+    .await?;
+    Ok(amounts)
+}
+
+pub struct PriceQuote {
+    pub time: u32,
+    pub price: f64,
+}
+
+#[derive(Debug)]
+pub struct TxUSD {
+    pub id: u32,
+    pub time: u32,
+    pub price: f64,
+}
