@@ -67,9 +67,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      # Same NDK bootstrap as jitpack.yml: a direct download works on any image,
+      # with or without cmdline-tools.
       - name: Install NDK and cargo-ndk
         run: |
-          yes | sdkmanager --install "ndk;27.0.12077973"
+          curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27-linux.zip
+          unzip -q /tmp/ndk.zip -d "$HOME"
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r27" >> "$GITHUB_ENV"
           cargo install cargo-ndk --locked
       # Same command JitPack runs, so a green build here means the release is publishable.
       - name: Publish to Maven local
