@@ -19,8 +19,13 @@ pub fn generate_seed() -> Result<String> {
 }
 
 /// Hosts that keep the spending key outside the SDK derive it here.
-pub fn derive_spending_key(coin: u8, phrase: &str, aindex: u32) -> Result<Vec<u8>> {
-    account::derive_spending_key(&network_from_coin(coin), phrase, None, aindex)
+pub fn derive_spending_key(
+    coin: u8,
+    phrase: &str,
+    passphrase: Option<&str>,
+    aindex: u32,
+) -> Result<Vec<u8>> {
+    account::derive_spending_key(&network_from_coin(coin), phrase, passphrase, aindex)
 }
 
 #[cfg_attr(feature = "flutter", frb(sync))]

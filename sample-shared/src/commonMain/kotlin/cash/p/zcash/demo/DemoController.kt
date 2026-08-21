@@ -20,6 +20,9 @@ import kotlinx.coroutines.launch
 private const val ACCOUNT_NAME = "demo"
 private const val DATABASE_FILE = "demo.db"
 
+/** Blocks a note must be buried under before it counts as spendable. */
+private const val CONFIRMATIONS = 10
+
 class DemoController(
     private val dataDir: String,
     private val scope: CoroutineScope,
@@ -159,8 +162,12 @@ class DemoController(
                     spendingKey.fill(0)
                 }
                 val raw = wallet.extract(signed)
-                val txid = wallet.broadcast(raw, planned.plan.height)
-                uiState = uiState.copy(send = SendState.Sent(txid), address = "", amount = "")
+                val result = wallet.broadcast(raw, planned.plan.height)
+                if (!result.accepted) {
+                    uiState = uiState.copy(send = SendState.Failed(planned, result.message))
+                    return@runGuarded
+                }
+                uiState = uiState.copy(send = SendState.Sent(result.message), address = "", amount = "")
                 load(wallet, id)
             }
         }
@@ -172,7 +179,7 @@ class DemoController(
 
     private suspend fun load(wallet: ZcashWallet, id: Int) {
         uiState = uiState.copy(
-            balance = wallet.balance(id),
+            balance = wallet.balance(id, confirmations = CONFIRMATIONS),
             addresses = wallet.addresses(id),
             transactions = wallet.transactions(id).sortedByDescending(Transaction::height),
         )

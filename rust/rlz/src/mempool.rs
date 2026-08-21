@@ -21,20 +21,7 @@ use zcash_primitives::transaction::{
 use zcash_protocol::memo::Memo;
 use zcash_transparent::address::TransparentAddress;
 
-#[cfg(feature = "flutter")]
-use crate::frb_generated::StreamSink;
 use crate::{Client, Sink};
-
-#[cfg(feature = "flutter")]
-pub async fn run_mempool(
-    mempool_tx: StreamSink<MempoolMsg>,
-    network: &Network,
-    connection: &mut SqliteConnection,
-    client: &mut Client,
-    cancel_token: CancellationToken,
-) -> Result<()> {
-    run_mempool_impl(mempool_tx, network, connection, client, cancel_token).await
-}
 
 pub async fn run_mempool_impl<S: Sink<MempoolMsg> + Send + 'static>(
     mempool_tx: S,
@@ -102,7 +89,8 @@ pub async fn run_mempool_impl<S: Sink<MempoolMsg> + Send + 'static>(
                 }
                 r = mempool_txs.next() => {
                     match r {
-                        Some((_, tx, len)) => {
+                        Some(Err(e)) => return Err(e).context("mempool_stream"),
+                        Some(Ok((_, tx, len))) => {
                             let txid = tx.txid();
                             let tx_hash = txid.to_string();
                             tracing::debug!("MP {tx_hash}");

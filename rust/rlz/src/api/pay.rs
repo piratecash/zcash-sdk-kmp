@@ -147,10 +147,18 @@ pub fn unpack_transaction(bytes: &[u8]) -> Result<PcztPackage> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn broadcast_transaction(height: u32, tx_bytes: &[u8], c: &Coin) -> Result<String> {
-    let mut client = c.client().await?;
+    Ok(broadcast(height, tx_bytes, c).await?.message)
+}
 
-    let tx = crate::pay::send(&mut client, height, tx_bytes).await?;
-    Ok(tx)
+/// Broadcast keeping the node's verdict: a host that must tell "already in the chain"
+/// from a real rejection needs the error code, not just the message.
+pub async fn broadcast(
+    height: u32,
+    tx_bytes: &[u8],
+    c: &Coin,
+) -> Result<crate::net::BroadcastOutcome> {
+    let mut client = c.client().await?;
+    crate::pay::send(&mut client, height, tx_bytes).await
 }
 
 #[cfg_attr(feature = "flutter", frb(sync))]
@@ -160,10 +168,7 @@ pub fn to_plan(package: &PcztPackage, c: &Coin) -> Result<TxPlan> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn send(height: u32, data: &[u8], c: &Coin) -> Result<String> {
-    let mut client = c.client().await?;
-
-    let tx = crate::pay::send(&mut client, height, data).await?;
-    Ok(tx)
+    Ok(broadcast(height, data, c).await?.message)
 }
 
 #[cfg_attr(feature = "flutter", frb)]

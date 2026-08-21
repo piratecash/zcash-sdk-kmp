@@ -9,7 +9,7 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 use crate::{
     api::{coin::Network, network::LWDInfo},
     lwd::*,
-    net::LwdServer,
+    net::{BroadcastOutcome, LwdServer},
     GRPCClient,
 };
 
@@ -80,7 +80,7 @@ impl LwdServer for GRPCClient {
         Ok((height, tx))
     }
 
-    async fn post_transaction(&mut self, height: u32, tx: &[u8]) -> Result<String> {
+    async fn post_transaction(&mut self, height: u32, tx: &[u8]) -> Result<BroadcastOutcome> {
         let rep = self
             .send_transaction(Request::new(RawTransaction {
                 data: tx.to_vec(),
@@ -88,12 +88,15 @@ impl LwdServer for GRPCClient {
             }))
             .await?
             .into_inner();
-        let m = if rep.error_code == 0 {
+        let message = if rep.error_code == 0 {
             rep.error_message.trim_matches('"').to_string()
         } else {
             rep.error_message
         };
-        Ok(m)
+        Ok(BroadcastOutcome {
+            error_code: rep.error_code,
+            message,
+        })
     }
 
     type TransactionStream = ReceiverStream<(u32, Transaction, usize)>;
@@ -153,22 +156,40 @@ impl LwdServer for GRPCClient {
         Ok(ReceiverStream::new(rx))
     }
 
-    async fn mempool_stream(&mut self, network: &Network) -> Result<Self::TransactionStream> {
+    type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+    async fn mempool_stream(&mut self, network: &Network) -> Result<Self::MempoolStream> {
         let mut txs = self
             .get_mempool_stream(Request::new(Empty {}))
             .await?
             .into_inner();
         let network = *network;
-        let (sender, rx) = tokio::sync::mpsc::channel::<(u32, Transaction, usize)>(10);
+        let (sender, rx) = tokio::sync::mpsc::channel::<Result<(u32, Transaction, usize)>>(10);
         tokio::spawn(async move {
-            while let Some(rtx) = txs.message().await? {
-                let len = rtx.data.len();
-                let branch_id =
-                    BranchId::for_height(&network, BlockHeight::from_u32(rtx.height as u32));
-                let tx = Transaction::read(&mut &rtx.data[..], branch_id)?;
-                sender.send((rtx.height as u32, tx, len)).await?;
+            loop {
+                let read = async {
+                    let Some(rtx) = txs.message().await? else {
+                        return Ok(None);
+                    };
+                    let len = rtx.data.len();
+                    let branch_id =
+                        BranchId::for_height(&network, BlockHeight::from_u32(rtx.height as u32));
+                    let tx = Transaction::read(&mut &rtx.data[..], branch_id)?;
+                    Ok(Some((rtx.height as u32, tx, len)))
+                }
+                .await;
+                match read {
+                    Ok(None) => break,
+                    Ok(Some(tx)) => {
+                        if sender.send(Ok(tx)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = sender.send(Err(e)).await;
+                        break;
+                    }
+                }
             }
-            Ok::<_, anyhow::Error>(())
         });
         Ok(ReceiverStream::new(rx))
     }

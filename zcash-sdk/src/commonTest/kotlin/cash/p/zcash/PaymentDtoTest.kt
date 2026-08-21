@@ -51,4 +51,23 @@ class PaymentDtoTest {
             plan,
         )
     }
+
+    @Test
+    fun parseBroadcastResult_zeroErrorCode_isAcceptedAndCarriesTheTxid() {
+        val result = parseBroadcastResult("""{"errorCode":0,"message":"a1b2c3"}""")
+
+        assertTrue(result.accepted)
+        assertEquals("a1b2c3", result.message)
+    }
+
+    @Test
+    fun parseBroadcastResult_nonZeroErrorCode_keepsCodeAndReason() {
+        val result = parseBroadcastResult(
+            """{"errorCode":-25,"message":"tx already committed to best chain"}"""
+        )
+
+        assertFalse(result.accepted)
+        assertEquals(-25, result.errorCode)
+        assertEquals("tx already committed to best chain", result.message)
+    }
 }

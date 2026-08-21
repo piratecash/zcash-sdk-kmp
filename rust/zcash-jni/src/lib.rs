@@ -4,34 +4,43 @@
 //! by replacing the directory rather than merging a diff.
 
 mod dto;
+mod mempool;
 mod progress;
 mod registry;
 
-use dto::{AccountDto, AddressesDto, RecipientDto, TxDto, TxPlanDto};
+use dto::{
+    AccountDto, AddressesDto, BroadcastResultDto, MigrationStatusDto, MigrationStepDto,
+    RecipientDto, TxDto, TxPlanDto,
+};
 use jni::errors::ErrorPolicy;
 use jni::objects::{JByteArray, JIntArray, JLongArray, JObject, JString};
 use jni::refs::Reference;
 use jni::sys::{jboolean, jbyte, jint, jlong};
 use jni::{Env, EnvUnowned};
 use rlz::api::account::{
-    delete_account, get_account_pools, get_account_ufvk, list_accounts, list_tx_history,
-    new_account, receivers_from_ua, ua_from_ufvk, NewAccount,
+    address_kind, delete_account, derive_unified_address, generate_next_receive_address,
+    get_account_pools, get_account_ufvk, list_accounts, list_tx_history, new_account,
+    receivers_from_ua, receivers_of, transparent_address_balance, ua_from_ufvk, unified_address,
+    AddressKind, NewAccount,
 };
 use rlz::api::coin::{init_datadir, Coin};
 use rlz::api::key::{derive_spending_key, generate_seed};
+use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::get_current_height;
 use rlz::api::pay::{
-    broadcast_transaction, extract_transaction, pack_transaction, prepare,
-    sign_transaction_with_key, to_plan, unpack_transaction, PaymentOptions, PcztPackage,
+    broadcast, extract_transaction, pack_transaction, prepare, sign_transaction_with_key, to_plan,
+    unpack_transaction, PaymentOptions, PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
-use rlz::api::sync::{balance, cancel_sync};
+use rlz::api::sweep::discover_transparent_addresses;
+use rlz::api::sync::{balance_breakdown, cancel_sync};
 use rlz::pay::Recipient;
 use rlz::sync::synchronize_impl;
 use serde::Serialize;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -145,6 +154,14 @@ fn optional_bytes(value: &JByteArray<'_>, env: &Env<'_>) -> Result<Option<Vec<u8
     }
 }
 
+fn optional_string(value: &JString<'_>, env: &Env<'_>) -> Result<Option<String>, BridgeError> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(value.try_to_string(env)?))
+    }
+}
+
 fn parse_recipients(json: &str) -> Result<Vec<Recipient>, BridgeError> {
     let recipients: Vec<RecipientDto> = serde_json::from_str(json)?;
     Ok(recipients.into_iter().map(Recipient::from).collect())
@@ -244,6 +261,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_generateSeedPhrase<'local>(
         .resolve::<ThrowNativeError>()
 }
 
+#[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub extern "system" fn Java_cash_p_zcash_ZcashJni_newAccount<'local>(
     mut unowned_env: EnvUnowned<'local>,
@@ -251,6 +269,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_newAccount<'local>(
     handle: jlong,
     name: JString<'local>,
     key: JString<'local>,
+    passphrase: JString<'local>,
     birth_height: jint,
     pools: jint,
     aindex: jint,
@@ -264,7 +283,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_newAccount<'local>(
                 // rlz never reads this flag: a non-empty key restores, an empty one generates.
                 restore: !key.is_empty(),
                 key,
-                passphrase: None,
+                passphrase: optional_string(&passphrase, env)?,
                 fingerprint: None,
                 aindex: aindex as u32,
                 birth: (birth_height > 0).then_some(birth_height as u32),
@@ -360,18 +379,158 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_accountAddresses<'local>(
         .resolve::<ThrowNativeError>()
 }
 
+/// A fresh receive-scope transparent address, or `null` when the account has no transparent key.
+///
+/// The account's own address stays where it is, so the receive screen is unaffected.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_nextTransparentAddress<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            match runtime().block_on(generate_next_receive_address(&coin))? {
+                Some(address) => Ok(env.new_string(&address)?),
+                None => Ok(JString::default()),
+            }
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Unspent value at `address` in zatoshi, as of the last sync.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentBalance<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    address: JString<'local>,
+) -> jlong {
+    unowned_env
+        .with_env(|env| -> Result<jlong, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let address = address.try_to_string(env)?;
+            let balance = runtime().block_on(transparent_address_balance(&coin, &address))?;
+            Ok(balance as jlong)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Re-derives transparent addresses this account handed out before it was restored, storing the
+/// ones the server knows a transaction for. Returns how many were added.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_discoverTransparentAddresses<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    end_height: jint,
+    gap_limit: jint,
+) -> jint {
+    unowned_env
+        .with_env(|_env| -> Result<jint, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let added = runtime().block_on(discover_transparent_addresses(
+                end_height as u32,
+                gap_limit as u32,
+                &coin,
+            ))?;
+            Ok(added as jint)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_deriveAddresses<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    phrase: JString<'local>,
+    passphrase: JString<'local>,
+    account_index: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = coin as u8;
+            let phrase = phrase.try_to_string(env)?;
+            let passphrase = optional_string(&passphrase, env)?;
+            let (unified, dindex) =
+                derive_unified_address(coin, &phrase, passphrase.as_deref(), account_index as u32)?;
+            let receivers = receivers_of(coin, &unified)?;
+            to_json(env, &AddressesDto::new(unified, receivers, dindex))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_addressKind<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    address: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let address = address.try_to_string(env)?;
+            let kind = match address_kind(coin as u8, &address) {
+                Some(AddressKind::Transparent) => "transparent",
+                Some(AddressKind::Sapling) => "sapling",
+                Some(AddressKind::Unified) => "unified",
+                Some(AddressKind::Tex) => "tex",
+                None => "invalid",
+            };
+            Ok(env.new_string(kind)?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_addressesFromViewingKey<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    viewing_key: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = coin as u8;
+            let viewing_key = viewing_key.try_to_string(env)?;
+            let (unified, dindex) = unified_address(coin, &viewing_key, None)?;
+            let receivers = receivers_of(coin, &unified)?;
+            to_json(env, &AddressesDto::new(unified, receivers, dindex))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Three longs per pool — available, change pending, value pending — from a single snapshot,
+/// so the split can never be read across two different sync states.
 #[no_mangle]
 pub extern "system" fn Java_cash_p_zcash_ZcashJni_balance<'local>(
     mut unowned_env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
     account: jint,
+    confirmations: jint,
 ) -> JLongArray<'local> {
     unowned_env
         .with_env(|env| -> Result<JLongArray<'local>, BridgeError> {
             let coin = wallet_account(handle, account)?;
-            let pools = runtime().block_on(balance(&coin))?;
-            let pools: Vec<i64> = pools.0.into_iter().map(|v| v as i64).collect();
+            let confirmations = confirmations.max(0) as u32;
+            let pools = runtime().block_on(balance_breakdown(confirmations, &coin))?;
+            let pools: Vec<i64> = pools
+                .0
+                .into_iter()
+                .flat_map(|b| {
+                    [
+                        b.available as i64,
+                        b.change_pending as i64,
+                        b.value_pending as i64,
+                    ]
+                })
+                .collect();
 
             let array = env.new_long_array(pools.len())?;
             array.set_region(env, 0, &pools)?;
@@ -458,6 +617,52 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_syncProgress<'local>(
 ) -> jlong {
     unowned_env
         .with_env(|_env| -> Result<jlong, BridgeError> { Ok(progress::sink().packed() as jlong) })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Starts the process-wide mempool subscription. It writes nothing to the database.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_mempoolStart<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+) {
+    unowned_env
+        .with_env(|_env| -> Result<(), BridgeError> {
+            mempool::start(wallet(handle)?).map_err(BridgeError)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// The next mempool event as JSON, or `null` when none arrived within `timeout_ms`.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_mempoolNext<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    timeout_ms: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+            match mempool::next(timeout) {
+                Some(event) => to_json(env, &event),
+                None => Ok(JString::default()),
+            }
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Cancels the subscription and returns once the native reader has actually stopped.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_mempoolStop<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) {
+    unowned_env
+        .with_env(|_env| -> Result<(), BridgeError> {
+            mempool::stop();
+            Ok(())
+        })
         .resolve::<ThrowNativeError>()
 }
 
@@ -563,12 +768,19 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_deriveSpendingKey<'local>(
     _this: JObject<'local>,
     coin: jbyte,
     phrase: JString<'local>,
+    passphrase: JString<'local>,
     account_index: jint,
 ) -> JByteArray<'local> {
     unowned_env
         .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
             let phrase = phrase.try_to_string(env)?;
-            let mut key = derive_spending_key(coin as u8, &phrase, account_index as u32)?;
+            let passphrase = optional_string(&passphrase, env)?;
+            let mut key = derive_spending_key(
+                coin as u8,
+                &phrase,
+                passphrase.as_deref(),
+                account_index as u32,
+            )?;
             let array = env.byte_array_from_slice(&key);
             key.fill(0);
             Ok(array?)
@@ -603,8 +815,46 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_broadcastTransaction<'local>(
         .with_env(|env| -> Result<JString<'local>, BridgeError> {
             let raw = env.convert_byte_array(&tx)?;
             let coin = wallet(handle)?;
-            let txid = runtime().block_on(broadcast_transaction(height as u32, &raw, &coin))?;
-            Ok(env.new_string(txid)?)
+            let outcome = runtime().block_on(broadcast(height as u32, &raw, &coin))?;
+            to_json(env, &BroadcastResultDto::from(outcome))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_migrationStatus<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let status = runtime().block_on(migration_status(&coin))?;
+            to_json(env, &MigrationStatusDto::from(status))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// One step of the Orchard → Ironwood migration. The step signs and broadcasts on its own, so
+/// the caller repeats it until the reported phase is `complete`.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_migrationStep<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    spending_key: JByteArray<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let mut usk = env.convert_byte_array(&spending_key)?;
+            let stepped = runtime().block_on(migration_step(&coin, &usk));
+            usk.fill(0);
+            let (event, status) = stepped?;
+            to_json(env, &MigrationStepDto::new(event, status))
         })
         .resolve::<ThrowNativeError>()
 }

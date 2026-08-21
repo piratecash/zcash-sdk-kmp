@@ -14,7 +14,7 @@ use crate::api::coin::{Coin, Network};
 use crate::api::sync::{CANCEL_SYNC, SYNCING};
 use crate::budget::merge_pending_txs;
 
-use crate::db::store_block_header;
+use crate::db::{store_block_header, transparent_addresses_to_scan};
 use crate::io::SyncHeight;
 use crate::{Client, Sink};
 use std::{collections::HashSet, mem};
@@ -320,41 +320,28 @@ pub(crate) async fn transparent_sync(
     mut rx_cancel: broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut addresses = vec![];
+    let mut scanned_accounts = vec![];
     debug!(
         "transparent_sync: scanning accounts {:?} from height {} to {} with limit {}",
         accounts, start_height, end_height, limit
     );
     for account in accounts {
-        // scan the most recent receive and change addresses, bounded by `limit`
-        let mut rows = sqlx::query("
-                WITH receive AS
-                (SELECT * FROM transparent_address_accounts WHERE account = ?1 AND scope = 0 ORDER BY dindex DESC LIMIT ?2),
-                change AS
-                (SELECT * FROM transparent_address_accounts WHERE account = ?1 AND scope = 1 ORDER BY dindex DESC LIMIT ?2)
-                SELECT id_taddress, address FROM receive UNION ALL SELECT id_taddress, address FROM change")
-            .bind(account)
-            .bind(limit)
-            .map(|row: SqliteRow| {
-                let id_taddress: u32 = row.get(0);
-                let address: String = row.get(1);
-                (id_taddress, address)
-            })
-            .fetch(&mut *connection);
-
-        let mut addr_count = 0u32;
-        while let Some((id_taddress, address)) = rows.try_next().await? {
+        let scanned = transparent_addresses_to_scan(&mut *connection, *account, limit).await?;
+        for (id_taddress, address) in &scanned {
             debug!(
                 "transparent_sync: account {} has taddress id={} addr={}",
                 account, id_taddress, address
             );
-            addr_count += 1;
-            // Add the address to the client
-            addresses.push((*account, (id_taddress, address)));
         }
         debug!(
             "transparent_sync: account {} has {} transparent addresses to scan",
-            account, addr_count
+            account,
+            scanned.len()
         );
+        if !scanned.is_empty() {
+            scanned_accounts.push(*account);
+        }
+        addresses.extend(scanned.into_iter().map(|address| (*account, address)));
     }
     debug!(
         "transparent_sync: total {} addresses to scan across all accounts",
@@ -521,13 +508,20 @@ pub(crate) async fn transparent_sync(
             }
         }
 
+        db_tx.commit().await?;
+    }
+
+    // Only once every address of the range has been scanned: moving the height earlier strands
+    // whatever a mid-account failure left unscanned, and that range is never requested again.
+    let mut db_tx = connection.begin().await?;
+    for account in scanned_accounts.iter() {
         sqlx::query("UPDATE sync_heights SET height = ? WHERE account = ? AND pool = 0")
             .bind(end_height)
             .bind(account)
             .execute(&mut *db_tx)
             .await?;
-        db_tx.commit().await?;
     }
+    db_tx.commit().await?;
 
     Ok(())
 }
@@ -1172,6 +1166,82 @@ pub async fn get_db_height(connection: &mut SqliteConnection, account: u32) -> R
     })
 }
 
+/// Rediscovers transparent addresses the wallet issued but has no rows for — the state a restore
+/// leaves behind, where only the account's own address survives. Walks each scope forward, storing
+/// an address as soon as the server reports a transaction for it, and gives up once `gap_limit`
+/// consecutive unused addresses say the wallet never went further. Returns how many were added.
+#[allow(clippy::too_many_arguments)]
+pub async fn discover_transparent_addresses(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    end_height: u32,
+    gap_limit: u32,
+    progress_fn: impl Fn(String),
+    cancellation_token: CancellationToken,
+) -> Result<u32> {
+    let hw = get_account_hw(connection, account).await?;
+    let aindex = get_account_aindex(connection, account).await?;
+    let account_dindex = get_account_dindex(connection, account).await?;
+    let ledger = get_ledger(connection, account).await?;
+    let tk = select_account_transparent(connection, account, account_dindex).await?;
+    let xvk = tk.xvk;
+    let start_height = get_birth_height(connection, account).await?;
+
+    let mut n_added = 0;
+    for scope in 0..2 {
+        let mut dindex = 0;
+        let mut gap = 0;
+        while gap <= gap_limit {
+            let (pk, taddr) = match xvk.as_ref() {
+                Some(xvk) => derive_transparent_address(xvk, scope, dindex, false)?,
+                None if hw != 0 => {
+                    ledger
+                        .get_hw_transparent_address(network, aindex, scope, dindex)
+                        .await?
+                }
+                _ => anyhow::bail!("Sweep needs an xpub key"),
+            };
+            let taddr = taddr.encode(network);
+            progress_fn(taddr.clone());
+
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    return Ok(n_added)
+                }
+
+                txids = client
+                    .taddress_txs(network, &taddr, start_height, end_height)
+                    => {
+                    let mut txids = txids?;
+                    if txids.next().await.is_some() {
+                        // The wallet reached this far, so the window reopens from here.
+                        gap = 0;
+                        let sk = tk
+                            .xsk
+                            .as_ref()
+                            .map(|tsk| derive_transparent_sk(tsk, scope, dindex))
+                            .transpose()?;
+                        if store_account_transparent_addr(
+                            connection, account, scope, dindex, sk, &pk, &taddr, false,
+                        )
+                        .await?
+                        {
+                            n_added += 1;
+                        }
+                    } else {
+                        gap += 1;
+                    }
+                    dindex += 1;
+                }
+            }
+        }
+    }
+    Ok(n_added)
+}
+
+/// Fire-and-forget wrapper: the caller watches the scan through `progress_fn`.
 #[allow(clippy::too_many_arguments)]
 pub async fn transparent_sweep(
     network: &Network,
@@ -1184,66 +1254,18 @@ pub async fn transparent_sweep(
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     let network = *network;
-    let hw = get_account_hw(&mut connection, account).await?;
-    let aindex = get_account_aindex(&mut connection, account).await?;
-    let dindex = get_account_dindex(&mut connection, account).await?;
     tokio::spawn(async move {
-        let ledger = get_ledger(&mut connection, account).await?;
-        let mut n_added = 0;
-        let tk = select_account_transparent(&mut connection, account, dindex).await?;
-        let xvk = tk.xvk;
-        let start_height = get_birth_height(&mut connection, account).await?;
-        for scope in 0..2 {
-            let mut dindex = 0;
-            let mut gap = 0;
-            loop {
-                let (pk, taddr) = match xvk.as_ref() {
-                    Some(xvk) => derive_transparent_address(xvk, scope, dindex, false)?,
-                    None if hw != 0 => {
-                        ledger
-                            .get_hw_transparent_address(&network, aindex, scope, dindex)
-                            .await?
-                    }
-                    _ => anyhow::bail!("Sweep needs an xpub key"),
-                };
-                let taddr = taddr.encode(&network);
-                progress_fn(taddr.clone());
-
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        return Ok::<_, anyhow::Error>(n_added)
-                    }
-
-                    txids = client
-                        .taddress_txs(&network, &taddr, start_height, end_height)
-                        => {
-                        let mut txids = txids?;
-                        if txids.next().await.is_some() {
-                            let sk = if let Some(tsk) = tk.xsk.as_ref() {
-                                let sk = derive_transparent_sk(tsk, scope, dindex)?;
-                                Some(sk)
-                            } else {
-                                None
-                            };
-                            if store_account_transparent_addr(
-                                &mut connection, account, scope, dindex, sk, &pk, &taddr, false,
-                            )
-                            .await?
-                            {
-                                n_added += 1;
-                            }
-                        } else {
-                            gap += 1;
-                        }
-                        dindex += 1;
-                        if gap > gap_limit {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(n_added)
+        discover_transparent_addresses(
+            &network,
+            &mut connection,
+            &mut client,
+            account,
+            end_height,
+            gap_limit,
+            progress_fn,
+            cancellation_token,
+        )
+        .await
     });
     Ok(())
 }
@@ -1283,4 +1305,421 @@ pub async fn get_heights_without_time(
     tx_without_time.extend(synced_heights_without_time);
 
     Ok(tx_without_time)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::tests::{restore, TEST_PHRASE};
+    use crate::db::tests::{
+        insert_scoped_taddress, insert_scoped_taddress_for_account, memory_db,
+        set_pool_sync_height, set_pool_sync_height_for_account, ACCOUNT,
+    };
+    use crate::net::{BroadcastOutcome, LwdServer};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::async_trait;
+    use zcash_primitives::transaction::Transaction;
+    use zcash_protocol::consensus::BranchId;
+
+    async fn sync_heights(connection: &mut SqliteConnection) -> Vec<u32> {
+        sqlx::query_scalar("SELECT height FROM sync_heights ORDER BY pool")
+            .fetch_all(connection)
+            .await
+            .expect("heights")
+    }
+
+    /// `transparent_sync` commits pool 0 for the whole range before the shielded pass runs, so a
+    /// failure there leaves it ahead. The next pass must rewind it, not skip the missed range.
+    #[tokio::test]
+    async fn recover_from_partial_sync_rewinds_a_pool_that_ran_ahead() {
+        let mut connection = memory_db().await;
+        set_pool_sync_height(&mut connection, 0, 200).await;
+        set_pool_sync_height(&mut connection, 1, 100).await;
+        set_pool_sync_height(&mut connection, 2, 100).await;
+
+        recover_from_partial_sync(&mut connection, &[ACCOUNT])
+            .await
+            .expect("recover");
+
+        assert_eq!(sync_heights(&mut connection).await, vec![100, 100, 100]);
+    }
+
+    /// Without a shielded pool nothing holds the minimum back — the trace the review found.
+    #[tokio::test]
+    async fn recover_from_partial_sync_keeps_a_lone_transparent_pool_where_it_is() {
+        let mut connection = memory_db().await;
+        set_pool_sync_height(&mut connection, 0, 200).await;
+
+        recover_from_partial_sync(&mut connection, &[ACCOUNT])
+            .await
+            .expect("recover");
+
+        assert_eq!(sync_heights(&mut connection).await, vec![200]);
+    }
+
+    /// Answers every address with an empty stream, failing on call `fail_at_call` when set —
+    /// the shape a mid-account network error takes.
+    struct EmptyStreams {
+        calls: u32,
+        fail_at_call: Option<u32>,
+    }
+
+    #[async_trait]
+    impl LwdServer for EmptyStreams {
+        async fn latest_height(&mut self) -> Result<u32> {
+            unimplemented!()
+        }
+
+        async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {
+            unimplemented!()
+        }
+
+        type CompactBlockStream = ReceiverStream<CompactBlock>;
+        async fn block_range(
+            &mut self,
+            _network: &Network,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::CompactBlockStream> {
+            unimplemented!()
+        }
+
+        async fn transaction(
+            &mut self,
+            _network: &Network,
+            _txid: &[u8],
+        ) -> Result<(u32, Transaction)> {
+            unimplemented!()
+        }
+
+        async fn post_transaction(&mut self, _height: u32, _tx: &[u8]) -> Result<BroadcastOutcome> {
+            unimplemented!()
+        }
+
+        type TransactionStream = ReceiverStream<(u32, Transaction, usize)>;
+        async fn taddress_txs(
+            &mut self,
+            _network: &Network,
+            _taddress: &str,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::TransactionStream> {
+            self.calls += 1;
+            anyhow::ensure!(
+                self.fail_at_call != Some(self.calls),
+                "server failed on address {}",
+                self.calls
+            );
+            let (sender, receiver) = channel(1);
+            drop(sender);
+            Ok(ReceiverStream::new(receiver))
+        }
+
+        type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn mempool_stream(&mut self, _network: &Network) -> Result<Self::MempoolStream> {
+            unimplemented!()
+        }
+
+        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            unimplemented!()
+        }
+    }
+
+    async fn two_addresses_at_height(connection: &mut SqliteConnection, height: u32) {
+        insert_scoped_taddress(connection, 1, 0, 0, "t1h31WzbruQhnwHg4XDJ5anLM7CAtwjXmPt").await;
+        insert_scoped_taddress(connection, 2, 0, 1, "t1VmmGiyjVNeCjxDZzg7vZmd99WyzVby9yC").await;
+        set_pool_sync_height(connection, 0, height).await;
+    }
+
+    const OTHER_ACCOUNT: u32 = ACCOUNT + 1;
+
+    /// One address per account, so call N of the fake server belongs to account N.
+    async fn two_accounts_at_height(connection: &mut SqliteConnection, height: u32) {
+        let accounts = [
+            (ACCOUNT, "t1h31WzbruQhnwHg4XDJ5anLM7CAtwjXmPt"),
+            (OTHER_ACCOUNT, "t1VmmGiyjVNeCjxDZzg7vZmd99WyzVby9yC"),
+        ];
+        for (index, (account, address)) in accounts.into_iter().enumerate() {
+            let id_taddress = index as u32 + 1;
+            insert_scoped_taddress_for_account(connection, account, id_taddress, 0, 0, address)
+                .await;
+            set_pool_sync_height_for_account(connection, account, 0, height).await;
+        }
+    }
+
+    async fn transparent_heights(connection: &mut SqliteConnection) -> Vec<(u32, u32)> {
+        sqlx::query_as("SELECT account, height FROM sync_heights WHERE pool = 0 ORDER BY account")
+            .fetch_all(connection)
+            .await
+            .expect("heights")
+    }
+
+    async fn scan_to_200(
+        connection: &mut SqliteConnection,
+        accounts: &[u32],
+        fail_at_call: Option<u32>,
+    ) -> Result<()> {
+        let mut client: Client = Box::new(EmptyStreams {
+            calls: 0,
+            fail_at_call,
+        });
+        let (_cancel, rx_cancel) = broadcast::channel(1);
+
+        transparent_sync(
+            &Network::Main,
+            connection,
+            &mut client,
+            accounts,
+            101,
+            200,
+            10,
+            rx_cancel,
+        )
+        .await
+    }
+
+    /// A failure on a later address must not leave pool 0 at the end of a range the earlier
+    /// addresses covered but the later ones never did — those payments are never requested again.
+    #[tokio::test]
+    async fn transparent_sync_keeps_the_pool_height_when_a_later_address_fails() {
+        let mut connection = memory_db().await;
+        two_addresses_at_height(&mut connection, 100).await;
+
+        let result = scan_to_200(&mut connection, &[ACCOUNT], Some(2)).await;
+
+        assert!(result.is_err());
+        assert_eq!(sync_heights(&mut connection).await, vec![100]);
+    }
+
+    #[tokio::test]
+    async fn transparent_sync_advances_the_pool_height_once_every_address_is_scanned() {
+        let mut connection = memory_db().await;
+        two_addresses_at_height(&mut connection, 100).await;
+
+        scan_to_200(&mut connection, &[ACCOUNT], None)
+            .await
+            .expect("sync");
+
+        assert_eq!(sync_heights(&mut connection).await, vec![200]);
+    }
+
+    /// Every scanned account is checkpointed, not just the first one — the rest would silently
+    /// re-request the range they already covered, or never move at all.
+    #[tokio::test]
+    async fn transparent_sync_advances_every_scanned_account() {
+        let mut connection = memory_db().await;
+        two_accounts_at_height(&mut connection, 100).await;
+
+        scan_to_200(&mut connection, &[ACCOUNT, OTHER_ACCOUNT], None)
+            .await
+            .expect("sync");
+
+        assert_eq!(
+            transparent_heights(&mut connection).await,
+            vec![(ACCOUNT, 200), (OTHER_ACCOUNT, 200)]
+        );
+    }
+
+    /// The whole range is one checkpoint: a failure on the second account also withdraws the
+    /// first one's, because nothing proves the range is fully covered until every address is.
+    #[tokio::test]
+    async fn transparent_sync_keeps_every_account_height_when_a_later_account_fails() {
+        let mut connection = memory_db().await;
+        two_accounts_at_height(&mut connection, 100).await;
+
+        let result = scan_to_200(&mut connection, &[ACCOUNT, OTHER_ACCOUNT], Some(2)).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            transparent_heights(&mut connection).await,
+            vec![(ACCOUNT, 100), (OTHER_ACCOUNT, 100)]
+        );
+    }
+
+    /// An account with a pool row but no address has nothing to scan, so its height stays put —
+    /// advancing it would checkpoint a range no address ever covered.
+    #[tokio::test]
+    async fn transparent_sync_leaves_an_account_without_addresses_where_it_is() {
+        let mut connection = memory_db().await;
+        set_pool_sync_height(&mut connection, 0, 100).await;
+
+        scan_to_200(&mut connection, &[ACCOUNT], None)
+            .await
+            .expect("sync");
+
+        assert_eq!(
+            transparent_heights(&mut connection).await,
+            vec![(ACCOUNT, 100)]
+        );
+    }
+
+    /// Answers with a transaction on the calls listed in `used_at_calls` and with an empty stream
+    /// otherwise — what a rediscovery scan sees when only some derived addresses were ever paid.
+    struct UsedAtCalls {
+        calls: Arc<AtomicU32>,
+        used_at_calls: Vec<u32>,
+    }
+
+    /// The smallest transaction that parses: the scan only asks whether the stream has an item.
+    fn any_transaction() -> Transaction {
+        // v4 header and version group id, then zeroes: no inputs, outputs, spends or joinsplits.
+        let raw =
+            hex::decode("0400008085202f89000000000000000000000000000000000000000000").expect("hex");
+        Transaction::read(&mut &raw[..], BranchId::Sapling).expect("transaction")
+    }
+
+    #[async_trait]
+    impl LwdServer for UsedAtCalls {
+        async fn latest_height(&mut self) -> Result<u32> {
+            unimplemented!()
+        }
+
+        async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {
+            unimplemented!()
+        }
+
+        type CompactBlockStream = ReceiverStream<CompactBlock>;
+        async fn block_range(
+            &mut self,
+            _network: &Network,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::CompactBlockStream> {
+            unimplemented!()
+        }
+
+        async fn transaction(
+            &mut self,
+            _network: &Network,
+            _txid: &[u8],
+        ) -> Result<(u32, Transaction)> {
+            unimplemented!()
+        }
+
+        async fn post_transaction(&mut self, _height: u32, _tx: &[u8]) -> Result<BroadcastOutcome> {
+            unimplemented!()
+        }
+
+        type TransactionStream = ReceiverStream<(u32, Transaction, usize)>;
+        async fn taddress_txs(
+            &mut self,
+            _network: &Network,
+            _taddress: &str,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::TransactionStream> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            let (sender, receiver) = channel(1);
+            if self.used_at_calls.contains(&call) {
+                sender
+                    .send((1, any_transaction(), 0))
+                    .await
+                    .expect("queue transaction");
+            }
+            drop(sender);
+            Ok(ReceiverStream::new(receiver))
+        }
+
+        type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn mempool_stream(&mut self, _network: &Network) -> Result<Self::MempoolStream> {
+            unimplemented!()
+        }
+
+        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            unimplemented!()
+        }
+    }
+
+    async fn receive_dindexes(connection: &mut SqliteConnection, account: u32) -> Vec<u32> {
+        sqlx::query_scalar(
+            "SELECT dindex FROM transparent_address_accounts
+            WHERE account = ? AND scope = 0 ORDER BY dindex",
+        )
+        .bind(account)
+        .fetch_all(connection)
+        .await
+        .expect("addresses")
+    }
+
+    /// Runs a rediscovery scan over a freshly restored account, whose only transparent row is the
+    /// account's own address. Returns how many addresses it added and how many calls it made.
+    async fn discover(
+        connection: &mut SqliteConnection,
+        account: u32,
+        gap_limit: u32,
+        used_at_calls: Vec<u32>,
+    ) -> (u32, u32) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut client: Client = Box::new(UsedAtCalls {
+            calls: calls.clone(),
+            used_at_calls,
+        });
+
+        let n_added = discover_transparent_addresses(
+            &Network::Main,
+            connection,
+            &mut client,
+            account,
+            2_000_100,
+            gap_limit,
+            |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("discover");
+
+        (n_added, calls.load(Ordering::Relaxed))
+    }
+
+    /// After a restore the wallet has no row for a one-time address it once handed out, so the
+    /// funds paid to it are invisible until the scan finds the address again.
+    #[tokio::test]
+    async fn discover_transparent_addresses_restores_an_address_that_received_funds() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        assert_eq!(receive_dindexes(&mut connection, account).await, vec![0]);
+
+        let (n_added, _) = discover(&mut connection, account, 2, vec![3]).await;
+
+        assert_eq!(n_added, 1);
+        assert_eq!(receive_dindexes(&mut connection, account).await, vec![0, 2]);
+    }
+
+    /// A used address reopens the window: stopping `gap_limit` addresses after the last hit is
+    /// what keeps a wallet that spaced its addresses out from losing the later ones.
+    #[tokio::test]
+    async fn discover_transparent_addresses_keeps_scanning_past_a_used_address() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        let (n_added, _) = discover(&mut connection, account, 1, vec![1, 3, 5]).await;
+
+        assert_eq!(n_added, 2, "dindex 0 is the account's own address");
+        assert_eq!(
+            receive_dindexes(&mut connection, account).await,
+            vec![0, 2, 4]
+        );
+    }
+
+    /// Nothing bounds the derivation but the gap, so an unused account must stop after
+    /// `gap_limit + 1` addresses in each of the two scopes rather than run forever.
+    #[tokio::test]
+    async fn discover_transparent_addresses_stops_after_the_gap_limit() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        let (n_added, calls) = discover(&mut connection, account, 2, vec![]).await;
+
+        assert_eq!(n_added, 0);
+        assert_eq!(calls, 6, "three addresses in each scope");
+        assert_eq!(receive_dindexes(&mut connection, account).await, vec![0]);
+    }
 }

@@ -4,7 +4,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::api::coin::Coin;
 
-use crate::db::calculate_balance;
+use crate::db::{calculate_balance, calculate_balance_breakdown};
 use crate::io::SyncHeight;
 use crate::sync::BlockHeader;
 
@@ -45,6 +45,18 @@ pub async fn balance(c: &Coin) -> Result<PoolBalance> {
     let account = c.account;
 
     calculate_balance(&mut *connection, account, None).await
+}
+
+/// Splits the balance into spendable and pending, per pool.
+///
+/// `confirmations` is the caller's threshold; the cutoff height is the locally scanned
+/// one, so the result never depends on the network being reachable.
+#[cfg_attr(feature = "flutter", frb)]
+pub async fn balance_breakdown(confirmations: u32, c: &Coin) -> Result<PoolBalanceBreakdown> {
+    let mut connection = c.get_connection().await?;
+    let account = c.account;
+
+    calculate_balance_breakdown(&mut connection, account, confirmations).await
 }
 
 #[cfg_attr(feature = "flutter", frb)]
@@ -97,6 +109,16 @@ pub struct SyncProgress {
 }
 
 pub struct PoolBalance(pub Vec<u64>);
+
+/// One pool's unspent value, split by how many confirmations its notes still need.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Balance {
+    pub available: u64,
+    pub change_pending: u64,
+    pub value_pending: u64,
+}
+
+pub struct PoolBalanceBreakdown(pub Vec<Balance>);
 
 pub static SYNCING: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 pub static CANCEL_SYNC: LazyLock<Mutex<Option<broadcast::Sender<()>>>> =

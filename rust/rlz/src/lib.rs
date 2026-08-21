@@ -45,6 +45,7 @@ pub type Client = Box<
     dyn LwdServer<
         CompactBlockStream = ReceiverStream<CompactBlock>,
         TransactionStream = ReceiverStream<(u32, Transaction, usize)>,
+        MempoolStream = ReceiverStream<anyhow::Result<(u32, Transaction, usize)>>,
     >,
 >;
 

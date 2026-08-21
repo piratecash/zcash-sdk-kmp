@@ -27,6 +27,7 @@ internal object ZcashJni {
         handle: Long,
         name: String,
         key: String,
+        passphrase: String?,
         birthHeight: Int,
         pools: Int,
         accountIndex: Int,
@@ -40,7 +41,21 @@ internal object ZcashJni {
 
     external fun accountAddresses(handle: Long, account: Int): String
 
-    external fun balance(handle: Long, account: Int): LongArray
+    external fun balance(handle: Long, account: Int, confirmations: Int): LongArray
+
+    /** A fresh receive-scope transparent address, or `null` when the account has no transparent key. */
+    external fun nextTransparentAddress(handle: Long, account: Int): String?
+
+    /** Unspent value at [address] in zatoshi, as of the last sync. */
+    external fun transparentBalance(handle: Long, account: Int, address: String): Long
+
+    /** Re-derives transparent addresses the account used before a restore. Returns how many were added. */
+    external fun discoverTransparentAddresses(
+        handle: Long,
+        account: Int,
+        endHeight: Int,
+        gapLimit: Int,
+    ): Int
 
     external fun listTransactions(handle: Long, account: Int): String
 
@@ -83,12 +98,44 @@ internal object ZcashJni {
     ): ByteArray
 
     /** Stateless: needs no open wallet. */
-    external fun deriveSpendingKey(coin: Byte, phrase: String, accountIndex: Int): ByteArray
+    external fun deriveSpendingKey(
+        coin: Byte,
+        phrase: String,
+        passphrase: String?,
+        accountIndex: Int,
+    ): ByteArray
 
     /** Stateless: needs no open wallet. */
     external fun generateSeedPhrase(): String
 
+    /** Stateless: needs no open wallet. */
+    external fun deriveAddresses(
+        coin: Byte,
+        phrase: String,
+        passphrase: String?,
+        accountIndex: Int,
+    ): String
+
+    /** Stateless: needs no open wallet. */
+    external fun addressesFromViewingKey(coin: Byte, viewingKey: String): String
+
+    /** Stateless: needs no open wallet. Returns `"invalid"` rather than throwing. */
+    external fun addressKind(coin: Byte, address: String): String
+
     external fun extractTransaction(pkg: ByteArray): ByteArray
 
     external fun broadcastTransaction(handle: Long, height: Int, tx: ByteArray): String
+
+    external fun migrationStatus(handle: Long, account: Int): String
+
+    external fun migrationStep(handle: Long, account: Int, spendingKey: ByteArray): String
+
+    /** Starts the process-wide mempool subscription; it writes nothing to the database. */
+    external fun mempoolStart(handle: Long)
+
+    /** The next event as JSON, or `null` when none arrived within [timeoutMs]. */
+    external fun mempoolNext(timeoutMs: Long): String?
+
+    /** Returns only once the native reader has actually stopped. */
+    external fun mempoolStop()
 }

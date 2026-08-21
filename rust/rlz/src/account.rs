@@ -89,6 +89,20 @@ pub(crate) fn derive_spending_key(
     Ok(usk.to_bytes(Era::Orchard))
 }
 
+/// Derives the account's unified full viewing key outside the database — the address it
+/// yields is the one the account reports once it is restored from the same phrase.
+pub(crate) fn derive_ufvk(
+    network: &Network,
+    phrase: &str,
+    passphrase: Option<&str>,
+    aindex: u32,
+) -> Result<String> {
+    let aindex = AccountId::try_from(aindex).map_err(|_| anyhow!("account index out of range"))?;
+    let (usk, _) = usk_from_phrase(network, phrase, passphrase.unwrap_or_default(), aindex)?;
+
+    Ok(usk.to_unified_full_viewing_key().encode(network))
+}
+
 pub async fn new_account(
     network: &Network,
     connection: &mut SqliteConnection,
@@ -796,41 +810,71 @@ pub async fn generate_next_change_address(
     connection: &mut SqliteConnection,
     account: u32,
 ) -> Result<Option<String>> {
-    let dindex = sqlx::query(
-        "SELECT MAX(dindex) FROM transparent_address_accounts WHERE account = ? AND scope = 1",
-    )
-    .bind(account)
-    .map(|row: SqliteRow| row.get::<Option<u32>, _>(0))
-    .fetch_one(&mut *connection)
-    .await?;
+    generate_next_transparent_address(network, connection, account, 1).await
+}
 
+/// Retries of an index lost to a concurrent allocation before giving up.
+const ADDRESS_ALLOCATION_ATTEMPTS: u32 = 8;
+
+/// Next receive-scope transparent address, WITHOUT moving the account's default address the
+/// way [`generate_next_dindex`] does — the receive screen has to keep showing the same one.
+pub async fn generate_next_receive_address(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<Option<String>> {
+    generate_next_transparent_address(network, connection, account, 0).await
+}
+
+/// `None` when the account has no transparent key, so no such address exists.
+async fn generate_next_transparent_address(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    account: u32,
+    scope: u32,
+) -> Result<Option<String>> {
     let (xsk, xvk) = get_transparent_keys(connection, account).await?;
 
     if let Some(tvk) = xvk.as_ref() {
-        let dindex = match dindex {
-            Some(dindex) => dindex + 1, // increment
-            None => 0,                  // first change address
-        };
+        // A concurrent allocation can claim the index between the SELECT and the INSERT; the
+        // unique constraint rejects the loser, which then retries with a fresh index.
+        for _ in 0..ADDRESS_ALLOCATION_ATTEMPTS {
+            let dindex = sqlx::query(
+                "SELECT MAX(dindex) FROM transparent_address_accounts WHERE account = ? AND scope = ?",
+            )
+            .bind(account)
+            .bind(scope)
+            .map(|row: SqliteRow| row.get::<Option<u32>, _>(0))
+            .fetch_one(&mut *connection)
+            .await?
+            .map_or(0, |dindex| dindex + 1);
 
-        let sk = xsk
-            .as_ref()
-            .map(|tsk| derive_transparent_sk(tsk, 1, dindex).unwrap());
-        let (change_pk, change_address) = derive_transparent_address(tvk, 1, dindex, false)?;
-        let change_address = change_address.encode(network);
+            let sk = xsk
+                .as_ref()
+                .map(|tsk| derive_transparent_sk(tsk, scope, dindex).unwrap());
+            let (pk, address) = derive_transparent_address(tvk, scope, dindex, false)?;
+            let address = address.encode(network);
 
-        store_account_transparent_addr(
-            &mut *connection,
-            account,
-            1,
-            dindex,
-            sk,
-            &change_pk,
-            &change_address,
-            false,
-        )
-        .await?;
+            let stored = store_account_transparent_addr(
+                &mut *connection,
+                account,
+                scope,
+                dindex,
+                sk,
+                &pk,
+                &address,
+                false,
+            )
+            .await?;
 
-        return Ok(Some(change_address));
+            if stored {
+                return Ok(Some(address));
+            }
+        }
+
+        return Err(anyhow!(
+            "Could not allocate a transparent address for account {account}, scope {scope}"
+        ));
     }
 
     Ok(None)
@@ -1506,6 +1550,36 @@ pub(crate) mod tests {
         assert!(address.starts_with("t1"), "{address}");
     }
 
+    async fn sync_height_pools(connection: &mut SqliteConnection) -> Vec<u32> {
+        sqlx::query_scalar("SELECT pool FROM sync_heights ORDER BY pool")
+            .fetch_all(connection)
+            .await
+            .expect("sync heights")
+    }
+
+    /// A per-pool row is what keeps `MIN(height)` from following the transparent pool alone.
+    #[tokio::test]
+    async fn new_account_with_all_pools_tracks_a_sync_height_per_pool() {
+        let mut connection = memory_db().await;
+
+        restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        assert_eq!(sync_height_pools(&mut connection).await, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn new_account_with_the_transparent_pool_only_tracks_that_pool_alone() {
+        let mut connection = memory_db().await;
+
+        restore(&mut connection, TEST_PHRASE, 0, Some(1))
+            .await
+            .expect("restore");
+
+        assert_eq!(sync_height_pools(&mut connection).await, vec![0]);
+    }
+
     /// Pinned in Kotlin too: the JNI boundary must derive the very same key.
     const TEST_PHRASE_USK_SHA256: &str =
         "3fabc1d61f40e5cb045261c10c1e0c559f48f7305d19c4200716424846fd1285";
@@ -1546,5 +1620,132 @@ pub(crate) mod tests {
     #[test]
     fn derive_spending_key_account_index_out_of_range_errors() {
         assert!(derive_spending_key(&Network::Main, TEST_PHRASE, None, 0x8000_0000).is_err());
+    }
+
+    #[tokio::test]
+    async fn derive_ufvk_matches_the_account_restored_from_the_same_phrase() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        let stored = crate::key::get_account_ufvk(&Network::Main, &mut connection, account, 7)
+            .await
+            .expect("stored ufvk");
+
+        assert_eq!(
+            stored,
+            derive_ufvk(&Network::Main, TEST_PHRASE, None, 0).expect("derive")
+        );
+    }
+
+    #[test]
+    fn derive_ufvk_differs_per_account_index_and_passphrase() {
+        let base = derive_ufvk(&Network::Main, TEST_PHRASE, None, 0).expect("derive");
+        let other_index = derive_ufvk(&Network::Main, TEST_PHRASE, None, 1).expect("derive");
+        let peppered = derive_ufvk(&Network::Main, TEST_PHRASE, Some("pepper"), 0).expect("derive");
+
+        assert_ne!(base, other_index);
+        assert_ne!(base, peppered);
+    }
+
+    #[test]
+    fn derive_ufvk_invalid_phrase_errors() {
+        assert!(derive_ufvk(&Network::Main, "not a mnemonic", None, 0).is_err());
+    }
+
+    async fn account_taddress(connection: &mut SqliteConnection, account: u32) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT ta.address FROM transparent_address_accounts ta
+            JOIN accounts a ON ta.account = a.id_account AND ta.dindex = a.dindex AND ta.scope = 0
+            WHERE ta.account = ?",
+        )
+        .bind(account)
+        .fetch_optional(&mut *connection)
+        .await
+        .expect("account address")
+    }
+
+    async fn scope_of(connection: &mut SqliteConnection, address: &str) -> u32 {
+        sqlx::query_scalar("SELECT scope FROM transparent_address_accounts WHERE address = ?")
+            .bind(address)
+            .fetch_one(&mut *connection)
+            .await
+            .expect("scope")
+    }
+
+    #[tokio::test]
+    async fn generate_next_receive_address_returns_a_fresh_address_each_call() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let own = account_taddress(&mut connection, account)
+            .await
+            .expect("own address");
+
+        let first = generate_next_receive_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("first")
+            .expect("some");
+        let second = generate_next_receive_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("second")
+            .expect("some");
+
+        assert_ne!(first, second);
+        assert_ne!(first, own);
+        assert_ne!(second, own);
+        assert_eq!(scope_of(&mut connection, &first).await, 0);
+        assert_eq!(scope_of(&mut connection, &second).await, 0);
+    }
+
+    #[tokio::test]
+    async fn generate_next_receive_address_leaves_the_account_address_alone() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let before = get_account_full_address(&Network::Main, &mut connection, account, 0, 0)
+            .await
+            .expect("address before");
+
+        generate_next_receive_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("generate");
+
+        let after = get_account_full_address(&Network::Main, &mut connection, account, 0, 0)
+            .await
+            .expect("address after");
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn generate_next_change_address_uses_the_change_scope() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        let change = generate_next_change_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("generate")
+            .expect("some");
+
+        assert_eq!(scope_of(&mut connection, &change).await, 1);
+    }
+
+    #[tokio::test]
+    async fn generate_next_receive_address_without_transparent_key_returns_none() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, Some(2))
+            .await
+            .expect("restore");
+
+        let address = generate_next_receive_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("generate");
+
+        assert!(address.is_none());
     }
 }

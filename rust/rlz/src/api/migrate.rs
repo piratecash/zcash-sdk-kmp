@@ -80,20 +80,53 @@ impl NoteMigration {
     }
 }
 
+impl From<crate::migrate::MigrationEvent> for MigrationEvent {
+    fn from(event: crate::migrate::MigrationEvent) -> Self {
+        match event {
+            crate::migrate::MigrationEvent::SplitComplete { fee } => {
+                MigrationEvent::SplitComplete { fee }
+            }
+            crate::migrate::MigrationEvent::MigrateComplete { fee } => {
+                MigrationEvent::MigrateComplete { fee }
+            }
+            crate::migrate::MigrationEvent::Complete => MigrationEvent::Complete,
+            crate::migrate::MigrationEvent::NothingToDo => MigrationEvent::NothingToDo,
+        }
+    }
+}
+
 /// Single-shot step (kept for FRB generated-code compatibility).
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn step_migration(c: &Coin) -> Result<MigrationEvent> {
-    let (event, _status) = do_step(c, 0, 0, true, true, crate::migrate::ANCHOR_BUCKET_SIZE).await?;
-    Ok(match event {
-        crate::migrate::MigrationEvent::SplitComplete { fee } => {
-            MigrationEvent::SplitComplete { fee }
-        }
-        crate::migrate::MigrationEvent::MigrateComplete { fee } => {
-            MigrationEvent::MigrateComplete { fee }
-        }
-        crate::migrate::MigrationEvent::Complete => MigrationEvent::Complete,
-        crate::migrate::MigrationEvent::NothingToDo => MigrationEvent::NothingToDo,
-    })
+    let (event, _status) = do_step(
+        c,
+        crate::pay::plan::NO_SPENDING_KEY,
+        0,
+        0,
+        true,
+        true,
+        crate::migrate::ANCHOR_BUCKET_SIZE,
+    )
+    .await?;
+    Ok(event.into())
+}
+
+/// Migration status for a host that drives the migration loop itself.
+pub async fn migration_status(c: &Coin) -> Result<MigrationStatus> {
+    current_migration_status(c, 0, 0).await
+}
+
+/// Run one migration step; `usk_bytes` signs whatever transaction it broadcasts.
+///
+/// The step syncs first and then acts at the chain tip, so a host that drives the loop
+/// itself paces the migration by when it calls this. The `flutter` runner keeps its own
+/// anchor-bucket alignment instead. Repeat until the status reports the `complete` phase.
+pub async fn migration_step(
+    c: &Coin,
+    usk_bytes: &[u8],
+) -> Result<(MigrationEvent, MigrationStatus)> {
+    let (event, status) = do_step(c, usk_bytes, 0, 0, true, true, 1).await?;
+    Ok((event.into(), status))
 }
 
 /// Run migration to completion, streaming MigrationStatus to Flutter.
@@ -225,6 +258,7 @@ async fn run_migration(
             }
             result = do_step(
                 c,
+                crate::pay::plan::NO_SPENDING_KEY,
                 acc_split,
                 acc_migrate,
                 align_to_boundary,
@@ -278,6 +312,7 @@ pub async fn get_migration_status(_c: &Coin) -> Result<MigrationStatus> {
 /// built from the current wallet state and accumulated fees.
 async fn do_step(
     c: &Coin,
+    usk_bytes: &[u8],
     acc_split: u64,
     acc_migrate: u64,
     allow_migrate: bool,
@@ -308,6 +343,7 @@ async fn do_step(
             &mut client,
             c.account,
             anchor_bucket_size,
+            usk_bytes,
         )
         .await
         .map_err(|e| anyhow::anyhow!("step: {e}"))?

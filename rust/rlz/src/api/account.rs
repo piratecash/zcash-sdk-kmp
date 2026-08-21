@@ -10,9 +10,12 @@ use csv_async::AsyncWriter;
 use flutter_rust_bridge::frb;
 use sapling_crypto::{zip32::sapling_derive_internal_fvk, PaymentAddress};
 use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
-use zcash_address::unified::{Container, Encoding};
+use zcash_address::{
+    unified::{Container, Encoding},
+    ZcashAddress,
+};
 use zcash_keys::{
-    address::UnifiedAddress,
+    address::{Address, UnifiedAddress},
     encoding::AddressCodec,
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
 };
@@ -23,7 +26,10 @@ use zip32::AccountId;
 #[cfg(feature = "flutter")]
 use crate::{api::pay::PcztPackage, frb_generated::StreamSink};
 use crate::{
-    api::{coin::Coin, pay::SigningEvent},
+    api::{
+        coin::{network_from_coin, Coin},
+        pay::SigningEvent,
+    },
     db::{get_account_dindex, get_account_hw},
     io::{decrypt, encrypt},
     ledger::HWAPI,
@@ -86,23 +92,51 @@ pub async fn get_account_fingerprint(account: u32, c: &Coin) -> Result<Option<St
 
 #[cfg_attr(feature = "flutter", frb(sync))]
 pub fn ua_from_ufvk(ufvk: &str, di: Option<u32>, c: &Coin) -> Result<String> {
-    let network = c.network();
+    Ok(unified_address(c.coin, ufvk, di)?.0)
+}
+
+/// [`ua_from_ufvk`] without a [`Coin`], reporting the diversifier index it used.
+///
+/// Opens no database: a receive screen has to show an address before the wallet is open.
+/// `di` of `None` takes the account's default address.
+pub fn unified_address(coin: u8, ufvk: &str, di: Option<u32>) -> Result<(String, u32)> {
+    let network = network_from_coin(coin);
 
     let ufvk = UnifiedFullViewingKey::decode(&network, ufvk).map_err(|_| anyhow!("Invalid Key"))?;
-    let ua = match di {
-        Some(di) => ufvk.address(di.into(), UnifiedAddressRequest::AllAvailableKeys)?,
+    let (ua, di) = match di {
+        Some(di) => (
+            ufvk.address(di.into(), UnifiedAddressRequest::AllAvailableKeys)?,
+            di,
+        ),
         None => {
-            ufvk.default_address(UnifiedAddressRequest::AllAvailableKeys)?
-                .0
+            let (ua, di) = ufvk.default_address(UnifiedAddressRequest::AllAvailableKeys)?;
+            (ua, u32::try_from(di)?)
         }
     };
 
-    Ok(ua.encode(&network))
+    Ok((ua.encode(&network), di))
+}
+
+/// Unified address of `aindex` for the wallet `phrase` describes, derived without a database.
+pub fn derive_unified_address(
+    coin: u8,
+    phrase: &str,
+    passphrase: Option<&str>,
+    aindex: u32,
+) -> Result<(String, u32)> {
+    let ufvk = crate::account::derive_ufvk(&network_from_coin(coin), phrase, passphrase, aindex)?;
+
+    unified_address(coin, &ufvk, None)
 }
 
 #[cfg_attr(feature = "flutter", frb(sync))]
 pub fn receivers_from_ua(ua: &str, c: &Coin) -> Result<Receivers> {
-    let network = c.network();
+    receivers_of(c.coin, ua)
+}
+
+/// [`receivers_from_ua`] without a [`Coin`]; opens no database.
+pub fn receivers_of(coin: u8, ua: &str) -> Result<Receivers> {
+    let network = network_from_coin(coin);
 
     let (net, ua) = zcash_address::unified::Address::decode(ua)?;
     if net != network.network_type() {
@@ -136,6 +170,34 @@ pub fn receivers_from_ua(ua: &str, c: &Coin) -> Result<Receivers> {
     }
 
     Ok(receivers)
+}
+
+/// Kind of an address that decodes cleanly on a given network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressKind {
+    Transparent,
+    Sapling,
+    Unified,
+    Tex,
+}
+
+/// The kind of `address`, or `None` when it is not a valid address of `coin`'s network.
+///
+/// Opens no database and makes no network call: decoding is what checks the checksum, and
+/// the conversion is what rejects an address of another network.
+pub fn address_kind(coin: u8, address: &str) -> Option<AddressKind> {
+    let network_type = network_from_coin(coin).network_type();
+
+    match ZcashAddress::try_from_encoded(address)
+        .ok()?
+        .convert_if_network(network_type)
+        .ok()?
+    {
+        Address::Transparent(_) => Some(AddressKind::Transparent),
+        Address::Sapling(_) => Some(AddressKind::Sapling),
+        Address::Unified(_) => Some(AddressKind::Unified),
+        Address::Tex(_) => Some(AddressKind::Tex),
+    }
 }
 
 #[derive(Default)]
@@ -248,6 +310,22 @@ pub async fn generate_next_dindex(c: &Coin) -> Result<u32> {
     crate::account::generate_next_dindex(&c.network(), &mut connection, c.account).await
 }
 
+/// Next receive-scope transparent address; `None` when the account has no transparent key.
+///
+/// The account's default address is left where it is, unlike [`generate_next_dindex`].
+pub async fn generate_next_receive_address(c: &Coin) -> Result<Option<String>> {
+    let mut connection = c.get_connection().await?;
+
+    crate::account::generate_next_receive_address(&c.network(), &mut connection, c.account).await
+}
+
+/// Unspent value at `address`, in zatoshi. Nothing is fetched: this is the last sync's view.
+pub async fn transparent_address_balance(c: &Coin, address: &str) -> Result<u64> {
+    let mut connection = c.get_connection().await?;
+
+    crate::db::transparent_address_balance(&mut connection, c.account, address).await
+}
+
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn generate_next_change_address(c: &Coin) -> Result<Option<String>> {
     let mut connection = c.get_connection().await?;
@@ -331,6 +409,12 @@ pub struct Tx {
     pub memo: Option<String>,
     pub is_user_memo: bool,
     pub contact_name: Option<String>,
+    pub fee: u64,
+    pub total_received: u64,
+    /// True when every note this account received here is change coming back.
+    pub is_change: bool,
+    /// The first output that is not ours; absent until transaction details are fetched.
+    pub recipient: Option<String>,
 }
 
 pub struct TAddressTxCount {
@@ -946,3 +1030,78 @@ pub(crate) async fn get_ledger(
 
 #[cfg_attr(feature = "flutter", frb)]
 pub fn dummy_export(_a: SigningEvent) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::tests::TEST_PHRASE;
+    use zcash_address::ToAddress;
+
+    const MAIN: u8 = 0;
+    const TEST: u8 = 1;
+
+    fn main_addresses() -> (String, Receivers) {
+        let (ua, _) = derive_unified_address(MAIN, TEST_PHRASE, None, 0).expect("derive");
+        let receivers = receivers_of(MAIN, &ua).expect("receivers");
+
+        (ua, receivers)
+    }
+
+    #[test]
+    fn address_kind_recognizes_every_receiver_of_a_derived_account() {
+        let (unified, receivers) = main_addresses();
+
+        assert_eq!(Some(AddressKind::Unified), address_kind(MAIN, &unified));
+        assert_eq!(
+            Some(AddressKind::Transparent),
+            address_kind(MAIN, &receivers.taddr.expect("taddr"))
+        );
+        assert_eq!(
+            Some(AddressKind::Sapling),
+            address_kind(MAIN, &receivers.saddr.expect("saddr"))
+        );
+    }
+
+    #[test]
+    fn address_kind_recognizes_a_tex_address() {
+        let (_, receivers) = main_addresses();
+        let network = network_from_coin(MAIN);
+        let TransparentAddress::PublicKeyHash(hash) =
+            TransparentAddress::decode(&network, &receivers.taddr.expect("taddr")).expect("decode")
+        else {
+            panic!("derived transparent receiver is a p2pkh address")
+        };
+        let tex = ZcashAddress::from_tex(network.network_type(), hash).to_string();
+
+        assert_eq!(Some(AddressKind::Tex), address_kind(MAIN, &tex), "{tex}");
+        assert_eq!(None, address_kind(TEST, &tex));
+    }
+
+    #[test]
+    fn address_kind_rejects_a_broken_checksum() {
+        let (unified, receivers) = main_addresses();
+        let transparent = receivers.taddr.expect("taddr");
+
+        for address in [&unified, &transparent] {
+            let mut corrupted = address.clone();
+            let last = corrupted.pop().expect("non-empty");
+            corrupted.push(if last == 'q' { 'p' } else { 'q' });
+
+            assert_eq!(None, address_kind(MAIN, &corrupted), "{address}");
+        }
+    }
+
+    #[test]
+    fn address_kind_rejects_an_address_of_another_network() {
+        let (unified, receivers) = main_addresses();
+
+        assert_eq!(None, address_kind(TEST, &unified));
+        assert_eq!(None, address_kind(TEST, &receivers.taddr.expect("taddr")));
+    }
+
+    #[test]
+    fn address_kind_rejects_text_that_is_not_an_address() {
+        assert_eq!(None, address_kind(MAIN, ""));
+        assert_eq!(None, address_kind(MAIN, TEST_PHRASE));
+    }
+}

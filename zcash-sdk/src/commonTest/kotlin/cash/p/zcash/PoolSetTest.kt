@@ -37,10 +37,23 @@ class PoolSetTest {
     }
 
     @Test
+    fun balance_pendingAndTotal_sumTheirParts() {
+        val balance = Balance(available = 10L, changePending = 3L, valuePending = 7L)
+
+        assertEquals(10L, balance.pending)
+        assertEquals(20L, balance.total)
+    }
+
+    @Test
     fun poolBalance_sumsAndSeparatesTransparent() {
-        val balance = PoolBalance(mapOf(Pool.TRANSPARENT to 100L, Pool.ORCHARD to 250L))
+        val balance = PoolBalance(
+            mapOf(
+                Pool.TRANSPARENT to Balance(available = 100L),
+                Pool.ORCHARD to Balance(available = 250L),
+            )
+        )
         assertEquals(350L, balance.total)
         assertEquals(250L, balance.shielded)
-        assertEquals(0L, balance[Pool.SAPLING])
+        assertEquals(Balance(), balance[Pool.SAPLING])
     }
 }

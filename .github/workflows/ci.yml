@@ -14,6 +14,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # The Kotlin desktop suite only exercises the JNI surface; everything below it
+      # (account derivation, the sync state machine, the SQL) is covered here.
+      - name: Test rust workspace
+        working-directory: rust
+        run: cargo test --workspace
+
   desktop:
     strategy:
       fail-fast: false

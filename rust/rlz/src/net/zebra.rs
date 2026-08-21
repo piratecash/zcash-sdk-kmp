@@ -30,7 +30,12 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 
 const COMPACT_NOTE_SIZE: usize = 52;
 
-use crate::{api::coin::Network, lwd::*, net::LwdServer, IntoAnyhow};
+use crate::{
+    api::coin::Network,
+    lwd::*,
+    net::{BroadcastOutcome, LwdServer},
+    IntoAnyhow,
+};
 
 #[derive(Clone)]
 pub struct ZebraClient {
@@ -219,10 +224,14 @@ impl LwdServer for ZebraClient {
         Ok(cb)
     }
 
-    async fn post_transaction(&mut self, height: u32, tx: &[u8]) -> Result<String> {
+    async fn post_transaction(&mut self, height: u32, tx: &[u8]) -> Result<BroadcastOutcome> {
         let tx_hex = hex::encode(tx);
         let rep = jsonrpc!(self, "sendrawtransaction", [tx_hex], String)?;
-        Ok(rep)
+        // A rejection surfaces as a JSON-RPC error, so reaching here means the node accepted it.
+        Ok(BroadcastOutcome {
+            error_code: 0,
+            message: rep,
+        })
     }
 
     async fn transaction(&mut self, network: &Network, txid: &[u8]) -> Result<(u32, Transaction)> {
@@ -307,9 +316,9 @@ impl LwdServer for ZebraClient {
         Ok(ReceiverStream::new(rx))
     }
 
-    async fn mempool_stream(&mut self, network: &Network) -> Result<Self::TransactionStream> {
-        let (_, rx) = tokio::sync::mpsc::channel::<(u32, Transaction, usize)>(10);
-        Ok(ReceiverStream::new(rx))
+    type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+    async fn mempool_stream(&mut self, _network: &Network) -> Result<Self::MempoolStream> {
+        anyhow::bail!("zebra exposes no mempool stream")
     }
 
     async fn tree_state(&mut self, height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
@@ -497,5 +506,21 @@ mod tests {
             .to_string();
         assert!(err.contains("nym"), "{err}");
         assert!(err.contains("transport 2"), "{err}");
+    }
+
+    /// An empty stream would read as "the epoch ended", and the caller would loop forever.
+    #[tokio::test]
+    async fn mempool_stream_reports_that_zebra_has_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut client = ZebraClient::new(&Network::Main, "https://203.0.113.1:8232", 1, "")
+            .expect("constructing the client must not need the network");
+        let err = client
+            .mempool_stream(&Network::Main)
+            .await
+            .expect_err("zebra has no mempool stream")
+            .to_string();
+
+        assert!(err.contains("mempool"), "{err}");
     }
 }

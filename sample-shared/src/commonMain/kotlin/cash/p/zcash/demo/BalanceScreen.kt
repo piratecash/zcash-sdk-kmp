@@ -54,7 +54,7 @@ internal fun BalanceScreen(
                     style = MaterialTheme.typography.headlineSmall,
                 )
                 Pool.entries.forEach { pool ->
-                    LabeledRow(pool.name.lowercase(), zecAmount(uiState.balance?.get(pool) ?: 0L))
+                    LabeledRow(pool.name.lowercase(), zecAmount(uiState.balance?.get(pool)?.total ?: 0L))
                 }
             }
         }

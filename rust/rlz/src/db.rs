@@ -23,7 +23,8 @@ use crate::api::account::Folder;
 use crate::api::account::TAddressTxCount;
 use crate::api::account::{Account, Memo, Tx};
 use crate::api::coin::Network;
-use crate::api::sync::PoolBalance;
+use crate::api::sync::{Balance, PoolBalance, PoolBalanceBreakdown};
+use crate::pay::pool::NUM_POOLS;
 use crate::sync::BlockHeader;
 use crate::{api::account::TxNote, tiu};
 
@@ -1372,6 +1373,53 @@ pub async fn calculate_balance(
     Ok(balance)
 }
 
+/// Splits each pool's unspent notes into spendable and still-maturing value.
+///
+/// The cutoff is the locally scanned height minus `confirmations`, matching what
+/// `plan_transaction` will accept as an input. Pending value is split by note scope:
+/// internal notes are change coming back, external ones are incoming payments.
+pub async fn calculate_balance_breakdown(
+    connection: &mut SqliteConnection,
+    account: u32,
+    confirmations: u32,
+) -> Result<PoolBalanceBreakdown> {
+    let confirmed_height = get_sync_height(&mut *connection, account)
+        .await?
+        .unwrap_or_default()
+        .saturating_sub(confirmations);
+
+    let mut balance = PoolBalanceBreakdown(vec![Balance::default(); NUM_POOLS]);
+    let mut rows = sqlx::query(
+        "SELECT n.pool,
+            SUM(CASE WHEN n.height <= ?2 THEN n.value ELSE 0 END),
+            SUM(CASE WHEN n.height > ?2 AND n.scope = 1 THEN n.value ELSE 0 END),
+            SUM(CASE WHEN n.height > ?2 AND (n.scope IS NULL OR n.scope <> 1) THEN n.value ELSE 0 END)
+        FROM notes n LEFT JOIN spends s ON s.id_note = n.id_note
+        WHERE n.account = ?1 AND n.id_asset IS NULL AND s.id_note IS NULL
+        GROUP BY n.pool",
+    )
+    .bind(account)
+    .bind(confirmed_height)
+    .map(|row: SqliteRow| {
+        (
+            row.get::<u8, _>(0),
+            row.get::<i64, _>(1),
+            row.get::<i64, _>(2),
+            row.get::<i64, _>(3),
+        )
+    })
+    .fetch(connection);
+    while let Some((pool, available, change_pending, value_pending)) = rows.try_next().await? {
+        balance.0[pool as usize] = Balance {
+            available: available as u64,
+            change_pending: change_pending as u64,
+            value_pending: value_pending as u64,
+        };
+    }
+
+    Ok(balance)
+}
+
 pub async fn fetch_txs(connection: &mut SqliteConnection, account: u32) -> Result<Vec<Tx>> {
     // union notes and spends, then sum value by tx into v to get tx value
     // join transactions with v by id_tx and filter by account
@@ -1380,9 +1428,23 @@ pub async fn fetch_txs(connection: &mut SqliteConnection, account: u32) -> Resul
     let transactions = sqlx::query(
         "SELECT t.id_tx, t.txid, t.height, t.time, t.value, t.tpe, c.name, t.zsa_value, t.price, t.asset_id,
             a.asset_name, a.asset_desc_hash,
-            um.user_memo as memo,
+            COALESCE(NULLIF(um.user_memo, ''), (SELECT m.memo_text FROM memos m
+                WHERE m.account = t.account AND m.tx = t.id_tx AND m.memo_text IS NOT NULL
+                ORDER BY m.pool, m.vout LIMIT 1)) as memo,
             (um.user_memo IS NOT NULL AND um.user_memo != '') as is_user_memo,
-            oc.contact_name
+            oc.contact_name,
+            t.fee,
+            (SELECT COALESCE(SUM(n.value), 0) FROM notes n
+                WHERE n.account = t.account AND n.tx = t.id_tx AND n.id_asset IS NULL) as total_received,
+            (SELECT COUNT(*) FROM notes n
+                WHERE n.account = t.account AND n.tx = t.id_tx AND n.id_asset IS NULL) as received_count,
+            (SELECT COUNT(*) FROM notes n
+                WHERE n.account = t.account AND n.tx = t.id_tx AND n.id_asset IS NULL AND n.scope = 1) as change_count,
+            (SELECT o.address FROM outputs o
+                WHERE o.account = t.account AND o.tx = t.id_tx AND NOT EXISTS (
+                    SELECT 1 FROM notes n
+                    WHERE n.account = o.account AND n.tx = o.tx AND n.pool = o.pool AND n.value = o.value)
+                ORDER BY o.value DESC LIMIT 1) as recipient
             FROM transactions t
             LEFT JOIN categories c ON c.id_category = t.category
             LEFT JOIN assets a ON t.asset_id = a.id_asset
@@ -1413,6 +1475,11 @@ pub async fn fetch_txs(connection: &mut SqliteConnection, account: u32) -> Resul
         let memo: Option<String> = row.get(12);
         let is_user_memo: bool = row.get(13);
         let contact_name: Option<String> = row.get(14);
+        let fee: i64 = row.get(15);
+        let total_received: i64 = row.get(16);
+        let received_count: i64 = row.get(17);
+        let change_count: i64 = row.get(18);
+        let recipient: Option<String> = row.get(19);
         Tx {
             id,
             txid,
@@ -1432,6 +1499,10 @@ pub async fn fetch_txs(connection: &mut SqliteConnection, account: u32) -> Resul
             memo,
             is_user_memo,
             contact_name,
+            fee: fee as u64,
+            total_received: total_received as u64,
+            is_change: received_count > 0 && received_count == change_count,
+            recipient,
         }
     })
     .fetch_all(&mut *connection)
@@ -1695,6 +1766,62 @@ pub async fn get_zsa_holdings(
     .await?;
 
     Ok(holdings)
+}
+
+/// Unspent value at one transparent address of `account`, in zatoshi.
+///
+/// Reads only the local database, so it is exactly as fresh as the last sync.
+pub async fn transparent_address_balance(
+    connection: &mut SqliteConnection,
+    account: u32,
+    address: &str,
+) -> Result<u64> {
+    let balance: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(n.value), 0) FROM notes n
+        JOIN transparent_address_accounts ta ON ta.id_taddress = n.taddress
+        LEFT JOIN spends s ON s.id_note = n.id_note
+        WHERE n.account = ?1 AND n.pool = 0 AND n.id_asset IS NULL
+            AND s.id_note IS NULL AND ta.address = ?2",
+    )
+    .bind(account)
+    .bind(address)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(balance.max(0) as u64)
+}
+
+/// The account's own default address first, then every other receive address, then the newest
+/// `limit` change addresses. Receive addresses are handed to payers and can be paid at any later
+/// time, so none of them may fall out of the scan set; change addresses only appear on a spend.
+/// The final `ORDER BY` is what fixes the scan order — a bare `UNION ALL` promises none.
+pub async fn transparent_addresses_to_scan(
+    connection: &mut SqliteConnection,
+    account: u32,
+    limit: u32,
+) -> Result<Vec<(u32, String)>> {
+    let addresses = sqlx::query(
+        "WITH change AS
+        (SELECT * FROM transparent_address_accounts WHERE account = ?1 AND scope = 1 ORDER BY dindex DESC LIMIT ?2)
+        SELECT ta.id_taddress, ta.address,
+            CASE WHEN ta.dindex = a.dindex THEN 0 ELSE 1 END AS scan_order, ta.dindex
+        FROM transparent_address_accounts ta
+            LEFT JOIN accounts a ON a.id_account = ta.account
+        WHERE ta.account = ?1 AND ta.scope = 0
+        UNION ALL SELECT id_taddress, address, 2, dindex FROM change
+        ORDER BY scan_order, dindex DESC",
+    )
+    .bind(account)
+    .bind(limit)
+    .map(|row: SqliteRow| {
+        let id_taddress: u32 = row.get(0);
+        let address: String = row.get(1);
+        (id_taddress, address)
+    })
+    .fetch_all(&mut *connection)
+    .await?;
+
+    Ok(addresses)
 }
 
 pub async fn fetch_transparent_address_tx_count(
@@ -2132,6 +2259,367 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) const ACCOUNT: u32 = 1;
+
+    /// `scope`: 0 external (incoming), 1 internal (change), NULL for transparent notes.
+    async fn insert_note(
+        connection: &mut SqliteConnection,
+        id_note: u32,
+        tx: u32,
+        pool: u8,
+        height: u32,
+        value: u64,
+        scope: Option<u8>,
+    ) {
+        sqlx::query(
+            "INSERT INTO notes(id_note, height, account, pool, scope, nullifier, tx, value)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(id_note)
+        .bind(height)
+        .bind(ACCOUNT)
+        .bind(pool)
+        .bind(scope)
+        .bind(id_note.to_le_bytes().to_vec())
+        .bind(tx)
+        .bind(value as i64)
+        .execute(connection)
+        .await
+        .expect("note");
+    }
+
+    async fn spend_note(connection: &mut SqliteConnection, id_note: u32, pool: u8, height: u32) {
+        sqlx::query(
+            "INSERT INTO spends(id_note, height, account, pool, tx, value)
+             SELECT id_note, ?2, account, ?3, 0, -value FROM notes WHERE id_note = ?1",
+        )
+        .bind(id_note)
+        .bind(height)
+        .bind(pool)
+        .execute(connection)
+        .await
+        .expect("spend");
+    }
+
+    async fn set_sync_height(connection: &mut SqliteConnection, height: u32) {
+        for pool in 0..NUM_POOLS as u8 {
+            set_pool_sync_height(&mut *connection, pool, height).await;
+        }
+    }
+
+    pub(crate) async fn set_pool_sync_height(
+        connection: &mut SqliteConnection,
+        pool: u8,
+        height: u32,
+    ) {
+        set_pool_sync_height_for_account(connection, ACCOUNT, pool, height).await;
+    }
+
+    pub(crate) async fn set_pool_sync_height_for_account(
+        connection: &mut SqliteConnection,
+        account: u32,
+        pool: u8,
+        height: u32,
+    ) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO sync_heights(account, pool, height) VALUES (?1, ?2, ?3)",
+        )
+        .bind(account)
+        .bind(pool)
+        .bind(height)
+        .execute(&mut *connection)
+        .await
+        .expect("sync height");
+    }
+
+    #[tokio::test]
+    async fn calculate_balance_breakdown_splits_pending_by_note_scope() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 1, 80, 100, Some(0)).await;
+        insert_note(&mut connection, 2, 0, 1, 95, 30, Some(0)).await;
+        insert_note(&mut connection, 3, 0, 1, 96, 7, Some(1)).await;
+        insert_note(&mut connection, 4, 0, 2, 80, 5, Some(0)).await;
+
+        let breakdown = calculate_balance_breakdown(&mut connection, ACCOUNT, 10)
+            .await
+            .expect("breakdown");
+
+        assert_eq!(
+            breakdown.0[1],
+            Balance {
+                available: 100,
+                change_pending: 7,
+                value_pending: 30,
+            }
+        );
+        assert_eq!(
+            breakdown.0[2],
+            Balance {
+                available: 5,
+                ..Balance::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn calculate_balance_breakdown_spent_note_is_excluded_everywhere() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 1, 80, 100, Some(0)).await;
+        insert_note(&mut connection, 2, 0, 1, 95, 30, Some(0)).await;
+        spend_note(&mut connection, 1, 1, 99).await;
+
+        let breakdown = calculate_balance_breakdown(&mut connection, ACCOUNT, 10)
+            .await
+            .expect("breakdown");
+
+        assert_eq!(
+            breakdown.0[1],
+            Balance {
+                available: 0,
+                change_pending: 0,
+                value_pending: 30,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn calculate_balance_breakdown_zero_confirmations_totals_match_calculate_balance() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 1, 80, 100, Some(0)).await;
+        insert_note(&mut connection, 2, 0, 1, 100, 30, Some(1)).await;
+        insert_note(&mut connection, 3, 0, 2, 90, 5, Some(0)).await;
+        spend_note(&mut connection, 1, 1, 99).await;
+
+        let breakdown = calculate_balance_breakdown(&mut connection, ACCOUNT, 0)
+            .await
+            .expect("breakdown");
+        let total = calculate_balance(&mut connection, ACCOUNT, None)
+            .await
+            .expect("balance");
+
+        for pool in 0..NUM_POOLS {
+            let b = breakdown.0[pool];
+            assert_eq!(b.change_pending, 0, "pool {pool}");
+            assert_eq!(b.value_pending, 0, "pool {pool}");
+            assert_eq!(b.available, total.0[pool], "pool {pool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn calculate_balance_breakdown_unsynced_account_reports_everything_pending() {
+        let mut connection = memory_db().await;
+        insert_note(&mut connection, 1, 0, 1, 80, 100, Some(0)).await;
+
+        let breakdown = calculate_balance_breakdown(&mut connection, ACCOUNT, 10)
+            .await
+            .expect("breakdown");
+
+        assert_eq!(
+            breakdown.0[1],
+            Balance {
+                available: 0,
+                change_pending: 0,
+                value_pending: 100,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn calculate_balance_breakdown_transparent_note_without_scope_counts_as_incoming() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 0, 95, 42, None).await;
+
+        let breakdown = calculate_balance_breakdown(&mut connection, ACCOUNT, 10)
+            .await
+            .expect("breakdown");
+
+        assert_eq!(
+            breakdown.0[0],
+            Balance {
+                available: 0,
+                change_pending: 0,
+                value_pending: 42,
+            }
+        );
+    }
+
+    const TX: u32 = 7;
+
+    async fn insert_tx(connection: &mut SqliteConnection, id_tx: u32, value: i64, fee: u64) {
+        sqlx::query(
+            "INSERT INTO transactions(id_tx, txid, height, account, time, value, fee)
+             VALUES (?1, ?2, 100, ?3, 1700000000, ?4, ?5)",
+        )
+        .bind(id_tx)
+        .bind(id_tx.to_le_bytes().to_vec())
+        .bind(ACCOUNT)
+        .bind(value)
+        .bind(fee as i64)
+        .execute(connection)
+        .await
+        .expect("transaction");
+    }
+
+    async fn insert_output(
+        connection: &mut SqliteConnection,
+        tx: u32,
+        pool: u8,
+        vout: u32,
+        value: u64,
+        address: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO outputs(account, height, tx, pool, vout, value, address)
+             VALUES (?1, 100, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(ACCOUNT)
+        .bind(tx)
+        .bind(pool)
+        .bind(vout)
+        .bind(value as i64)
+        .bind(address)
+        .execute(connection)
+        .await
+        .expect("output");
+    }
+
+    async fn insert_memo(
+        connection: &mut SqliteConnection,
+        tx: u32,
+        pool: u8,
+        vout: u32,
+        text: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO memos(account, height, tx, pool, vout, memo_text, memo_bytes)
+             VALUES (?1, 100, ?2, ?3, ?4, ?5, x'00')",
+        )
+        .bind(ACCOUNT)
+        .bind(tx)
+        .bind(pool)
+        .bind(vout)
+        .bind(text)
+        .execute(connection)
+        .await
+        .expect("memo");
+    }
+
+    async fn insert_user_memo(connection: &mut SqliteConnection, tx: u32, text: &str) {
+        sqlx::query("INSERT INTO user_memos(account, id_tx, user_memo) VALUES (?1, ?2, ?3)")
+            .bind(ACCOUNT)
+            .bind(tx)
+            .bind(text)
+            .execute(connection)
+            .await
+            .expect("user memo");
+    }
+
+    async fn single_tx(connection: &mut SqliteConnection) -> Tx {
+        fetch_txs(connection, ACCOUNT)
+            .await
+            .expect("transactions")
+            .pop()
+            .expect("one transaction")
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_on_chain_memo_is_reported_when_the_user_wrote_none() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -3_000, 1_000).await;
+        insert_memo(&mut connection, TX, 3, 1, "second output").await;
+        insert_memo(&mut connection, TX, 2, 0, "first output").await;
+
+        let tx = single_tx(&mut connection).await;
+
+        assert_eq!(Some("first output".to_string()), tx.memo);
+        assert!(!tx.is_user_memo);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_user_memo_overrides_the_on_chain_one() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -3_000, 1_000).await;
+        insert_memo(&mut connection, TX, 2, 0, "on chain").await;
+        insert_user_memo(&mut connection, TX, "my note").await;
+
+        let tx = single_tx(&mut connection).await;
+
+        assert_eq!(Some("my note".to_string()), tx.memo);
+        assert!(tx.is_user_memo);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_total_received_counts_only_notes_of_that_transaction() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -3_000, 1_000).await;
+        insert_note(&mut connection, 1, TX, 2, 100, 600, Some(0)).await;
+        insert_note(&mut connection, 2, TX, 3, 100, 400, Some(1)).await;
+        insert_note(&mut connection, 3, TX + 1, 2, 100, 999, Some(0)).await;
+
+        let tx = single_tx(&mut connection).await;
+
+        assert_eq!(1_000, tx.total_received);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_only_internal_notes_mark_the_transaction_as_change() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -1_000, 1_000).await;
+        insert_note(&mut connection, 1, TX, 2, 100, 600, Some(1)).await;
+        insert_note(&mut connection, 2, TX, 3, 100, 400, Some(1)).await;
+
+        assert!(single_tx(&mut connection).await.is_change);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_one_external_note_keeps_the_transaction_out_of_change() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -1_000, 1_000).await;
+        insert_note(&mut connection, 1, TX, 2, 100, 600, Some(1)).await;
+        insert_note(&mut connection, 2, TX, 3, 100, 400, Some(0)).await;
+
+        assert!(!single_tx(&mut connection).await.is_change);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_transaction_without_notes_is_not_change() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -1_000, 1_000).await;
+
+        assert!(!single_tx(&mut connection).await.is_change);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_recipient_skips_the_output_that_came_back_to_us() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -3_000, 1_000).await;
+        insert_note(&mut connection, 1, TX, 2, 100, 6_000, Some(1)).await;
+        insert_output(&mut connection, TX, 2, 0, 6_000, "own-change").await;
+        insert_output(&mut connection, TX, 2, 1, 3_000, "recipient").await;
+
+        let tx = single_tx(&mut connection).await;
+
+        assert_eq!(Some("recipient".to_string()), tx.recipient);
+        assert_eq!(1_000, tx.fee);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_transaction_without_details_has_no_recipient_and_no_fee() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, 5_000, 0).await;
+        insert_note(&mut connection, 1, TX, 2, 100, 5_000, Some(0)).await;
+
+        let tx = single_tx(&mut connection).await;
+
+        assert_eq!(None, tx.recipient);
+        assert_eq!(0, tx.fee);
+        assert_eq!(5_000, tx.total_received);
+    }
+
     #[tokio::test]
     async fn scrub_spending_keys_clears_secrets_and_keeps_viewing_keys() {
         let mut connection = memory_db().await;
@@ -2169,5 +2657,261 @@ pub(crate) mod tests {
         scrub_spending_keys(&mut connection)
             .await
             .expect("second scrub");
+    }
+
+    async fn insert_taddress(connection: &mut SqliteConnection, id_taddress: u32, address: &str) {
+        insert_scoped_taddress(connection, id_taddress, 0, id_taddress, address).await;
+    }
+
+    pub(crate) async fn insert_scoped_taddress(
+        connection: &mut SqliteConnection,
+        id_taddress: u32,
+        scope: u32,
+        dindex: u32,
+        address: &str,
+    ) {
+        insert_scoped_taddress_for_account(
+            connection,
+            ACCOUNT,
+            id_taddress,
+            scope,
+            dindex,
+            address,
+        )
+        .await;
+    }
+
+    pub(crate) async fn insert_scoped_taddress_for_account(
+        connection: &mut SqliteConnection,
+        account: u32,
+        id_taddress: u32,
+        scope: u32,
+        dindex: u32,
+        address: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO transparent_address_accounts(id_taddress, account, scope, dindex, pk, address)
+             VALUES (?1, ?2, ?3, ?4, x'00', ?5)",
+        )
+        .bind(id_taddress)
+        .bind(account)
+        .bind(scope)
+        .bind(dindex)
+        .bind(address)
+        .execute(&mut *connection)
+        .await
+        .expect("taddress");
+    }
+
+    async fn insert_account(connection: &mut SqliteConnection, dindex: u32) {
+        sqlx::query(
+            "INSERT INTO accounts(id_account, name, aindex, dindex, def_dindex, birth, position,
+             use_internal, hidden, saved)
+             VALUES (?1, 'test', 0, ?2, ?2, 0, 0, FALSE, FALSE, TRUE)",
+        )
+        .bind(ACCOUNT)
+        .bind(dindex)
+        .execute(&mut *connection)
+        .await
+        .expect("account");
+    }
+
+    async fn insert_transparent_note(
+        connection: &mut SqliteConnection,
+        id_note: u32,
+        value: u64,
+        id_taddress: u32,
+    ) {
+        insert_note(&mut *connection, id_note, 0, 0, 100, value, None).await;
+        sqlx::query("UPDATE notes SET taddress = ?2 WHERE id_note = ?1")
+            .bind(id_note)
+            .bind(id_taddress)
+            .execute(&mut *connection)
+            .await
+            .expect("taddress of note");
+    }
+
+    #[tokio::test]
+    async fn transparent_address_balance_counts_unspent_notes_of_that_address_only() {
+        let mut connection = memory_db().await;
+        insert_taddress(&mut connection, 1, "t1first").await;
+        insert_taddress(&mut connection, 2, "t1second").await;
+        insert_transparent_note(&mut connection, 1, 100, 1).await;
+        insert_transparent_note(&mut connection, 2, 30, 1).await;
+        insert_transparent_note(&mut connection, 3, 7, 2).await;
+        spend_note(&mut connection, 2, 0, 110).await;
+
+        let first = transparent_address_balance(&mut connection, ACCOUNT, "t1first")
+            .await
+            .expect("balance");
+        let second = transparent_address_balance(&mut connection, ACCOUNT, "t1second")
+            .await
+            .expect("balance");
+
+        assert_eq!(first, 100);
+        assert_eq!(second, 7);
+    }
+
+    #[tokio::test]
+    async fn transparent_address_balance_unknown_address_is_zero() {
+        let mut connection = memory_db().await;
+        insert_taddress(&mut connection, 1, "t1first").await;
+        insert_transparent_note(&mut connection, 1, 100, 1).await;
+
+        let balance = transparent_address_balance(&mut connection, ACCOUNT, "t1other")
+            .await
+            .expect("balance");
+
+        assert_eq!(balance, 0);
+    }
+
+    #[tokio::test]
+    async fn transparent_address_balance_ignores_notes_of_another_account() {
+        let mut connection = memory_db().await;
+        insert_taddress(&mut connection, 1, "t1first").await;
+        insert_transparent_note(&mut connection, 1, 100, 1).await;
+
+        let balance = transparent_address_balance(&mut connection, ACCOUNT + 1, "t1first")
+            .await
+            .expect("balance");
+
+        assert_eq!(balance, 0);
+    }
+
+    /// The signal `generate_next_transparent_address` retries on.
+    #[tokio::test]
+    async fn store_account_transparent_addr_reports_an_index_taken_by_someone_else() {
+        let mut connection = memory_db().await;
+
+        let first = store_account_transparent_addr(
+            &mut connection,
+            ACCOUNT,
+            0,
+            7,
+            None,
+            b"pk",
+            "t1a",
+            false,
+        )
+        .await
+        .expect("first insert");
+        let second = store_account_transparent_addr(
+            &mut connection,
+            ACCOUNT,
+            0,
+            7,
+            None,
+            b"pk",
+            "t1b",
+            false,
+        )
+        .await
+        .expect("second insert");
+
+        assert!(first);
+        assert!(!second);
+    }
+
+    #[tokio::test]
+    async fn transparent_addresses_to_scan_takes_the_newest_of_each_scope() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1default").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 1, "t1receive").await;
+        insert_scoped_taddress(&mut connection, 3, 1, 0, "t1change").await;
+
+        let scanned = transparent_addresses_to_scan(&mut connection, ACCOUNT, 100)
+            .await
+            .expect("addresses");
+
+        let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(addresses, vec!["t1default", "t1receive", "t1change"]);
+    }
+
+    /// The account's own address is the one that must never be dropped from a short window.
+    #[tokio::test]
+    async fn transparent_addresses_to_scan_scans_the_default_address_first() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1default").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 1, "t1one").await;
+        insert_scoped_taddress(&mut connection, 3, 1, 0, "t1change").await;
+
+        let scanned = transparent_addresses_to_scan(&mut connection, ACCOUNT, 100)
+            .await
+            .expect("addresses");
+
+        assert_eq!(scanned.first().map(|(_, a)| a.as_str()), Some("t1default"));
+    }
+
+    /// A receive address is handed to a payer, who can pay it at any later time, so no number of
+    /// newer addresses may push it out of the scan set.
+    #[tokio::test]
+    async fn transparent_addresses_to_scan_keeps_every_issued_receive_address() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1default").await;
+        for dindex in 1..=3 {
+            insert_scoped_taddress(
+                &mut connection,
+                dindex + 1,
+                0,
+                dindex,
+                &format!("t1one{dindex}"),
+            )
+            .await;
+        }
+
+        let scanned = transparent_addresses_to_scan(&mut connection, ACCOUNT, 2)
+            .await
+            .expect("addresses");
+
+        let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(
+            addresses,
+            vec!["t1default", "t1one3", "t1one2", "t1one1"],
+            "no receive address may be dropped, whatever the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn transparent_addresses_to_scan_scans_the_default_before_older_receive_addresses() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 1).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1old").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 1, "t1default").await;
+        insert_scoped_taddress(&mut connection, 3, 0, 2, "t1one").await;
+
+        let scanned = transparent_addresses_to_scan(&mut connection, ACCOUNT, 2)
+            .await
+            .expect("addresses");
+
+        let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(addresses, vec!["t1default", "t1one", "t1old"]);
+    }
+
+    /// Change addresses stay bounded: they are internal, and only a spend can create one.
+    #[tokio::test]
+    async fn transparent_addresses_to_scan_bounds_the_change_window() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1default").await;
+        for dindex in 0..=2 {
+            insert_scoped_taddress(
+                &mut connection,
+                dindex + 2,
+                1,
+                dindex,
+                &format!("t1change{dindex}"),
+            )
+            .await;
+        }
+
+        let scanned = transparent_addresses_to_scan(&mut connection, ACCOUNT, 2)
+            .await
+            .expect("addresses");
+
+        let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(addresses, vec!["t1default", "t1change2", "t1change1"]);
     }
 }

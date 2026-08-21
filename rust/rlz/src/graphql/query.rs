@@ -304,7 +304,7 @@ impl Query {
         let mut client = context.coin.client().await?;
         let height = client.latest_height().await?;
         let result = client.post_transaction(height, &tx).await?;
-        Ok(result)
+        Ok(result.message)
     }
 }
 

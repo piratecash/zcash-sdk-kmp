@@ -738,7 +738,7 @@ pub async fn do_sign_impl(
         delete_frost_state(&mut *connection).await?;
 
         status.send(SigningStatus::SendingTransaction).await;
-        let txid = send(client, height, &tx_bytes).await?;
+        let txid = send(client, height, &tx_bytes).await?.message;
         info!("Transaction sent: {}", txid);
         status.send(SigningStatus::TransactionSent(txid)).await;
     }

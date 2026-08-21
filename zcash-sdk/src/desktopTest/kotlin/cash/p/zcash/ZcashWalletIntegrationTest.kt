@@ -11,7 +11,12 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.runBlocking
 
 /** Published BIP-39 test vector (all-zero entropy) — never holds funds. */
@@ -19,6 +24,29 @@ private const val TEST_PHRASE =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
 private const val BIRTH_HEIGHT = 2_000_000
+
+/** BIP-39 passphrase, the "25th word": a different wallet from the very same phrase. */
+private const val TEST_PASSPHRASE = "pepper"
+
+private const val TEST_PHRASE_PASSPHRASE_USK_SHA256 =
+    "fe58e5f0215f80de0fd298d04c27192dd6ffc0c0848b7f6ddae6704588962163"
+
+/** BIP-44 `m/44'/133'/0'/0/3` of the BIP-39 seed of [TEST_PHRASE] with [TEST_PASSPHRASE]. */
+private const val TEST_PHRASE_PASSPHRASE_TRANSPARENT = "t1WaKiZ8GaKjV8seRko8T5j8s4UXTZcGBPi"
+
+/**
+ * Cross-vendor vector: the ECC SDK derives these receivers from [ECC_PHRASE] with an empty
+ * passphrase (`app/src/androidTest/.../ZcashAddressDerivationTest.kt`). Holds no funds.
+ */
+private const val ECC_PHRASE =
+    "deputy visa gentle among clean scout farm drive comfort patch skin salt ranch cool ramp " +
+        "warrior drink narrow normal lunch behind salt deal person"
+private const val ECC_TRANSPARENT_RECEIVER = "t1WksXp7ci6XkPNkEHNkFfzQXbRpBCQw7kW"
+private const val ECC_SAPLING_RECEIVER =
+    "zs1yc4sgtfwwzz6xfsy2xsradzr6m4aypgxhfw2vcn3hatrh5ryqsr08sgpemlg39vdh9kfupx20py"
+
+/** ZIP-320 form of [ECC_TRANSPARENT_RECEIVER] — the one address kind nothing else here produces. */
+private const val ECC_TEX_RECEIVER = "tex134f6aaltdxvueh5uwl65wwfr5n2jr4fmcakzpq"
 
 /** Pinned in the Rust tests too: both sides must derive the very same spending key. */
 private const val TEST_PHRASE_USK_SHA256 =
@@ -69,9 +97,133 @@ class ZcashWalletIntegrationTest {
     fun balance_freshAccount_isZeroInEveryPool() = withWallet { wallet ->
         val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
 
-        val balance = wallet.balance(id)
+        val balance = wallet.balance(id, confirmations = 0)
         assertEquals(0L, balance.total)
-        Pool.entries.forEach { assertEquals(0L, balance[it], "pool $it") }
+        Pool.entries.forEach { assertEquals(Balance(), balance[it], "pool $it") }
+    }
+
+    @Test
+    fun balance_unsyncedAccount_confirmationThresholdIsAcceptedByTheNativeLayer() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            val balance = wallet.balance(id, confirmations = 10)
+
+            assertEquals(0L, balance.total)
+            assertEquals(0L, balance.available)
+        }
+
+    @Test
+    fun balance_negativeConfirmations_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> { wallet.balance(id, confirmations = -1) }
+    }
+
+    @Test
+    fun nextTransparentAddress_calledTwice_yieldsTwoUnusedAddresses() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val own = assertNotNull(wallet.addresses(id).transparent)
+
+        val first = assertNotNull(wallet.nextTransparentAddress(id))
+        val second = assertNotNull(wallet.nextTransparentAddress(id))
+
+        assertTrue(first.startsWith("t1"))
+        assertTrue(second.startsWith("t1"))
+        assertNotEquals(first, second)
+        assertNotEquals(own, first)
+        assertNotEquals(own, second)
+    }
+
+    @Test
+    fun nextTransparentAddress_calledConcurrently_neverHandsOutTheSameAddressTwice() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+            val callers = 8
+
+            val addresses = coroutineScope {
+                List(callers) { async { wallet.nextTransparentAddress(id) } }.awaitAll()
+            }
+
+            assertEquals(callers, addresses.filterNotNull().distinct().size)
+        }
+
+    @Test
+    fun nextTransparentAddress_afterGenerating_theAccountKeepsItsOwnAddresses() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+            val before = wallet.addresses(id)
+
+            wallet.nextTransparentAddress(id)
+
+            assertEquals(before, wallet.addresses(id))
+        }
+
+    @Test
+    fun transparentBalance_freshAccount_isZero() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val address = assertNotNull(wallet.nextTransparentAddress(id))
+
+        assertEquals(0L, wallet.transparentBalance(id, address))
+    }
+
+    @Test
+    fun transparentBalance_addressOfAnotherWallet_isZeroRatherThanAnError() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertEquals(0L, wallet.transparentBalance(id, ECC_TRANSPARENT_RECEIVER))
+    }
+
+    @Test
+    fun transparentBalance_blankAddress_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> { wallet.transparentBalance(id, " ") }
+    }
+
+    @Test
+    fun migrationStatus_freshAccount_hasNothingToMigrate() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertEquals(
+            MigrationStatus(
+                phase = MigrationPhase.COMPLETE,
+                standardNotes = 0,
+                nonStandardNotes = 0,
+                migratedNotes = 0,
+            ),
+            wallet.migrationStatus(id),
+        )
+    }
+
+    @Test
+    fun migrationStep_unreachableServer_failsWithAZcashException() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val key = ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN)
+
+        assertFailsWith<ZcashException> { wallet.migrationStep(id, key) }
+        Unit
+    }
+
+    @Test
+    fun mempool_unreachableServer_endsTheFlowWithTheConnectionFailure() = withWallet { wallet ->
+        wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        val failure = assertFailsWith<ZcashException> { wallet.mempool().collect { } }
+
+        // The exact reason matters: a native panic would surface as a ZcashException too.
+        assertTrue(failure.message.orEmpty().contains("Connection refused"), failure.message)
+    }
+
+    @Test
+    fun mempool_leavingTheFlow_releasesTheRunForTheNextCollection() = withWallet { wallet ->
+        wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        val first = assertFailsWith<ZcashException> { wallet.mempool().collect { } }
+        val second = assertFailsWith<ZcashException> { wallet.mempool().collect { } }
+
+        // A leaked run would fail the second collection with "mempool is already running".
+        assertEquals(first.message, second.message)
     }
 
     @Test
@@ -104,7 +256,7 @@ class ZcashWalletIntegrationTest {
         val id = wallet.restoreAccount(name = "watch-only", key = TEST_UFVK, birthHeight = BIRTH_HEIGHT)
 
         assertTrue(assertNotNull(wallet.addresses(id).unified).startsWith("u1"))
-        assertEquals(0L, wallet.balance(id).total)
+        assertEquals(0L, wallet.balance(id, confirmations = 0).total)
     }
 
     @Test
@@ -134,6 +286,161 @@ class ZcashWalletIntegrationTest {
             val key = ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN, index)
             assertTrue(key.isNotEmpty(), "account index $index")
         }
+    }
+
+    @Test
+    fun deriveSpendingKey_bip39Passphrase_yieldsADifferentKeyThanWithoutOne() = runBlocking {
+        val plain = ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN)
+        val peppered =
+            ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN, passphrase = TEST_PASSPHRASE)
+
+        assertNotEquals(sha256Hex(plain), sha256Hex(peppered))
+        assertEquals(TEST_PHRASE_PASSPHRASE_USK_SHA256, sha256Hex(peppered))
+        assertContentEquals(
+            peppered,
+            ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN, passphrase = TEST_PASSPHRASE),
+        )
+    }
+
+    @Test
+    fun deriveSpendingKey_emptyPassphrase_matchesNoPassphraseAtAll() = runBlocking {
+        assertContentEquals(
+            ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN),
+            ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN, passphrase = ""),
+        )
+    }
+
+    @Test
+    fun deriveAddresses_withoutOpeningAWallet_matchTheRestoredAccount() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertEquals(
+            wallet.addresses(id),
+            ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN),
+        )
+    }
+
+    @Test
+    fun deriveAddressesFromViewingKey_withoutOpeningAWallet_matchTheWatchOnlyAccount() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "watch-only", key = TEST_UFVK, birthHeight = BIRTH_HEIGHT)
+
+            assertEquals(
+                wallet.addresses(id),
+                ZcashSdk.deriveAddressesFromViewingKey(TEST_UFVK, ZcashNetwork.MAIN),
+            )
+        }
+
+    @Test
+    fun deriveAddresses_eccVectorPhrase_deriveTheSameReceiversAsTheEccSdk() = runBlocking {
+        val addresses = ZcashSdk.deriveAddresses(ECC_PHRASE, ZcashNetwork.MAIN)
+
+        assertEquals(ECC_TRANSPARENT_RECEIVER, addresses.transparent)
+        assertEquals(ECC_SAPLING_RECEIVER, addresses.sapling)
+    }
+
+    @Test
+    fun deriveAddresses_bip39Passphrase_yieldDifferentAddressesThanWithoutOne() = runBlocking {
+        val plain = ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN)
+        val peppered =
+            ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN, passphrase = TEST_PASSPHRASE)
+
+        assertNotEquals(plain.unified, peppered.unified)
+        assertEquals(TEST_PHRASE_PASSPHRASE_TRANSPARENT, peppered.transparent)
+    }
+
+    @Test
+    fun deriveAddresses_accountIndex_selectsADifferentAccountAndRejectsANegativeOne() = runBlocking {
+        assertFailsWith<IllegalArgumentException> {
+            ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN, accountIndex = -1)
+        }
+
+        assertNotEquals(
+            ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN).unified,
+            ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN, accountIndex = 1).unified,
+        )
+    }
+
+    @Test
+    fun deriveAddresses_invalidPhrase_failsWithAZcashException() = runBlocking {
+        assertFailsWith<ZcashException> {
+            ZcashSdk.deriveAddresses("not a seed phrase", ZcashNetwork.MAIN)
+        }
+        Unit
+    }
+
+    @Test
+    fun deriveAddressesFromViewingKey_invalidKey_failsWithAZcashException() = runBlocking {
+        assertFailsWith<ZcashException> {
+            ZcashSdk.deriveAddressesFromViewingKey("not a viewing key", ZcashNetwork.MAIN)
+        }
+        Unit
+    }
+
+    @Test
+    fun addressKind_validAddresses_areClassifiedWithoutAWalletOrACoroutine() {
+        assertEquals(
+            ZcashAddressKind.TRANSPARENT,
+            ZcashSdk.addressKind(ECC_TRANSPARENT_RECEIVER, ZcashNetwork.MAIN),
+        )
+        assertEquals(
+            ZcashAddressKind.SAPLING,
+            ZcashSdk.addressKind(ECC_SAPLING_RECEIVER, ZcashNetwork.MAIN),
+        )
+        assertEquals(ZcashAddressKind.TEX, ZcashSdk.addressKind(ECC_TEX_RECEIVER, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun addressKind_unifiedAddress_isUnifiedWhateverReceiversItHolds() = runBlocking {
+        val unified = assertNotNull(ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN).unified)
+
+        assertEquals(ZcashAddressKind.UNIFIED, ZcashSdk.addressKind(unified, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun addressKind_brokenChecksum_isNotAnAddress() {
+        listOf(ECC_TRANSPARENT_RECEIVER, ECC_SAPLING_RECEIVER, ECC_TEX_RECEIVER).forEach { address ->
+            val corrupted = address.dropLast(1) + if (address.last() == 'q') 'p' else 'q'
+
+            assertNull(ZcashSdk.addressKind(corrupted, ZcashNetwork.MAIN), address)
+        }
+    }
+
+    @Test
+    fun addressKind_addressOfAnotherNetwork_isNotAnAddress() {
+        assertNull(ZcashSdk.addressKind(ECC_TRANSPARENT_RECEIVER, ZcashNetwork.TEST))
+        assertNull(ZcashSdk.addressKind(ECC_SAPLING_RECEIVER, ZcashNetwork.TEST))
+    }
+
+    @Test
+    fun addressKind_textThatIsNotAnAddress_isNotAnAddress() {
+        assertNull(ZcashSdk.addressKind("", ZcashNetwork.MAIN))
+        assertNull(ZcashSdk.addressKind(TEST_PHRASE, ZcashNetwork.MAIN))
+        assertNull(ZcashSdk.addressKind(TEST_UFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun restoreAccount_eccVectorPhrase_derivesTheSameReceiversAsTheEccSdk() = withWallet { wallet ->
+        val account = wallet.restoreAccount(name = "ecc", key = ECC_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val addresses = wallet.addresses(account)
+
+        assertEquals(ECC_TRANSPARENT_RECEIVER, addresses.transparent)
+        assertEquals(ECC_SAPLING_RECEIVER, addresses.sapling)
+    }
+
+    @Test
+    fun restoreAccount_bip39Passphrase_derivesDifferentAddressesThanWithoutOne() = withWallet { wallet ->
+        val plain = wallet.restoreAccount(name = "plain", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val peppered = wallet.restoreAccount(
+            name = "peppered",
+            key = TEST_PHRASE,
+            birthHeight = BIRTH_HEIGHT,
+            passphrase = TEST_PASSPHRASE,
+        )
+
+        assertNotEquals(wallet.addresses(plain).unified, wallet.addresses(peppered).unified)
+        assertNotEquals(wallet.addresses(plain).sapling, wallet.addresses(peppered).sapling)
+        assertEquals(TEST_PHRASE_PASSPHRASE_TRANSPARENT, wallet.addresses(peppered).transparent)
     }
 
     @Test

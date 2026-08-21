@@ -113,6 +113,10 @@ internal data class TransactionDto(
     val time: Long,
     val value: Long,
     val memo: String? = null,
+    val fee: Long = 0,
+    val totalReceived: Long = 0,
+    val isChange: Boolean = false,
+    val recipient: String? = null,
 ) {
     fun toTransaction(): Transaction = Transaction(
         id = id,
@@ -121,6 +125,10 @@ internal data class TransactionDto(
         time = time,
         value = value,
         memo = memo,
+        fee = fee,
+        totalReceived = totalReceived,
+        isChange = isChange,
+        recipient = recipient,
     )
 }
 
@@ -139,10 +147,139 @@ internal fun encodeRecipients(recipients: List<Recipient>): String =
 internal fun parseTransactionPlan(json: String): TransactionPlan =
     nativeJson.decodeFromString<TxPlanDto>(json).toTransactionPlan()
 
-/** The native layer returns one balance per pool, in [Pool] bit order. */
+/** The native layer returns three longs per pool — available, change, value — in [Pool] bit order. */
 internal fun LongArray.toPoolBalance(): PoolBalance =
-    PoolBalance(Pool.entries.associateWith { getOrElse(it.bit) { 0L } })
+    PoolBalance(
+        Pool.entries.associateWith { pool ->
+            val base = pool.bit * BALANCE_FIELDS
+            Balance(
+                available = getOrElse(base) { 0L },
+                changePending = getOrElse(base + 1) { 0L },
+                valuePending = getOrElse(base + 2) { 0L },
+            )
+        }
+    )
+
+private const val BALANCE_FIELDS = 3
 
 /** [Pool.bit] is the wire index for a single pool (distinct from [PoolSet]'s bitmask). */
 private fun Int.toPool(): Pool =
     checkNotNull(Pool.entries.firstOrNull { it.bit == this }) { "Unknown pool bit: $this" }
+
+@Serializable
+internal data class MigrationStatusDto(
+    val phase: String,
+    val sdNotesCount: Int,
+    val nonSdNotesCount: Int,
+    val ironwoodSdCount: Int,
+) {
+    fun toMigrationStatus(): MigrationStatus = MigrationStatus(
+        phase = phase.toMigrationPhase(),
+        standardNotes = sdNotesCount,
+        nonStandardNotes = nonSdNotesCount,
+        migratedNotes = ironwoodSdCount,
+    )
+}
+
+@Serializable
+internal data class MigrationStepDto(
+    val event: String,
+    val fee: Long,
+    val status: MigrationStatusDto,
+) {
+    fun toMigrationStep(): MigrationStep = MigrationStep(
+        event = event.toMigrationEvent(),
+        fee = fee,
+        status = status.toMigrationStatus(),
+    )
+}
+
+internal fun parseAddressKind(wire: String): ZcashAddressKind? = when (wire) {
+    "transparent" -> ZcashAddressKind.TRANSPARENT
+    "sapling" -> ZcashAddressKind.SAPLING
+    "unified" -> ZcashAddressKind.UNIFIED
+    "tex" -> ZcashAddressKind.TEX
+    "invalid" -> null
+    else -> throw ZcashException("Unknown address kind: $wire")
+}
+
+private fun String.toMigrationPhase(): MigrationPhase = when (this) {
+    "splitting" -> MigrationPhase.SPLITTING
+    "migrating" -> MigrationPhase.MIGRATING
+    "complete" -> MigrationPhase.COMPLETE
+    else -> throw ZcashException("Unknown migration phase: $this")
+}
+
+private fun String.toMigrationEvent(): MigrationEvent = when (this) {
+    "splitComplete" -> MigrationEvent.SPLIT_COMPLETE
+    "migrateComplete" -> MigrationEvent.MIGRATE_COMPLETE
+    "complete" -> MigrationEvent.COMPLETE
+    "nothingToDo" -> MigrationEvent.NOTHING_TO_DO
+    else -> throw ZcashException("Unknown migration event: $this")
+}
+
+internal fun parseMigrationStatus(json: String): MigrationStatus =
+    nativeJson.decodeFromString<MigrationStatusDto>(json).toMigrationStatus()
+
+internal fun parseMigrationStep(json: String): MigrationStep =
+    nativeJson.decodeFromString<MigrationStepDto>(json).toMigrationStep()
+
+@Serializable
+internal data class BroadcastResultDto(
+    val errorCode: Int,
+    val message: String,
+)
+
+internal fun parseBroadcastResult(json: String): BroadcastResult =
+    nativeJson.decodeFromString<BroadcastResultDto>(json).let {
+        BroadcastResult(errorCode = it.errorCode, message = it.message)
+    }
+
+@Serializable
+internal data class MempoolAmountDto(
+    val account: Int,
+    val value: Long,
+) {
+    fun toMempoolAmount(): MempoolAmount = MempoolAmount(account, value)
+}
+
+@Serializable
+internal data class MempoolNoteDto(
+    val account: Int,
+    val value: Long,
+    val pool: Int,
+    val memo: String? = null,
+) {
+    fun toMempoolNote(): MempoolNote = MempoolNote(account, value, pool.toPool(), memo)
+}
+
+/** Flat on purpose: `kind` is read as an ordinary field, never as a polymorphic discriminator. */
+@Serializable
+internal data class MempoolEventDto(
+    val kind: String,
+    val height: Int = 0,
+    val txid: String = "",
+    val amounts: List<MempoolAmountDto> = emptyList(),
+    val notes: List<MempoolNoteDto> = emptyList(),
+    val size: Int = 0,
+    val error: String? = null,
+)
+
+/** `null` means the run ended on its own; an end caused by a failure throws instead. */
+internal fun parseMempoolEvent(json: String): MempoolEvent? =
+    nativeJson.decodeFromString<MempoolEventDto>(json).toMempoolEvent()
+
+private fun MempoolEventDto.toMempoolEvent(): MempoolEvent? = when (kind) {
+    "epoch" -> MempoolEvent.Epoch(height)
+    "unconfirmed" -> MempoolEvent.Unconfirmed(
+        txid = txid,
+        amounts = amounts.map(MempoolAmountDto::toMempoolAmount),
+        notes = notes.map(MempoolNoteDto::toMempoolNote),
+        size = size,
+    )
+    "ended" -> {
+        if (error != null) throw ZcashException(error)
+        null
+    }
+    else -> throw ZcashException("Unknown mempool event: $kind")
+}

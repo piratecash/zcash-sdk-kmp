@@ -27,6 +27,14 @@ pub fn is_nym_url(url: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(NYM_URL_SCHEME.as_bytes()))
 }
 
+/// Raw outcome of a broadcast. A non-zero `error_code` means the node rejected the
+/// transaction and `message` carries its reason; on success `message` is the txid.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BroadcastOutcome {
+    pub error_code: i32,
+    pub message: String,
+}
+
 #[async_trait]
 pub trait LwdServer: Send {
     async fn latest_height(&mut self) -> Result<u32>;
@@ -41,7 +49,7 @@ pub trait LwdServer: Send {
     ) -> Result<Self::CompactBlockStream>;
 
     async fn transaction(&mut self, network: &Network, txid: &[u8]) -> Result<(u32, Transaction)>;
-    async fn post_transaction(&mut self, height: u32, tx: &[u8]) -> Result<String>;
+    async fn post_transaction(&mut self, height: u32, tx: &[u8]) -> Result<BroadcastOutcome>;
 
     type TransactionStream: Stream<Item = (u32, Transaction, usize)>;
     async fn taddress_txs(
@@ -52,7 +60,10 @@ pub trait LwdServer: Send {
         end: u32,
     ) -> Result<Self::TransactionStream>;
 
-    async fn mempool_stream(&mut self, network: &Network) -> Result<Self::TransactionStream>;
+    /// Items are fallible on purpose: the reader runs in its own task, so a mid-stream failure
+    /// would otherwise be indistinguishable from the server ending the epoch.
+    type MempoolStream: Stream<Item = Result<(u32, Transaction, usize)>>;
+    async fn mempool_stream(&mut self, network: &Network) -> Result<Self::MempoolStream>;
 
     async fn tree_state(&mut self, height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)>;
 }

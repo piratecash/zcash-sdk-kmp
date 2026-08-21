@@ -1,13 +1,30 @@
 package cash.p.zcash
 
+/**
+ * One pool's unspent value in zatoshi, split by whether it can be spent yet.
+ *
+ * [changePending] is change coming back from own spends, [valuePending] is incoming payments.
+ */
+public data class Balance(
+    val available: Long = 0L,
+    val changePending: Long = 0L,
+    val valuePending: Long = 0L,
+) {
+    public val pending: Long get() = changePending + valuePending
+
+    public val total: Long get() = available + pending
+}
+
 /** Per-pool balances of a single account, in zatoshi. */
-public data class PoolBalance(private val byPool: Map<Pool, Long>) {
+public data class PoolBalance(private val byPool: Map<Pool, Balance>) {
 
-    public operator fun get(pool: Pool): Long = byPool[pool] ?: 0L
+    public operator fun get(pool: Pool): Balance = byPool[pool] ?: Balance()
 
-    public val total: Long get() = byPool.values.sum()
+    public val available: Long get() = byPool.values.sumOf { it.available }
 
-    public val shielded: Long get() = total - get(Pool.TRANSPARENT)
+    public val total: Long get() = byPool.values.sumOf { it.total }
+
+    public val shielded: Long get() = total - get(Pool.TRANSPARENT).total
 }
 
 /**
@@ -21,6 +38,16 @@ public data class Addresses(
     val transparent: String?,
     val diversifierIndex: Int,
 )
+
+/** The kinds of address the SDK can decode. A UA is [UNIFIED] whatever it holds. */
+public enum class ZcashAddressKind {
+    TRANSPARENT,
+    SAPLING,
+    UNIFIED,
+
+    /** ZIP-320 transparent-source-only address. */
+    TEX,
+}
 
 public sealed interface SyncState {
     public data object Stopped : SyncState
@@ -108,6 +135,12 @@ public data class Transaction(
     val time: Long,
     val value: Long,
     val memo: String?,
+    val fee: Long,
+    /** Sum of the notes this account received here, before change is netted out of [value]. */
+    val totalReceived: Long,
+    val isChange: Boolean,
+    /** First output that is not ours; null until transaction details are fetched. */
+    val recipient: String?,
 )
 
 /** What [ZcashWallet.plan] reports before a transaction is signed or broadcast. */
@@ -135,3 +168,84 @@ internal fun syncProgressOf(packed: Long): SyncProgress? = when (packed) {
     0L -> null
     else -> SyncProgress(height = (packed ushr Int.SIZE_BITS).toInt(), time = packed and 0xFFFF_FFFFL)
 }
+
+/**
+ * Where the Orchard → Ironwood migration stands. Notes are first split into standard
+ * denominations ([MigrationPhase.SPLITTING]), then moved one at a time
+ * ([MigrationPhase.MIGRATING]), so a single step never finishes the whole pool.
+ */
+public data class MigrationStatus(
+    val phase: MigrationPhase,
+    val standardNotes: Int,
+    val nonStandardNotes: Int,
+    val migratedNotes: Int,
+)
+
+public enum class MigrationPhase {
+    SPLITTING,
+    MIGRATING,
+    COMPLETE,
+}
+
+/** What one [ZcashWallet.migrationStep] did. [fee] is zero for the events that broadcast nothing. */
+public data class MigrationStep(
+    val event: MigrationEvent,
+    val fee: Long,
+    val status: MigrationStatus,
+)
+
+public enum class MigrationEvent {
+    SPLIT_COMPLETE,
+    MIGRATE_COMPLETE,
+    COMPLETE,
+
+    /** Nothing to do yet: the migration is waiting for its next anchor block. */
+    NOTHING_TO_DO,
+}
+
+/**
+ * The node's verdict on a broadcast. [errorCode] `0` means the transaction was accepted and
+ * [message] is its txid; anything else is a rejection and [message] is the node's reason.
+ */
+public data class BroadcastResult(
+    val errorCode: Int,
+    val message: String,
+) {
+    public val accepted: Boolean get() = errorCode == 0
+}
+
+/**
+ * One observation of the mempool. The flow ends when the native run stops — cleanly on
+ * cancellation, with a [ZcashException] when reading failed.
+ */
+public sealed interface MempoolEvent {
+
+    /**
+     * A new observation epoch opened at [height]. It is NOT a claim that anything was mined:
+     * the height is read before the stream reopens, so a transaction seen in the previous
+     * epoch may still be unmined and still in the mempool.
+     */
+    public data class Epoch(val height: Int) : MempoolEvent
+
+    /** A transaction sitting in the mempool that decrypted for at least one local account. */
+    public data class Unconfirmed(
+        val txid: String,
+        val amounts: List<MempoolAmount>,
+        val notes: List<MempoolNote>,
+        val size: Int,
+    ) : MempoolEvent
+}
+
+/** The net value an unconfirmed transaction moves for one account, in zatoshi. */
+public data class MempoolAmount(
+    val account: Int,
+    val value: Long,
+)
+
+/** [memo] belongs to this note only — on a spend that is the memo of someone else's output. */
+public data class MempoolNote(
+    val account: Int,
+    val value: Long,
+    val pool: Pool,
+    val memo: String?,
+)

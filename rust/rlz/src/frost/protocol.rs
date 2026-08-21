@@ -554,7 +554,8 @@ pub async fn publish(
         .context("extract_transaction in DKG publish")?;
     let result = crate::pay::send(client, height, &txb)
         .await
-        .context("send in DKG publish")?;
+        .context("send in DKG publish")?
+        .message;
     if hex::decode(&result).is_err() {
         anyhow::bail!(result);
     }

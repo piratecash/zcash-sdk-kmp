@@ -8,7 +8,7 @@ use crate::{
     db::get_account_hw,
     pay::{
         fee::{FeeManager, COST_PER_ACTION},
-        plan::{extract_transaction, plan_transaction, sign_transaction, NO_SPENDING_KEY},
+        plan::{extract_transaction, plan_transaction, sign_transaction},
         pool::PoolMask,
         send, Recipient,
     },
@@ -185,12 +185,16 @@ pub(crate) fn next_anchor_bucket_height(height: u32, bucket_size: u32) -> u32 {
 }
 
 /// Run one migration step. Fully idempotent — re-scans notes on every call.
+///
+/// `usk_bytes` signs the transaction this step broadcasts; this fork keeps no
+/// spending key in the database, so the host has to supply it.
 pub async fn step(
     network: &Network,
     connection: &mut SqliteConnection,
     client: &mut Client,
     account: u32,
     anchor_bucket_size: u32,
+    usk_bytes: &[u8],
 ) -> Result<MigrationEvent> {
     let height = client.latest_height().await?;
     let checkpoint_height = crate::sync::get_db_height(&mut *connection, account)
@@ -338,7 +342,7 @@ pub async fn step(
                 .map(|p| p.fee)
                 .unwrap_or(0);
             let pczt =
-                sign_transaction(&mut *connection, account, network, &pczt, NO_SPENDING_KEY)
+                sign_transaction(&mut *connection, account, network, &pczt, usk_bytes)
                     .await?;
             let tx_bytes = extract_transaction(&pczt).await?;
             let _txid = send(client, height, &tx_bytes).await?;
@@ -432,7 +436,7 @@ pub async fn step(
             .map(|p| p.fee)
             .unwrap_or(0);
         let pczt =
-            sign_transaction(&mut *connection, account, network, &pczt, NO_SPENDING_KEY).await?;
+            sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
         let tx_bytes = extract_transaction(&pczt).await?;
         let _txid = send(client, height, &tx_bytes).await?;
 

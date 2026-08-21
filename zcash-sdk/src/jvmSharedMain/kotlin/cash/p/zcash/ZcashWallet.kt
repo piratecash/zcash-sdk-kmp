@@ -1,6 +1,7 @@
 package cash.p.zcash
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -13,7 +14,9 @@ import kotlinx.coroutines.withContext
 private const val DEFAULT_ACTIONS_PER_SYNC = 100_000
 private const val DEFAULT_TRANSPARENT_LIMIT = 100
 private const val DEFAULT_CHECKPOINT_AGE = 10_000
+private const val DEFAULT_GAP_LIMIT = 20
 private const val PROGRESS_SAMPLE_MS = 250L
+private const val MEMPOOL_POLL_MS = 500L
 
 /**
  * One open wallet database.
@@ -40,6 +43,10 @@ public class ZcashWallet private constructor(private val handle: Long) {
      * Only a seed phrase yields a spendable account: its spending key is derived on demand
      * with [ZcashSdk.deriveSpendingKey]. Every other key restores watch-only, and such an
      * account reports `canSign = false`.
+     *
+     * [passphrase] is the BIP-39 passphrase (the "25th word") and applies to a seed phrase
+     * only; the same passphrase must be passed to [ZcashSdk.deriveSpendingKey], otherwise
+     * signing derives a key for a different wallet.
      */
     public suspend fun restoreAccount(
         name: String,
@@ -47,9 +54,10 @@ public class ZcashWallet private constructor(private val handle: Long) {
         birthHeight: Int = 0,
         pools: PoolSet = PoolSet.ALL,
         accountIndex: Int = 0,
+        passphrase: String? = null,
     ): Int {
         require(key.isNotBlank()) { "Restore key must not be blank" }
-        return newAccount(name, key, birthHeight, pools, accountIndex)
+        return newAccount(name, key, passphrase, birthHeight, pools, accountIndex)
     }
 
     public suspend fun accounts(): List<AccountInfo> =
@@ -60,11 +68,47 @@ public class ZcashWallet private constructor(private val handle: Long) {
     /** Makes [id] the account the native layer works with by default. */
     public suspend fun selectAccount(id: Int): Unit = withNative { ZcashJni.setAccount(handle, id) }
 
-    public suspend fun balance(id: Int): PoolBalance =
-        withNative { ZcashJni.balance(handle, id).toPoolBalance() }
+    /**
+     * Balance of [id], split into spendable and pending value.
+     *
+     * A note counts as available once it is [confirmations] blocks deep in the locally
+     * scanned chain — the same cutoff a spend of it would have to clear.
+     */
+    public suspend fun balance(id: Int, confirmations: Int): PoolBalance {
+        require(confirmations >= 0) { "Confirmations must not be negative: $confirmations" }
+        return withNative { ZcashJni.balance(handle, id, confirmations).toPoolBalance() }
+    }
 
     public suspend fun addresses(id: Int): Addresses =
         withNative { parseAddresses(ZcashJni.accountAddresses(handle, id)) }
+
+    /**
+     * A fresh transparent address of [id] for one-time use, or `null` when the account has no
+     * transparent key. The address [addresses] reports stays where it is.
+     */
+    public suspend fun nextTransparentAddress(id: Int): String? =
+        withNative { ZcashJni.nextTransparentAddress(handle, id) }
+
+    /**
+     * Unspent value at [address] in zatoshi, as of the last sync — nothing is fetched here.
+     *
+     * Addresses outside [id] are simply worth nothing, not an error.
+     */
+    public suspend fun transparentBalance(id: Int, address: String): Long {
+        require(address.isNotBlank()) { "Address must not be blank" }
+        return withNative { ZcashJni.transparentBalance(handle, id, address) }
+    }
+
+    /**
+     * Re-derives the transparent addresses [id] handed out before it was restored and stores those
+     * the server knows a transaction for. A restore keeps the keys but not the address rows, so
+     * money received on a one-time address stays invisible until this runs. Returns how many
+     * addresses were added; it stops once it passes [gapLimit] unused addresses in a row.
+     */
+    public suspend fun discoverTransparentAddresses(id: Int, gapLimit: Int = DEFAULT_GAP_LIMIT): Int {
+        val endHeight = latestHeight()
+        return withNative { ZcashJni.discoverTransparentAddresses(handle, id, endHeight, gapLimit) }
+    }
 
     /** Transactions already written to the local database — a sync is what adds new ones. */
     public suspend fun transactions(id: Int): List<Transaction> =
@@ -115,8 +159,9 @@ public class ZcashWallet private constructor(private val handle: Long) {
     public suspend fun extract(transaction: PreparedTransaction): ByteArray =
         withNative { ZcashJni.extractTransaction(transaction.bytes) }
 
-    public suspend fun broadcast(rawTransaction: ByteArray, height: Int): String =
-        withNative { ZcashJni.broadcastTransaction(handle, height, rawTransaction) }
+    /** Hands [rawTransaction] to the node and reports its verdict without interpreting it. */
+    public suspend fun broadcast(rawTransaction: ByteArray, height: Int): BroadcastResult =
+        withNative { parseBroadcastResult(ZcashJni.broadcastTransaction(handle, height, rawTransaction)) }
 
     /**
      * The full send path: prepare, plan (for its height), sign, extract, broadcast. Returns
@@ -136,8 +181,27 @@ public class ZcashWallet private constructor(private val handle: Long) {
         val height = plan(prepared).height
         val signed = sign(account, prepared, spendingKey)
         val raw = extract(signed)
-        return broadcast(raw, height)
+        val result = broadcast(raw, height)
+        if (!result.accepted) {
+            throw ZcashException("Broadcast rejected (${result.errorCode}): ${result.message}")
+        }
+        return result.message
     }
+
+    /** Where the Orchard → Ironwood migration currently stands for [account]. */
+    public suspend fun migrationStatus(account: Int): MigrationStatus =
+        withNative { parseMigrationStatus(ZcashJni.migrationStatus(handle, account)) }
+
+    /**
+     * Runs one step of the migration, signing and broadcasting on its own.
+     *
+     * The protocol moves one note per transaction, so the caller repeats this until the
+     * reported phase is [MigrationPhase.COMPLETE] and paces the loop itself.
+     *
+     * [spendingKey] must belong to [account]; see [send] for the key-handling contract.
+     */
+    public suspend fun migrationStep(account: Int, spendingKey: ByteArray): MigrationStep =
+        withNative { parseMigrationStep(ZcashJni.migrationStep(handle, account, spendingKey)) }
 
     /**
      * Scans [accountIds] up to the current chain tip.
@@ -218,10 +282,36 @@ public class ZcashWallet private constructor(private val handle: Long) {
         withContext(Dispatchers.IO) { mapNativeError { ZcashJni.cancelSync() } }
     }
 
+    /**
+     * Unconfirmed transactions the configured server sees, for every account of this wallet.
+     *
+     * The subscription is process-wide, so a second collection while one is running fails.
+     * Nothing here is written to the database: these events live only as long as they are
+     * collected. Collection ends when the native run does — cleanly on [stopMempool], with a
+     * [ZcashException] when reading failed — and leaving the flow always stops the run.
+     */
+    public fun mempool(): Flow<MempoolEvent> = flow {
+        withNative { ZcashJni.mempoolStart(handle) }
+        try {
+            while (true) {
+                val json = withNative { ZcashJni.mempoolNext(MEMPOOL_POLL_MS) } ?: continue
+                emit(parseMempoolEvent(json) ?: break)
+            }
+        } finally {
+            withContext(NonCancellable) { stopMempool() }
+        }
+    }
+
+    /** Stops the subscription, returning only after the native reader has actually stopped. */
+    public suspend fun stopMempool() {
+        withContext(Dispatchers.IO) { mapNativeError { ZcashJni.mempoolStop() } }
+    }
+
     /** Releases the handle. Calling it again, or any other method afterwards, is safe. */
     public suspend fun close() {
         if (closed) return
         if (syncing) cancelSync()
+        stopMempool()
         closed = true
         withContext(Dispatchers.IO) { mapNativeError { ZcashJni.close(handle) } }
     }
@@ -229,12 +319,15 @@ public class ZcashWallet private constructor(private val handle: Long) {
     private suspend fun newAccount(
         name: String,
         key: String,
+        passphrase: String?,
         birthHeight: Int,
         pools: PoolSet,
         accountIndex: Int,
     ): Int {
         require(!pools.isEmpty) { "An account needs at least one pool" }
-        return withNative { ZcashJni.newAccount(handle, name, key, birthHeight, pools.mask, accountIndex) }
+        return withNative {
+            ZcashJni.newAccount(handle, name, key, passphrase, birthHeight, pools.mask, accountIndex)
+        }
     }
 
     /** The height every synced account has reached, so [SyncState.Synced] reports the real tip. */

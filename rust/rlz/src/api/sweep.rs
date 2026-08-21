@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "flutter")]
 use crate::frb_generated::StreamSink;
 use crate::{api::coin::Coin, sync::transparent_sweep};
+
 #[cfg(feature = "flutter")]
 use flutter_rust_bridge::frb;
 
@@ -49,4 +50,28 @@ impl TransparentScanner {
         self.cancellation_token.cancel();
         Ok(())
     }
+}
+
+/// Rediscovers transparent addresses the account handed out before it was restored: a restore
+/// keeps the keys but not the address rows, so payments made to a one-time address stay invisible
+/// until it is derived again. Returns how many addresses were added.
+#[cfg_attr(feature = "flutter", frb)]
+pub async fn discover_transparent_addresses(
+    end_height: u32,
+    gap_limit: u32,
+    c: &Coin,
+) -> Result<u32> {
+    let mut connection = c.get_connection().await?;
+    let mut client = c.client().await?;
+    crate::sync::discover_transparent_addresses(
+        &c.network(),
+        &mut connection,
+        &mut client,
+        c.account,
+        end_height,
+        gap_limit,
+        |_| {},
+        CancellationToken::new(),
+    )
+    .await
 }

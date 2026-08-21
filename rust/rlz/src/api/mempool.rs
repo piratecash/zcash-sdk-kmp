@@ -5,32 +5,28 @@ pub use tokio_util::sync::CancellationToken;
 use crate::api::coin::Coin;
 #[cfg(feature = "flutter")]
 use crate::frb_generated::StreamSink;
+use crate::Sink;
 #[cfg(feature = "flutter")]
 use flutter_rust_bridge::frb;
 
-#[cfg(feature = "flutter")]
-async fn run_mempool(
-    mempool_sink: StreamSink<MempoolMsg>,
+/// Runs the subscription until it is cancelled or the stream fails.
+///
+/// The only way in for a consumer outside this crate: a `Coin`'s connection and client are
+/// crate-private, so the run cannot be assembled from the outside.
+pub async fn observe_mempool<S: Sink<MempoolMsg> + Send + 'static>(
+    mempool_sink: S,
     cancel_token: CancellationToken,
     c: &Coin,
 ) -> Result<()> {
     let mut connection = c.get_connection().await?;
-    let r = crate::mempool::run_mempool(
+    crate::mempool::run_mempool_impl(
         mempool_sink,
         &c.network(),
         &mut connection,
         &mut c.client().await?,
         cancel_token,
     )
-    .await;
-    match r {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!("Error running mempool: {:#}", e);
-            return Err(e);
-        }
-    }
-    Ok(())
+    .await
 }
 
 #[cfg_attr(feature = "flutter", frb)]
@@ -95,7 +91,7 @@ impl Mempool {
         let ct = CancellationToken::new();
         self.cancel_token = Some(ct.clone());
         self.runtime.spawn(async move {
-            if let Err(e) = run_mempool(mempool_sink, ct, &c).await {
+            if let Err(e) = observe_mempool(mempool_sink, ct, &c).await {
                 tracing::error!("Error running mempool: {:#}", e);
             }
         });

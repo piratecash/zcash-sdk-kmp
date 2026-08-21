@@ -46,17 +46,74 @@ public object ZcashSdk {
  * database. The key is returned to the caller and never kept by the SDK.
  *
  * [accountIndex] is a zip32 account index in `0..Int.MAX_VALUE`.
+ *
+ * [passphrase] is the BIP-39 passphrase (the "25th word") and must match the one the account
+ * was restored with, otherwise the key belongs to a different wallet.
  */
 public suspend fun ZcashSdk.deriveSpendingKey(
     phrase: String,
     network: ZcashNetwork,
     accountIndex: Int = 0,
+    passphrase: String? = null,
 ): ByteArray {
     require(accountIndex >= 0) { "Account index must not be negative" }
     NativeLibrary.ensureLoaded()
     return withContext(Dispatchers.IO) {
-        mapNativeError { ZcashJni.deriveSpendingKey(network.coin, phrase, accountIndex) }
+        mapNativeError { ZcashJni.deriveSpendingKey(network.coin, phrase, passphrase, accountIndex) }
     }
+}
+
+/**
+ * Every address of [accountIndex] for the wallet [phrase] describes.
+ *
+ * Needs no [ZcashSdk.initialize] and no open wallet, so a receive screen can show an address
+ * before the wallet is opened. The result matches [ZcashWallet.addresses] of an account
+ * restored from the same phrase, index and passphrase.
+ */
+public suspend fun ZcashSdk.deriveAddresses(
+    phrase: String,
+    network: ZcashNetwork,
+    accountIndex: Int = 0,
+    passphrase: String? = null,
+): Addresses {
+    require(accountIndex >= 0) { "Account index must not be negative" }
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError {
+            parseAddresses(
+                ZcashJni.deriveAddresses(network.coin, phrase, passphrase, accountIndex)
+            )
+        }
+    }
+}
+
+/**
+ * [deriveAddresses] for a watch-only wallet: every address the unified full viewing key
+ * [viewingKey] yields, without a database.
+ */
+public suspend fun ZcashSdk.deriveAddressesFromViewingKey(
+    viewingKey: String,
+    network: ZcashNetwork,
+): Addresses {
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError { parseAddresses(ZcashJni.addressesFromViewingKey(network.coin, viewingKey)) }
+    }
+}
+
+/**
+ * The kind of [address] on [network], or `null` when it is not a valid address there.
+ *
+ * Decoding checks the checksum and the network prefix, reads no database and makes no network
+ * call — hence a plain function. Keeping it synchronous is deliberate: a caller gating a button
+ * on the result cannot race a stale answer against newer input.
+ *
+ * The very first call blocks while the native library loads, unless [ZcashSdk.initialize] or any
+ * other SDK call already did it.
+ */
+public fun ZcashSdk.addressKind(address: String, network: ZcashNetwork): ZcashAddressKind? {
+    NativeLibrary.ensureLoadedBlocking()
+    return mapNativeError { parseAddressKind(ZcashJni.addressKind(network.coin, address)) }
 }
 
 /**

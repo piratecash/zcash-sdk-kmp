@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{api::pay::PcztPackage, Client};
+use crate::{api::pay::PcztPackage, net::BroadcastOutcome, Client};
 
 use crate::api::coin::Network;
 use anyhow::Result;
@@ -313,11 +313,11 @@ pub struct TxPlanOut {
     pub asset_name: String, // "ZEC" for ZEC, asset name for ZSA
 }
 
-pub async fn send(client: &mut Client, height: u32, data: &[u8]) -> Result<String> {
+pub async fn send(client: &mut Client, height: u32, data: &[u8]) -> Result<BroadcastOutcome> {
     let span = span!(Level::INFO, "transaction");
-    let txid = client.post_transaction(height, data).await?;
+    let outcome = client.post_transaction(height, data).await?;
     span.in_scope(|| {
-        info!("TXID: {}", txid);
+        info!("TXID: {}", outcome.message);
     });
-    Ok(txid)
+    Ok(outcome)
 }

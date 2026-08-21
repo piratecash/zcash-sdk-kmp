@@ -5,6 +5,9 @@
 //! the native side at all.
 
 use rlz::api::account::{Account, Receivers, Tx};
+use rlz::api::mempool::{MempoolAmount, MempoolMsg, MempoolNote};
+use rlz::api::migrate::{MigrationEvent, MigrationStatus};
+use rlz::net::BroadcastOutcome;
 use rlz::pay::{Recipient, TxPlan, TxPlanIn, TxPlanOut};
 use serde::{Deserialize, Serialize};
 
@@ -164,6 +167,10 @@ pub struct TxDto {
     pub time: u32,
     pub value: i64,
     pub memo: Option<String>,
+    pub fee: u64,
+    pub total_received: u64,
+    pub is_change: bool,
+    pub recipient: Option<String>,
 }
 
 impl From<&Tx> for TxDto {
@@ -182,6 +189,95 @@ impl From<&Tx> for TxDto {
             time: t.time,
             value: t.value,
             memo: t.memo.clone(),
+            fee: t.fee,
+            total_received: t.total_received,
+            is_change: t.is_change,
+            recipient: t.recipient.clone(),
+        }
+    }
+}
+
+/// The node's verdict on a broadcast. `errorCode` 0 means accepted and `message` is the txid.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcastResultDto {
+    pub error_code: i32,
+    pub message: String,
+}
+
+impl From<BroadcastOutcome> for BroadcastResultDto {
+    fn from(outcome: BroadcastOutcome) -> Self {
+        BroadcastResultDto {
+            error_code: outcome.error_code,
+            message: outcome.message,
+        }
+    }
+}
+
+/// The net value an unconfirmed transaction moves for one account, in zatoshi.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MempoolAmountDto {
+    pub account: u32,
+    pub value: i64,
+}
+
+impl From<&MempoolAmount> for MempoolAmountDto {
+    fn from(a: &MempoolAmount) -> Self {
+        MempoolAmountDto {
+            account: a.account,
+            value: a.value,
+        }
+    }
+}
+
+/// What an ephemeral history row is built from; rlz's remaining note fields stay native detail.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MempoolNoteDto {
+    pub account: u32,
+    pub value: i64,
+    pub pool: u8,
+    pub memo: Option<String>,
+}
+
+impl From<&MempoolNote> for MempoolNoteDto {
+    fn from(n: &MempoolNote) -> Self {
+        MempoolNoteDto {
+            account: n.account,
+            value: n.value,
+            pool: n.pool,
+            memo: n.memo.clone(),
+        }
+    }
+}
+
+/// One event of the mempool subscription, tagged so Kotlin branches on `kind`.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MempoolEventDto {
+    /// A new observation epoch opened at this height — not a claim that anything was mined.
+    Epoch { height: u32 },
+    Unconfirmed {
+        txid: String,
+        amounts: Vec<MempoolAmountDto>,
+        notes: Vec<MempoolNoteDto>,
+        size: u32,
+    },
+    /// The run stopped for good; `error` is absent when it was cancelled.
+    Ended { error: Option<String> },
+}
+
+impl From<MempoolMsg> for MempoolEventDto {
+    fn from(msg: MempoolMsg) -> Self {
+        match msg {
+            MempoolMsg::BlockHeight(height) => MempoolEventDto::Epoch { height },
+            MempoolMsg::TxId(tx) => MempoolEventDto::Unconfirmed {
+                txid: tx.txid,
+                amounts: tx.amounts.iter().map(MempoolAmountDto::from).collect(),
+                notes: tx.notes.iter().map(MempoolNoteDto::from).collect(),
+                size: tx.size,
+            },
         }
     }
 }
@@ -190,6 +286,7 @@ impl From<&Tx> for TxDto {
 mod tests {
     use super::*;
     use rlz::api::account::Folder;
+    use rlz::api::mempool::MempoolTx;
 
     fn account() -> Account {
         Account {
@@ -214,6 +311,71 @@ mod tests {
             time: 1_700_000_000,
             balance: 123_456_789,
         }
+    }
+
+    fn migration_status() -> MigrationStatus {
+        MigrationStatus {
+            phase: "migrating".to_string(),
+            split_fees: 10_000,
+            migrate_fees: 20_000,
+            total_fees: 30_000,
+            sd_notes_count: 4,
+            non_sd_notes_count: 1,
+            ironwood_sd_count: 2,
+            progress: 0.5,
+            next_action: "Preparing migration transaction...".to_string(),
+            work_summary: "4 notes left".to_string(),
+        }
+    }
+
+    #[test]
+    fn broadcast_result_dto_round_trips_a_rejection() {
+        let dto = BroadcastResultDto::from(BroadcastOutcome {
+            error_code: -25,
+            message: "missing inputs".to_string(),
+        });
+        let json = serde_json::to_string(&dto).unwrap();
+
+        assert!(json.contains("errorCode"));
+        assert_eq!(
+            dto,
+            serde_json::from_str::<BroadcastResultDto>(&json).unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_status_dto_round_trips() {
+        let dto = MigrationStatusDto::from(migration_status());
+        let json = serde_json::to_string(&dto).unwrap();
+        assert_eq!(
+            dto,
+            serde_json::from_str::<MigrationStatusDto>(&json).unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_step_dto_carries_event_and_fee() {
+        let dto = MigrationStepDto::new(
+            MigrationEvent::MigrateComplete { fee: 20_000 },
+            migration_status(),
+        );
+
+        assert_eq!("migrateComplete", dto.event);
+        assert_eq!(20_000, dto.fee);
+        assert_eq!(4, dto.status.sd_notes_count);
+    }
+
+    #[test]
+    fn migration_step_dto_reports_a_failed_step_as_error() {
+        let dto = MigrationStepDto::new(
+            MigrationEvent::Error {
+                message: "broadcast rejected".to_string(),
+            },
+            migration_status(),
+        );
+
+        assert_eq!("error", dto.event);
+        assert_eq!(0, dto.fee);
     }
 
     #[test]
@@ -326,6 +488,10 @@ mod tests {
             memo: Some("hi".to_string()),
             is_user_memo: true,
             contact_name: None,
+            fee: 15_000,
+            total_received: 1_000,
+            is_change: false,
+            recipient: Some("u1recipient".to_string()),
         };
 
         let dto = TxDto::from(&tx);
@@ -333,5 +499,166 @@ mod tests {
         assert_eq!("ab0201", dto.txid);
         assert_eq!(-5_000, dto.value);
         assert_eq!(Some("hi".to_string()), dto.memo);
+        assert_eq!(15_000, dto.fee);
+        assert_eq!(1_000, dto.total_received);
+        assert!(!dto.is_change);
+        assert_eq!(Some("u1recipient".to_string()), dto.recipient);
+    }
+
+    #[test]
+    fn tx_dto_serializes_the_new_fields_in_camel_case() {
+        let tx = Tx {
+            id: 4,
+            txid: vec![0x01],
+            height: 2_500_000,
+            time: 1_700_000_000,
+            value: 1_000,
+            tpe: None,
+            category: None,
+            zsa_value: 0,
+            asset_id: None,
+            asset_display: String::new(),
+            price: None,
+            memo: None,
+            is_user_memo: false,
+            contact_name: None,
+            fee: 0,
+            total_received: 1_000,
+            is_change: true,
+            recipient: None,
+        };
+
+        let json = serde_json::to_string(&TxDto::from(&tx)).unwrap();
+
+        assert!(json.contains("\"totalReceived\":1000"));
+        assert!(json.contains("\"isChange\":true"));
+        assert!(json.contains("\"recipient\":null"));
+    }
+
+    fn mempool_note(value: i64) -> MempoolNote {
+        MempoolNote {
+            account: 3,
+            name: "main".to_string(),
+            value,
+            pool: 2,
+            scope: 0,
+            diversifier: None,
+            diversifier_index: None,
+            address: Some("u1self".to_string()),
+            memo: Some("for you".to_string()),
+        }
+    }
+
+    #[test]
+    fn mempool_msg_block_height_becomes_an_epoch_event() {
+        let event = MempoolEventDto::from(MempoolMsg::BlockHeight(2_500_000));
+
+        assert_eq!(MempoolEventDto::Epoch { height: 2_500_000 }, event);
+        assert_eq!(
+            r#"{"kind":"epoch","height":2500000}"#,
+            serde_json::to_string(&event).unwrap()
+        );
+    }
+
+    #[test]
+    fn mempool_msg_tx_keeps_only_the_fields_kotlin_needs() {
+        let event = MempoolEventDto::from(MempoolMsg::TxId(MempoolTx {
+            txid: "ab01".to_string(),
+            amounts: vec![MempoolAmount {
+                account: 3,
+                name: "main".to_string(),
+                value: 900,
+            }],
+            notes: vec![mempool_note(900)],
+            size: 512,
+        }));
+
+        assert_eq!(
+            MempoolEventDto::Unconfirmed {
+                txid: "ab01".to_string(),
+                amounts: vec![MempoolAmountDto {
+                    account: 3,
+                    value: 900
+                }],
+                notes: vec![MempoolNoteDto {
+                    account: 3,
+                    value: 900,
+                    pool: 2,
+                    memo: Some("for you".to_string()),
+                }],
+                size: 512,
+            },
+            event
+        );
+    }
+
+    /// A spend keeps its negative value, which is how Kotlin tells its own outgoing apart.
+    #[test]
+    fn mempool_note_dto_keeps_the_sign_of_a_spend() {
+        assert_eq!(-900, MempoolNoteDto::from(&mempool_note(-900)).value);
+    }
+
+    #[test]
+    fn mempool_event_dto_ended_reports_the_error_that_stopped_the_run() {
+        let json = serde_json::to_string(&MempoolEventDto::Ended {
+            error: Some("server unreachable".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(r#"{"kind":"ended","error":"server unreachable"}"#, json);
+    }
+
+    #[test]
+    fn mempool_event_dto_ended_without_an_error_means_it_was_cancelled() {
+        let json = serde_json::to_string(&MempoolEventDto::Ended { error: None }).unwrap();
+
+        assert_eq!(r#"{"kind":"ended","error":null}"#, json);
+    }
+}
+
+/// Where the Orchard → Ironwood migration currently stands.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationStatusDto {
+    pub phase: String,
+    pub sd_notes_count: u32,
+    pub non_sd_notes_count: u32,
+    pub ironwood_sd_count: u32,
+}
+
+impl From<MigrationStatus> for MigrationStatusDto {
+    fn from(s: MigrationStatus) -> Self {
+        MigrationStatusDto {
+            phase: s.phase,
+            sd_notes_count: s.sd_notes_count,
+            non_sd_notes_count: s.non_sd_notes_count,
+            ironwood_sd_count: s.ironwood_sd_count,
+        }
+    }
+}
+
+/// Outcome of one migration step. `fee` is zero for the events that broadcast nothing.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationStepDto {
+    pub event: String,
+    pub fee: u64,
+    pub status: MigrationStatusDto,
+}
+
+impl MigrationStepDto {
+    pub fn new(event: MigrationEvent, status: MigrationStatus) -> Self {
+        let (event, fee) = match event {
+            MigrationEvent::SplitComplete { fee } => ("splitComplete", fee),
+            MigrationEvent::MigrateComplete { fee } => ("migrateComplete", fee),
+            MigrationEvent::Complete => ("complete", 0),
+            MigrationEvent::NothingToDo => ("nothingToDo", 0),
+            MigrationEvent::Error { .. } => ("error", 0),
+        };
+        MigrationStepDto {
+            event: event.to_string(),
+            fee,
+            status: status.into(),
+        }
     }
 }

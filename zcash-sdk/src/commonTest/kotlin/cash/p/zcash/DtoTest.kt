@@ -82,21 +82,30 @@ class DtoTest {
 
     @Test
     fun toPoolBalance_nativeOrdering_mapsEachPool() {
-        val balance = longArrayOf(1L, 2L, 4L, 8L).toPoolBalance()
+        val balance = longArrayOf(1L, 0L, 0L, 2L, 0L, 0L, 4L, 0L, 0L, 8L, 0L, 0L).toPoolBalance()
 
-        assertEquals(1L, balance[Pool.TRANSPARENT])
-        assertEquals(2L, balance[Pool.SAPLING])
-        assertEquals(4L, balance[Pool.ORCHARD])
-        assertEquals(8L, balance[Pool.IRONWOOD])
+        assertEquals(1L, balance[Pool.TRANSPARENT].total)
+        assertEquals(2L, balance[Pool.SAPLING].total)
+        assertEquals(4L, balance[Pool.ORCHARD].total)
+        assertEquals(8L, balance[Pool.IRONWOOD].total)
         assertEquals(15L, balance.total)
         assertEquals(14L, balance.shielded)
+    }
+
+    @Test
+    fun toPoolBalance_threeFieldsPerPool_areReadInOrder() {
+        val balance = longArrayOf(0L, 0L, 0L, 10L, 3L, 7L).toPoolBalance()
+
+        assertEquals(Balance(available = 10L, changePending = 3L, valuePending = 7L), balance[Pool.SAPLING])
+        assertEquals(10L, balance.available)
+        assertEquals(20L, balance.total)
     }
 
     @Test
     fun toPoolBalance_shortNativeArray_missingPoolsAreZero() {
         val balance = longArrayOf(1L, 2L).toPoolBalance()
 
-        assertEquals(0L, balance[Pool.ORCHARD])
+        assertEquals(Balance(), balance[Pool.ORCHARD])
         assertEquals(3L, balance.total)
     }
 }
