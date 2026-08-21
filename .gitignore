@@ -4,6 +4,7 @@ local.properties
 .idea/
 .DS_Store
 rust/target/
+zcash-sdk/prebuilt/
 docs/plans/
 .kotlin/
 /AGENTS.md

@@ -9,5 +9,25 @@ before_install:
   - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && $HOME/.cargo/bin/rustup target add aarch64-linux-android armv7-linux-androideabi && $HOME/.cargo/bin/cargo install cargo-ndk --locked
   - curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27-linux.zip && unzip -q /tmp/ndk.zip -d $HOME && rm /tmp/ndk.zip
 
+  # Only this host's desktop binary is built here, so the jar would otherwise load nowhere
+  # but Linux. CI attaches the other hosts' binaries to the tag; a missing one fails the
+  # build rather than publishing a jar that is silently incomplete.
+  - |
+    set -eu
+    case "${VERSION:-}" in
+      v*)
+        mkdir -p zcash-sdk/prebuilt
+        for host in macos-arm64 windows-x64; do
+          curl -fsSL -o "/tmp/$host.tar.gz" \
+            "https://github.com/piratecash/zcash-sdk-kmp/releases/download/$VERSION/native-$host.tar.gz"
+          tar -xzf "/tmp/$host.tar.gz" -C zcash-sdk/prebuilt
+        done
+        find zcash-sdk/prebuilt -type f
+        ;;
+      *)
+        echo "Not a tagged build (${VERSION:-unset}) - the desktop jar carries the Linux native only."
+        ;;
+    esac
+
 install:
   - ANDROID_NDK_HOME=$HOME/android-ndk-r27 ./gradlew :zcash-sdk:publishToMavenLocal -PzcashSdk.rustRelease=true --no-daemon

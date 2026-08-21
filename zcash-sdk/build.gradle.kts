@@ -122,6 +122,8 @@ kotlin {
         getByName("androidMain").dependsOn(jvmSharedMain)
         getByName("desktopMain").dependsOn(jvmSharedMain)
         getByName("desktopMain").resources.srcDir(cargoBuildDesktop)
+        // The release builder is Linux-only; the other hosts' binaries are staged here.
+        getByName("desktopMain").resources.srcDir(layout.projectDirectory.dir("prebuilt"))
 
         commonMain {
             dependencies {
