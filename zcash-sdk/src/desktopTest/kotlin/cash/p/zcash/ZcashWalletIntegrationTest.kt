@@ -212,7 +212,8 @@ class ZcashWalletIntegrationTest {
         val failure = assertFailsWith<ZcashException> { wallet.mempool().collect { } }
 
         // The exact reason matters: a native panic would surface as a ZcashException too.
-        assertTrue(failure.message.orEmpty().contains("Connection refused"), failure.message)
+        // The OS wording of a refused connection is not portable, the tonic prefix is.
+        assertTrue(failure.message.orEmpty().contains("tcp connect error"), failure.message)
     }
 
     @Test
