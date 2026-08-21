@@ -142,8 +142,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          # Nothing is checked out here, so gh has no repository to infer from.
+          REPO: ${{ github.repository }}
         run: |
           set -eu
-          gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" --title "$TAG" --notes "Desktop native libraries for $TAG."
-          gh release upload "$TAG" ./*.tar.gz --clobber
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$REPO" --title "$TAG" \
+                 --notes "Desktop native libraries for $TAG."
+          gh release upload "$TAG" ./*.tar.gz --repo "$REPO" --clobber
