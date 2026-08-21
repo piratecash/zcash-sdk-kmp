@@ -187,10 +187,14 @@ public enum class MigrationPhase {
     COMPLETE,
 }
 
-/** What one [ZcashWallet.migrationStep] did. [fee] is zero for the events that broadcast nothing. */
+/**
+ * What one [ZcashWallet.migrationStep] did. [fee] is zero and [txid] null for the events
+ * that broadcast nothing.
+ */
 public data class MigrationStep(
     val event: MigrationEvent,
     val fee: Long,
+    val txid: String?,
     val status: MigrationStatus,
 )
 

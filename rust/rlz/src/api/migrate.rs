@@ -29,8 +29,8 @@ pub struct MigrationStatus {
 /// Result of a single step (kept for FRB compat with step_migration).
 #[cfg_attr(feature = "flutter", frb)]
 pub enum MigrationEvent {
-    SplitComplete { fee: u64 },
-    MigrateComplete { fee: u64 },
+    SplitComplete { fee: u64, txid: String },
+    MigrateComplete { fee: u64, txid: String },
     Complete,
     NothingToDo,
     Error { message: String },
@@ -83,11 +83,11 @@ impl NoteMigration {
 impl From<crate::migrate::MigrationEvent> for MigrationEvent {
     fn from(event: crate::migrate::MigrationEvent) -> Self {
         match event {
-            crate::migrate::MigrationEvent::SplitComplete { fee } => {
-                MigrationEvent::SplitComplete { fee }
+            crate::migrate::MigrationEvent::SplitComplete { fee, txid } => {
+                MigrationEvent::SplitComplete { fee, txid }
             }
-            crate::migrate::MigrationEvent::MigrateComplete { fee } => {
-                MigrationEvent::MigrateComplete { fee }
+            crate::migrate::MigrationEvent::MigrateComplete { fee, txid } => {
+                MigrationEvent::MigrateComplete { fee, txid }
             }
             crate::migrate::MigrationEvent::Complete => MigrationEvent::Complete,
             crate::migrate::MigrationEvent::NothingToDo => MigrationEvent::NothingToDo,
@@ -268,11 +268,11 @@ async fn run_migration(
         };
 
         match event {
-            crate::migrate::MigrationEvent::SplitComplete { fee } => {
+            crate::migrate::MigrationEvent::SplitComplete { fee, .. } => {
                 acc_split += fee;
                 last_action_height = Some(client.latest_height().await?);
             }
-            crate::migrate::MigrationEvent::MigrateComplete { fee } => {
+            crate::migrate::MigrationEvent::MigrateComplete { fee, .. } => {
                 acc_migrate += fee;
                 last_action_height = Some(client.latest_height().await?);
             }

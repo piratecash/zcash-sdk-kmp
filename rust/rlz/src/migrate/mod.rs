@@ -6,6 +6,7 @@ use crate::{
     account::get_account_full_address,
     api::coin::Network,
     db::get_account_hw,
+    net::BroadcastOutcome,
     pay::{
         fee::{FeeManager, COST_PER_ACTION},
         plan::{extract_transaction, plan_transaction, sign_transaction},
@@ -96,9 +97,9 @@ pub(crate) fn has_split_transaction(mut values: Vec<u64>) -> bool {
 /// Result of a migration step.
 pub enum MigrationEvent {
     /// A split transaction was broadcast.
-    SplitComplete { fee: u64 },
+    SplitComplete { fee: u64, txid: String },
     /// A migration transaction was broadcast.
-    MigrateComplete { fee: u64 },
+    MigrateComplete { fee: u64, txid: String },
     /// Migration is complete — no more Orchard notes to migrate.
     Complete,
     /// No action needed (e.g., all notes are already SD but no migration
@@ -182,6 +183,23 @@ pub(crate) fn next_anchor_bucket_height(height: u32, bucket_size: u32) -> u32 {
     } else {
         height.saturating_add(bucket_size - remainder)
     }
+}
+
+/// The node reports a rejection in-band, so a step that did not land must fail
+/// rather than report a txid that does not exist.
+fn broadcast_txid(outcome: BroadcastOutcome) -> Result<String> {
+    if outcome.error_code != 0 {
+        anyhow::bail!(
+            "Broadcast rejected ({}): {}",
+            outcome.error_code,
+            outcome.message
+        );
+    }
+    Ok(outcome.message)
+}
+
+async fn broadcast(client: &mut Client, height: u32, tx: &[u8]) -> Result<String> {
+    broadcast_txid(send(client, height, tx).await?)
 }
 
 /// Run one migration step. Fully idempotent — re-scans notes on every call.
@@ -345,9 +363,9 @@ pub async fn step(
                 sign_transaction(&mut *connection, account, network, &pczt, usk_bytes)
                     .await?;
             let tx_bytes = extract_transaction(&pczt).await?;
-            let _txid = send(client, height, &tx_bytes).await?;
+            let txid = broadcast(client, height, &tx_bytes).await?;
 
-            return Ok(MigrationEvent::SplitComplete { fee });
+            return Ok(MigrationEvent::SplitComplete { fee, txid });
         }
         // If no outputs after trimming, fall through to migration phase.
     } // end if total >= MIN_SD
@@ -438,9 +456,9 @@ pub async fn step(
         let pczt =
             sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
         let tx_bytes = extract_transaction(&pczt).await?;
-        let _txid = send(client, height, &tx_bytes).await?;
+        let txid = broadcast(client, height, &tx_bytes).await?;
 
-        return Ok(MigrationEvent::MigrateComplete { fee });
+        return Ok(MigrationEvent::MigrateComplete { fee, txid });
     }
 
     // No SD and no non-SD orchard notes
@@ -552,5 +570,27 @@ mod tests {
                 "round-trip failed for total={total}"
             );
         }
+    }
+
+    #[test]
+    fn broadcast_txid_returns_the_txid_when_the_node_accepted_the_transaction() {
+        let outcome = BroadcastOutcome {
+            error_code: 0,
+            message: "9f3c".to_string(),
+        };
+
+        assert_eq!("9f3c", broadcast_txid(outcome).unwrap());
+    }
+
+    #[test]
+    fn broadcast_txid_fails_when_the_node_rejected_the_transaction() {
+        let outcome = BroadcastOutcome {
+            error_code: -25,
+            message: "missing inputs".to_string(),
+        };
+
+        let error = broadcast_txid(outcome).unwrap_err().to_string();
+        assert!(error.contains("-25"), "{error}");
+        assert!(error.contains("missing inputs"), "{error}");
     }
 }

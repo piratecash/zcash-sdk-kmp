@@ -185,11 +185,13 @@ internal data class MigrationStatusDto(
 internal data class MigrationStepDto(
     val event: String,
     val fee: Long,
+    val txid: String? = null,
     val status: MigrationStatusDto,
 ) {
     fun toMigrationStep(): MigrationStep = MigrationStep(
         event = event.toMigrationEvent(),
         fee = fee,
+        txid = txid,
         status = status.toMigrationStatus(),
     )
 }

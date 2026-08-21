@@ -334,12 +334,12 @@ impl Mutation {
             .await
             .map_err(|e| format!("Migration error: {e}"))?;
         Ok(match event {
-            crate::api::migrate::MigrationEvent::SplitComplete { fee } => MigrationEvent {
+            crate::api::migrate::MigrationEvent::SplitComplete { fee, .. } => MigrationEvent {
                 event: "SplitComplete".to_string(),
                 fee: Some(fee as i32),
                 message: None,
             },
-            crate::api::migrate::MigrationEvent::MigrateComplete { fee } => MigrationEvent {
+            crate::api::migrate::MigrationEvent::MigrateComplete { fee, .. } => MigrationEvent {
                 event: "MigrateComplete".to_string(),
                 fee: Some(fee as i32),
                 message: None,

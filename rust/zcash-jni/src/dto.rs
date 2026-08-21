@@ -356,13 +356,24 @@ mod tests {
     #[test]
     fn migration_step_dto_carries_event_and_fee() {
         let dto = MigrationStepDto::new(
-            MigrationEvent::MigrateComplete { fee: 20_000 },
+            MigrationEvent::MigrateComplete {
+                fee: 20_000,
+                txid: "9f3c".to_string(),
+            },
             migration_status(),
         );
 
         assert_eq!("migrateComplete", dto.event);
         assert_eq!(20_000, dto.fee);
+        assert_eq!(Some("9f3c".to_string()), dto.txid);
         assert_eq!(4, dto.status.sd_notes_count);
+    }
+
+    #[test]
+    fn migration_step_dto_leaves_txid_empty_when_nothing_was_broadcast() {
+        let dto = MigrationStepDto::new(MigrationEvent::Complete, migration_status());
+
+        assert_eq!(None, dto.txid);
     }
 
     #[test]
@@ -376,6 +387,38 @@ mod tests {
 
         assert_eq!("error", dto.event);
         assert_eq!(0, dto.fee);
+    }
+
+    #[test]
+    fn migration_step_dto_json_carries_the_txid() {
+        let dto = MigrationStepDto::new(
+            MigrationEvent::SplitComplete {
+                fee: 20_000,
+                txid: "9f3c".to_string(),
+            },
+            migration_status(),
+        );
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""txid":"9f3c""#), "{json}");
+        assert_eq!(dto, serde_json::from_str::<MigrationStepDto>(&json).unwrap());
+    }
+
+    #[test]
+    fn migration_step_dto_json_omits_an_absent_txid() {
+        let dto = MigrationStepDto::new(MigrationEvent::NothingToDo, migration_status());
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(!json.contains("txid"), "{json}");
+    }
+
+    #[test]
+    fn migration_step_dto_reads_a_payload_written_before_txid_existed() {
+        let status = serde_json::to_string(&MigrationStatusDto::from(migration_status())).unwrap();
+        let json = format!(r#"{{"event":"complete","fee":0,"status":{status}}}"#);
+
+        let dto: MigrationStepDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(None, dto.txid);
     }
 
     #[test]
@@ -637,27 +680,31 @@ impl From<MigrationStatus> for MigrationStatusDto {
     }
 }
 
-/// Outcome of one migration step. `fee` is zero for the events that broadcast nothing.
+/// Outcome of one migration step. `fee` is zero and `txid` absent for the events
+/// that broadcast nothing.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationStepDto {
     pub event: String,
     pub fee: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txid: Option<String>,
     pub status: MigrationStatusDto,
 }
 
 impl MigrationStepDto {
     pub fn new(event: MigrationEvent, status: MigrationStatus) -> Self {
-        let (event, fee) = match event {
-            MigrationEvent::SplitComplete { fee } => ("splitComplete", fee),
-            MigrationEvent::MigrateComplete { fee } => ("migrateComplete", fee),
-            MigrationEvent::Complete => ("complete", 0),
-            MigrationEvent::NothingToDo => ("nothingToDo", 0),
-            MigrationEvent::Error { .. } => ("error", 0),
+        let (event, fee, txid) = match event {
+            MigrationEvent::SplitComplete { fee, txid } => ("splitComplete", fee, Some(txid)),
+            MigrationEvent::MigrateComplete { fee, txid } => ("migrateComplete", fee, Some(txid)),
+            MigrationEvent::Complete => ("complete", 0, None),
+            MigrationEvent::NothingToDo => ("nothingToDo", 0, None),
+            MigrationEvent::Error { .. } => ("error", 0, None),
         };
         MigrationStepDto {
             event: event.to_string(),
             fee,
+            txid,
             status: status.into(),
         }
     }

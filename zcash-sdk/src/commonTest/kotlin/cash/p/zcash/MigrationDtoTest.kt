@@ -3,6 +3,7 @@ package cash.p.zcash
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 
 class MigrationDtoTest {
 
@@ -58,6 +59,30 @@ class MigrationDtoTest {
 
         assertEquals(MigrationEvent.NOTHING_TO_DO, step.event)
         assertEquals(0L, step.fee)
+    }
+
+    @Test
+    fun parseMigrationStep_broadcastEvent_carriesTxid() {
+        val step = parseMigrationStep(
+            """
+            {"event":"migrateComplete","fee":20000,"txid":"9f3c",
+             "status":{"phase":"migrating","sdNotesCount":1,"nonSdNotesCount":0,"ironwoodSdCount":2}}
+            """
+        )
+
+        assertEquals("9f3c", step.txid)
+    }
+
+    @Test
+    fun parseMigrationStep_eventWithoutBroadcast_hasNoTxid() {
+        val step = parseMigrationStep(
+            """
+            {"event":"complete","fee":0,
+             "status":{"phase":"complete","sdNotesCount":0,"nonSdNotesCount":0,"ironwoodSdCount":3}}
+            """
+        )
+
+        assertNull(step.txid)
     }
 
     @Test
