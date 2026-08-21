@@ -35,7 +35,7 @@ use zcash_keys::{
 use zcash_note_encryption::Domain;
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding},
-    TxVersion,
+    Transaction, TxVersion,
     fees::zip317::FeeRule,
 };
 use zcash_proofs::prover::LocalTxProver;
@@ -1436,6 +1436,27 @@ pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
             return Err(anyhow!("Extraction failed: {:?}", e));
         }
     }
+}
+
+/// The txid of a fully signed transaction, in the display order explorers use.
+///
+/// A v5 transaction carries its own consensus branch id, so the one passed to the parser is
+/// only a fallback for older versions - hence the walk from the newest branch down.
+pub fn transaction_id(raw: &[u8]) -> Result<String> {
+    for branch in [
+        BranchId::Nu6_3,
+        BranchId::Nu6_2,
+        BranchId::Nu6,
+        BranchId::Nu5,
+    ] {
+        let mut remaining = raw;
+        if let Ok(tx) = Transaction::read(&mut remaining, branch) {
+            if remaining.is_empty() {
+                return Ok(tx.txid().to_string());
+            }
+        }
+    }
+    Err(anyhow!("Not a valid transaction"))
 }
 
 struct MyTransparentAddress(TransparentAddress);

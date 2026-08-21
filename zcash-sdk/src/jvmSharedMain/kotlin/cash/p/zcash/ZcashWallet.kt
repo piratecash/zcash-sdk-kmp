@@ -82,6 +82,10 @@ public class ZcashWallet private constructor(private val handle: Long) {
     public suspend fun addresses(id: Int): Addresses =
         withNative { parseAddresses(ZcashJni.accountAddresses(handle, id)) }
 
+    /** The unified full viewing key of [id], covering every pool the account holds keys for. */
+    public suspend fun viewingKey(id: Int): String =
+        withNative { ZcashJni.accountUfvk(handle, id) }
+
     /**
      * A fresh transparent address of [id] for one-time use, or `null` when the account has no
      * transparent key. The address [addresses] reports stays where it is.

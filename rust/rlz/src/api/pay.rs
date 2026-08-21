@@ -118,6 +118,12 @@ pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
     crate::pay::plan::extract_transaction(package).await
 }
 
+/// The txid of a fully signed transaction, in the display order explorers use.
+#[cfg_attr(feature = "flutter", frb)]
+pub fn transaction_id(raw: &[u8]) -> Result<String> {
+    crate::pay::plan::transaction_id(raw)
+}
+
 #[cfg_attr(feature = "flutter", frb(dart_metadata = ("freezed")))]
 #[derive(Encode, Decode)]
 pub struct PcztPackage {

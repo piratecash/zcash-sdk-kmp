@@ -117,6 +117,19 @@ public fun ZcashSdk.addressKind(address: String, network: ZcashNetwork): ZcashAd
 }
 
 /**
+ * The txid of a fully signed transaction, in the display order explorers use.
+ *
+ * Needs no [ZcashSdk.initialize] and no open wallet: the bytes carry everything. An offline
+ * signer needs this, because otherwise only [ZcashWallet.broadcast] reports a txid.
+ */
+public suspend fun ZcashSdk.transactionId(rawTransaction: ByteArray): String {
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError { ZcashJni.transactionId(rawTransaction) }
+    }
+}
+
+/**
  * A fresh BIP-39 seed phrase. Needs no [ZcashSdk.initialize].
  *
  * The SDK does not keep it: storing the phrase and restoring an account from it are the

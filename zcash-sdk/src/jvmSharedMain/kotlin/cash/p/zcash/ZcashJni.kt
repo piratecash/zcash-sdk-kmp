@@ -43,6 +43,8 @@ internal object ZcashJni {
 
     external fun balance(handle: Long, account: Int, confirmations: Int): LongArray
 
+    external fun accountUfvk(handle: Long, account: Int): String
+
     /** A fresh receive-scope transparent address, or `null` when the account has no transparent key. */
     external fun nextTransparentAddress(handle: Long, account: Int): String?
 
@@ -123,6 +125,9 @@ internal object ZcashJni {
     external fun addressKind(coin: Byte, address: String): String
 
     external fun extractTransaction(pkg: ByteArray): ByteArray
+
+    /** Stateless: needs no open wallet. */
+    external fun transactionId(tx: ByteArray): String
 
     external fun broadcastTransaction(handle: Long, height: Int, tx: ByteArray): String
 

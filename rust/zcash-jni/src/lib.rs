@@ -29,7 +29,7 @@ use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::get_current_height;
 use rlz::api::pay::{
     broadcast, extract_transaction, pack_transaction, prepare, sign_transaction_with_key, to_plan,
-    unpack_transaction, PaymentOptions, PcztPackage,
+    transaction_id, unpack_transaction, PaymentOptions, PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sweep::discover_transparent_addresses;
@@ -131,6 +131,12 @@ fn wallet_account(handle: jlong, account: jint) -> Result<Coin, BridgeError> {
         account: account as u32,
         ..wallet(handle)?
     })
+}
+
+/// The account's unified full viewing key, over every pool it holds keys for.
+async fn account_ufvk(account: u32, coin: &Coin) -> anyhow::Result<String> {
+    let pools = get_account_pools(account, coin).await?;
+    get_account_ufvk(account, pools, coin).await
 }
 
 fn to_json<'local, T: Serialize>(
@@ -359,8 +365,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_accountAddresses<'local>(
             let account = account as u32;
 
             let (ufvk, dindex) = runtime().block_on(async {
-                let pools = get_account_pools(account, &coin).await?;
-                let ufvk = get_account_ufvk(account, pools, &coin).await?;
+                let ufvk = account_ufvk(account, &coin).await?;
                 let dindex = list_accounts(&coin)
                     .await?
                     .into_iter()
@@ -375,6 +380,26 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_accountAddresses<'local>(
                 env,
                 &AddressesDto::new(unified, receivers, dindex.unwrap_or(0)),
             )
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// The account's unified full viewing key, over every pool the account holds keys for.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_accountUfvk<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = wallet(handle)?;
+            let account = account as u32;
+
+            let ufvk = runtime().block_on(account_ufvk(account, &coin))?;
+
+            Ok(env.new_string(ufvk)?)
         })
         .resolve::<ThrowNativeError>()
 }
@@ -799,6 +824,21 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_extractTransaction<'local>(
             let package = unpack_package(env, &pkg)?;
             let raw = runtime().block_on(extract_transaction(&package))?;
             Ok(env.byte_array_from_slice(&raw)?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_transactionId<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    tx: JByteArray<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let raw = env.convert_byte_array(&tx)?;
+            let txid = transaction_id(&raw)?;
+            Ok(env.new_string(txid)?)
         })
         .resolve::<ThrowNativeError>()
 }

@@ -261,6 +261,14 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun viewingKey_accountRestoredFromThePhrase_isTheKnownUnifiedFullViewingKey() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            assertEquals(TEST_UFVK, wallet.viewingKey(id))
+        }
+
+    @Test
     fun deriveSpendingKey_withoutOpeningAWallet_isDeterministicAndMatchesTheRustVector() =
         runBlocking {
             val key = ZcashSdk.deriveSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN)
@@ -418,6 +426,12 @@ class ZcashWalletIntegrationTest {
         assertNull(ZcashSdk.addressKind("", ZcashNetwork.MAIN))
         assertNull(ZcashSdk.addressKind(TEST_PHRASE, ZcashNetwork.MAIN))
         assertNull(ZcashSdk.addressKind(TEST_UFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun transactionId_bytesThatAreNotATransaction_failsWithAZcashException() = runBlocking {
+        assertFailsWith<ZcashException> { ZcashSdk.transactionId(ByteArray(32)) }
+        Unit
     }
 
     @Test
