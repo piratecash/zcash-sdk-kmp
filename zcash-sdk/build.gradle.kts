@@ -30,11 +30,23 @@ val cargoExecutable = providers.environmentVariable("CARGO")
 
 val androidAbis = providers.gradleProperty("zcashSdk.androidAbis").get().split(',').map(String::trim)
 
-val ndkDirectory = providers.environmentVariable("ANDROID_NDK_HOME").orNull
-    ?: providers.environmentVariable("ANDROID_HOME").orNull?.let {
-        "$it/ndk/${providers.gradleProperty("zcashSdk.ndkVersion").get()}"
+val prebuiltDesktop = layout.projectDirectory.dir("prebuilt/desktop")
+val prebuiltAndroidNatives = layout.projectDirectory.dir("prebuilt/android/native")
+val usesPrebuiltDesktop = prebuiltDesktop.dir("native").asFile.isDirectory
+val usesPrebuiltAndroid = prebuiltAndroidNatives.asFile.isDirectory
+
+if (usesPrebuiltAndroid) {
+    val missingAbis = androidAbis.filter { abi ->
+        val library = prebuiltAndroidNatives.file("$abi/libzcash_sdk_kmp.so").asFile
+        !library.isFile || library.length() == 0L
     }
-    ?: error("Set ANDROID_NDK_HOME or ANDROID_HOME to cross-compile the Rust bridge")
+    if (missingAbis.isNotEmpty()) {
+        error(
+            "Incomplete prebuilt Android natives for: ${missingAbis.joinToString()}. " +
+                "Delete zcash-sdk/prebuilt/android and rebuild them with cargo-ndk."
+        )
+    }
+}
 
 val osName = providers.systemProperty("os.name").get()
 val isMac = osName.startsWith("Mac", ignoreCase = true)
@@ -62,31 +74,45 @@ val rustSourceFiles = fileTree(rustWorkspace) {
     exclude("target/**")
 }
 
-val cargoBuildAndroid = tasks.register<CargoNdkTask>("cargoBuildAndroid") {
-    description = "Cross-compiles the Rust JNI bridge for the configured Android ABIs."
-    rustSources.from(rustSourceFiles)
-    cargoBinary.set(cargoExecutable)
-    // `ndk` is a cargo subcommand; everything after `--` is forwarded to cargo itself.
-    arguments.set(
-        listOf("ndk") + androidAbis.flatMap { listOf("-t", it) } +
-            listOf("-P", libs.versions.minSdk.get(), "--", "build", "-p", "zcash-jni", "--profile", cargoProfile)
-    )
-    libraryName.set("libzcash_sdk_kmp.so")
-    cargoEnvironment.set(mapOf("ANDROID_NDK_HOME" to ndkDirectory))
-    workspace.set(rustWorkspace)
-    outputDirectory.set(layout.buildDirectory.dir("rust/jniLibs"))
+val cargoBuildAndroid = if (usesPrebuiltAndroid) {
+    null
+} else {
+    val ndkDirectory = providers.environmentVariable("ANDROID_NDK_HOME").orNull
+        ?: providers.environmentVariable("ANDROID_HOME").orNull?.let {
+            "$it/ndk/${providers.gradleProperty("zcashSdk.ndkVersion").get()}"
+        }
+        ?: error("Set ANDROID_NDK_HOME or ANDROID_HOME to cross-compile the Rust bridge")
+
+    tasks.register<CargoNdkTask>("cargoBuildAndroid") {
+        description = "Cross-compiles the Rust JNI bridge for the configured Android ABIs."
+        rustSources.from(rustSourceFiles)
+        cargoBinary.set(cargoExecutable)
+        // `ndk` is a cargo subcommand; everything after `--` is forwarded to cargo itself.
+        arguments.set(
+            listOf("ndk") + androidAbis.flatMap { listOf("-t", it) } +
+                listOf("-P", libs.versions.minSdk.get(), "--", "build", "-p", "zcash-jni", "--profile", cargoProfile)
+        )
+        libraryName.set("libzcash_sdk_kmp.so")
+        cargoEnvironment.set(mapOf("ANDROID_NDK_HOME" to ndkDirectory))
+        workspace.set(rustWorkspace)
+        outputDirectory.set(layout.buildDirectory.dir("rust/jniLibs"))
+    }
 }
 
-val cargoBuildDesktop = tasks.register<CargoHostTask>("cargoBuildDesktop") {
-    description = "Builds the Rust JNI bridge for the host and stages it as desktop resources."
-    rustSources.from(rustSourceFiles)
-    cargoBinary.set(cargoExecutable)
-    arguments.set(listOf("build", "-p", "zcash-jni", "--profile", cargoProfile))
-    cargoEnvironment.set(emptyMap<String, String>())
-    workspace.set(rustWorkspace)
-    hostTriple.set(hostTargetTriple)
-    binary.set(rustWorkspace.file("target/$cargoProfileDirectory/$hostLibraryName"))
-    outputDirectory.set(layout.buildDirectory.dir("rust/desktopResources"))
+val cargoBuildDesktop = if (usesPrebuiltDesktop) {
+    null
+} else {
+    tasks.register<CargoHostTask>("cargoBuildDesktop") {
+        description = "Builds the Rust JNI bridge for the host and stages it as desktop resources."
+        rustSources.from(rustSourceFiles)
+        cargoBinary.set(cargoExecutable)
+        arguments.set(listOf("build", "-p", "zcash-jni", "--profile", cargoProfile))
+        cargoEnvironment.set(emptyMap<String, String>())
+        workspace.set(rustWorkspace)
+        hostTriple.set(hostTargetTriple)
+        binary.set(rustWorkspace.file("target/$cargoProfileDirectory/$hostLibraryName"))
+        outputDirectory.set(layout.buildDirectory.dir("rust/desktopResources"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,9 +147,11 @@ kotlin {
         }
         getByName("androidMain").dependsOn(jvmSharedMain)
         getByName("desktopMain").dependsOn(jvmSharedMain)
-        getByName("desktopMain").resources.srcDir(cargoBuildDesktop)
-        // The release builder is Linux-only; the other hosts' binaries are staged here.
-        getByName("desktopMain").resources.srcDir(layout.projectDirectory.dir("prebuilt"))
+        if (usesPrebuiltDesktop) {
+            getByName("desktopMain").resources.srcDir(prebuiltDesktop)
+        } else {
+            getByName("desktopMain").resources.srcDir(checkNotNull(cargoBuildDesktop))
+        }
 
         commonMain {
             dependencies {
@@ -142,6 +170,13 @@ kotlin {
 
 extensions.configure<KotlinMultiplatformAndroidComponentsExtension> {
     onVariants { variant ->
-        variant.sources.jniLibs?.addGeneratedSourceDirectory(cargoBuildAndroid, CargoNdkTask::outputDirectory)
+        if (usesPrebuiltAndroid) {
+            variant.sources.jniLibs?.addStaticSourceDirectory(prebuiltAndroidNatives.asFile.absolutePath)
+        } else {
+            variant.sources.jniLibs?.addGeneratedSourceDirectory(
+                checkNotNull(cargoBuildAndroid),
+                CargoNdkTask::outputDirectory,
+            )
+        }
     }
 }

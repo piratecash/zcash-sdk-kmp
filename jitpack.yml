@@ -1,33 +1,67 @@
 jdk:
   - openjdk21
 
-# The Rust bridge is cross-compiled during the Gradle build, so the toolchain and the NDK
-# must exist before it starts. The build image ships an sdkmanager too old to run on JDK 21
-# (it needs javax.xml.bind), hence the direct NDK download. Each line runs in its own shell,
-# so anything that must share state is chained.
 before_install:
-  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && $HOME/.cargo/bin/rustup target add aarch64-linux-android armv7-linux-androideabi && $HOME/.cargo/bin/cargo install cargo-ndk --locked
-  - curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27-linux.zip && unzip -q /tmp/ndk.zip -d $HOME && rm /tmp/ndk.zip
-
-  # Only this host's desktop binary is built here, so the jar would otherwise load nowhere
-  # but Linux. CI attaches the other hosts' binaries to the tag; a missing one fails the
-  # build rather than publishing a jar that is silently incomplete.
   - |
     set -eu
+    fail() { echo "INVALID NATIVE SET: $*" >&2; exit 1; }
     case "${VERSION:-}" in
       v*)
-        mkdir -p zcash-sdk/prebuilt
-        for host in macos-arm64 windows-x64; do
-          curl -fsSL -o "/tmp/$host.tar.gz" \
-            "https://github.com/piratecash/zcash-sdk-kmp/releases/download/$VERSION/native-$host.tar.gz"
-          tar -xzf "/tmp/$host.tar.gz" -C zcash-sdk/prebuilt
+        mkdir -p zcash-sdk/prebuilt/desktop zcash-sdk/prebuilt/android
+        base="https://github.com/piratecash/zcash-sdk-kmp/releases/download/$VERSION"
+
+        # A tag can become visible before CI publishes its release assets.
+        fetch() {
+          for attempt in $(seq 1 30); do
+            curl -fsSL -o "$2" "$1" && return 0
+            echo "waiting for $1 (attempt $attempt)"
+            sleep 30
+          done
+          echo "asset never appeared: $1"
+          return 1
+        }
+
+        mkdir -p /tmp/natives
+        cd /tmp/natives
+        for host in linux-x64 macos-arm64 windows-x64; do
+          fetch "$base/native-$host.tar.gz" "native-$host.tar.gz"
         done
+        fetch "$base/native-android.tar.gz" native-android.tar.gz
+        fetch "$base/natives.sha256" natives.sha256
+
+        printf '%s\n' \
+          native-linux-x64.tar.gz native-macos-arm64.tar.gz \
+          native-windows-x64.tar.gz native-android.tar.gz \
+          | sort > expected-manifest-files
+        awk 'NF == 2 { print $2 }' natives.sha256 | sed 's|^\./||' \
+          | sort > actual-manifest-files
+        diff -u expected-manifest-files actual-manifest-files \
+          || fail "natives.sha256 does not name the exact archive set"
+
+        if ! checksum_output=$(sha256sum --strict -c natives.sha256); then
+          printf '%s\n' "$checksum_output"
+          fail "archive checksum mismatch"
+        fi
+        printf '%s\n' "$checksum_output"
+        cd - >/dev/null
+
+        for host in linux-x64 macos-arm64 windows-x64; do
+          tar -xzf "/tmp/natives/native-$host.tar.gz" -C zcash-sdk/prebuilt/desktop
+        done
+        tar -xzf /tmp/natives/native-android.tar.gz -C zcash-sdk/prebuilt/android
+
+        expect() { [ -s "$1" ] || fail "missing or empty $1"; }
+        expect zcash-sdk/prebuilt/desktop/native/x86_64-unknown-linux-gnu/libzcash_sdk_kmp.so
+        expect zcash-sdk/prebuilt/desktop/native/aarch64-apple-darwin/libzcash_sdk_kmp.dylib
+        expect zcash-sdk/prebuilt/desktop/native/x86_64-pc-windows-msvc/zcash_sdk_kmp.dll
+        expect zcash-sdk/prebuilt/android/native/arm64-v8a/libzcash_sdk_kmp.so
+        expect zcash-sdk/prebuilt/android/native/armeabi-v7a/libzcash_sdk_kmp.so
         find zcash-sdk/prebuilt -type f
         ;;
       *)
-        echo "Not a tagged build (${VERSION:-unset}) - the desktop jar carries the Linux native only."
+        echo "Not a tagged build (${VERSION:-unset}) - no prebuilt natives."
         ;;
     esac
 
 install:
-  - ANDROID_NDK_HOME=$HOME/android-ndk-r27 ./gradlew :zcash-sdk:publishToMavenLocal -PzcashSdk.rustRelease=true --no-daemon
+  - ./gradlew :zcash-sdk:publishToMavenLocal --no-daemon

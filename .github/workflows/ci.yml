@@ -69,7 +69,7 @@ jobs:
 
       - name: Test desktop target
         shell: bash
-        run: ./gradlew :zcash-sdk:desktopTest --console=plain
+        run: ./gradlew :zcash-sdk:desktopTest -PzcashSdk.rustRelease=true --console=plain
       - name: Upload native library
         uses: actions/upload-artifact@v4
         with:
@@ -94,17 +94,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      # Same NDK bootstrap as jitpack.yml: a direct download works on any image,
-      # with or without cmdline-tools.
+      # A direct download keeps the pinned NDK independent of the runner's cmdline-tools.
       - name: Install NDK and cargo-ndk
         run: |
           curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27-linux.zip
           unzip -q /tmp/ndk.zip -d "$HOME"
           echo "ANDROID_NDK_HOME=$HOME/android-ndk-r27" >> "$GITHUB_ENV"
           cargo install cargo-ndk --locked
-      # Same command JitPack runs, so a green build here means the release is publishable.
+      # This job produces the Android natives that JitPack consumes from the release.
       - name: Publish to Maven local
-        run: ./gradlew :zcash-sdk:publishToMavenLocal --console=plain
+        run: ./gradlew :zcash-sdk:publishToMavenLocal -PzcashSdk.rustRelease=true --console=plain
+      - name: Upload Android natives
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-android
+          path: zcash-sdk/build/rust/jniLibs
+          if-no-files-found: error
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
@@ -138,7 +143,43 @@ jobs:
             tar -czf "$name.tar.gz" -C "pack/$name" native
           done
           ls -l ./*.tar.gz
-      - name: Attach them to the release
+      - name: Refuse to publish an incomplete set
+        run: |
+          set -eu
+          fail() { echo "INCOMPLETE NATIVE SET: $*" >&2; exit 1; }
+
+          verify() {
+            [ -f "$1" ] || fail "$1 is missing"
+            rm -rf "$RUNNER_TEMP/verify"
+            mkdir -p "$RUNNER_TEMP/verify"
+            tar -xzf "$1" -C "$RUNNER_TEMP/verify" \
+              || fail "$1 is not a readable tarball"
+            [ -s "$RUNNER_TEMP/verify/$2" ] || fail "$1 has no non-empty $2"
+            case "$3" in
+              elf)
+                readelf -h "$RUNNER_TEMP/verify/$2" | grep -q "Machine:.*$4" \
+                  || fail "$1: $2 is not built for $4"
+                ;;
+              file)
+                file -b "$RUNNER_TEMP/verify/$2" | grep -Eq "$4" \
+                  || fail "$1: $2 does not match $4"
+                ;;
+              *) fail "unknown inspector: $3" ;;
+            esac
+          }
+
+          # Keep these in sync with zcashSdk.androidAbis in gradle.properties.
+          verify native-linux-x64.tar.gz native/x86_64-unknown-linux-gnu/libzcash_sdk_kmp.so elf X86-64
+          verify native-macos-arm64.tar.gz native/aarch64-apple-darwin/libzcash_sdk_kmp.dylib file '^Mach-O 64-bit.*arm64'
+          verify native-windows-x64.tar.gz native/x86_64-pc-windows-msvc/zcash_sdk_kmp.dll file '^PE32\+.*x86-64.*MS Windows'
+          verify native-android.tar.gz native/arm64-v8a/libzcash_sdk_kmp.so elf AArch64
+          verify native-android.tar.gz native/armeabi-v7a/libzcash_sdk_kmp.so elf ARM
+
+          sha256sum \
+            native-linux-x64.tar.gz native-macos-arm64.tar.gz \
+            native-windows-x64.tar.gz native-android.tar.gz > natives.sha256
+          cat natives.sha256
+      - name: Publish only a complete release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -147,6 +188,31 @@ jobs:
         run: |
           set -eu
           gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$REPO" --title "$TAG" \
-                 --notes "Desktop native libraries for $TAG."
-          gh release upload "$TAG" ./*.tar.gz --repo "$REPO" --clobber
+            || gh release create "$TAG" --repo "$REPO" --draft --title "$TAG" \
+                 --notes "Native libraries for $TAG."
+          gh release upload "$TAG" \
+            native-linux-x64.tar.gz native-macos-arm64.tar.gz \
+            native-windows-x64.tar.gz native-android.tar.gz natives.sha256 \
+            --repo "$REPO" --clobber
+
+          sha256sum \
+            native-linux-x64.tar.gz native-macos-arm64.tar.gz \
+            native-windows-x64.tar.gz native-android.tar.gz natives.sha256 \
+            | sort > local-assets.sha256
+          gh release view "$TAG" --repo "$REPO" --json assets \
+            --jq '.assets[] | select(.state == "uploaded")
+                  | (.digest | sub("^sha256:";"")) + "  " + .name' \
+            | sort > remote-assets.sha256
+          diff -u local-assets.sha256 remote-assets.sha256 || {
+            echo "release assets do not exactly match the validated set" >&2
+            exit 1
+          }
+          gh release edit "$TAG" --repo "$REPO" --draft=false
+      - name: Warm up JitPack
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          url="https://jitpack.io/com/github/piratecash/zcash-sdk-kmp/$TAG/build.log"
+          curl -s -o /dev/null --max-time 120 "$url" || true
+          echo "Triggered $url"
