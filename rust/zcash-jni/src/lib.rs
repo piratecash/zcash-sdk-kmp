@@ -168,6 +168,34 @@ fn optional_string(value: &JString<'_>, env: &Env<'_>) -> Result<Option<String>,
     }
 }
 
+fn build_new_account(
+    name: String,
+    key: String,
+    passphrase: Option<String>,
+    birth_height: jint,
+    pools: jint,
+    aindex: jint,
+) -> NewAccount {
+    NewAccount {
+        icon: None,
+        name,
+        // rlz never reads this flag: a non-empty key restores, an empty one generates.
+        restore: !key.is_empty(),
+        key,
+        passphrase,
+        fingerprint: None,
+        aindex: aindex as u32,
+        birth: (birth_height > 0).then_some(birth_height as u32),
+        folder: String::new(),
+        pools: Some(pools as u8),
+        // Standard ZIP-32 wallets keep change on the Internal scope; scanning it is what makes
+        // a seed restored from one of them show its change.
+        use_internal: true,
+        internal: false,
+        ledger: false,
+    }
+}
+
 fn parse_recipients(json: &str) -> Result<Vec<Recipient>, BridgeError> {
     let recipients: Vec<RecipientDto> = serde_json::from_str(json)?;
     Ok(recipients.into_iter().map(Recipient::from).collect())
@@ -282,23 +310,14 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_newAccount<'local>(
 ) -> jint {
     unowned_env
         .with_env(|env| -> Result<jint, BridgeError> {
-            let key = key.try_to_string(env)?;
-            let account = NewAccount {
-                icon: None,
-                name: name.try_to_string(env)?,
-                // rlz never reads this flag: a non-empty key restores, an empty one generates.
-                restore: !key.is_empty(),
-                key,
-                passphrase: optional_string(&passphrase, env)?,
-                fingerprint: None,
-                aindex: aindex as u32,
-                birth: (birth_height > 0).then_some(birth_height as u32),
-                folder: String::new(),
-                pools: Some(pools as u8),
-                use_internal: false,
-                internal: false,
-                ledger: false,
-            };
+            let account = build_new_account(
+                name.try_to_string(env)?,
+                key.try_to_string(env)?,
+                optional_string(&passphrase, env)?,
+                birth_height,
+                pools,
+                aindex,
+            );
             let id = runtime().block_on(new_account(&account, &wallet(handle)?))?;
             Ok(id as jint)
         })
@@ -897,4 +916,48 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_migrationStep<'local>(
             to_json(env, &MigrationStepDto::new(event, status))
         })
         .resolve::<ThrowNativeError>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(key: &str, birth_height: jint) -> NewAccount {
+        build_new_account(
+            "wallet".into(),
+            key.into(),
+            Some("pp".into()),
+            birth_height,
+            3,
+            2,
+        )
+    }
+
+    #[test]
+    fn build_new_account_uses_the_internal_scope() {
+        assert!(account("key", 100).use_internal);
+    }
+
+    #[test]
+    fn build_new_account_maps_the_bridge_arguments() {
+        let account = account("key", 100);
+
+        assert_eq!("wallet", account.name);
+        assert_eq!("key", account.key);
+        assert_eq!(Some("pp".to_string()), account.passphrase);
+        assert_eq!(Some(100), account.birth);
+        assert_eq!(Some(3), account.pools);
+        assert_eq!(2, account.aindex);
+    }
+
+    #[test]
+    fn build_new_account_restores_only_when_a_key_is_given() {
+        assert!(account("key", 100).restore);
+        assert!(!account("", 100).restore);
+    }
+
+    #[test]
+    fn build_new_account_without_a_positive_birth_height_has_no_birth() {
+        assert_eq!(None, account("key", 0).birth);
+    }
 }

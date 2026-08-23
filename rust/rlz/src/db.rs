@@ -579,6 +579,12 @@ pub async fn create_schema(connection: &mut SqliteConnection) -> Result<()> {
         }
     }
 
+    // V10 — the bridge now always scans and spends on the Internal scope. Runs after the version
+    // check so a database rejected as too new is left untouched.
+    sqlx::query("UPDATE accounts SET use_internal = 1 WHERE use_internal <> 1")
+        .execute(&mut *connection)
+        .await?;
+
     Ok(())
 }
 
@@ -2913,5 +2919,26 @@ pub(crate) mod tests {
 
         let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
         assert_eq!(addresses, vec!["t1default", "t1change2", "t1change1"]);
+    }
+
+    async fn use_internal_of(connection: &mut SqliteConnection, account: u32) -> bool {
+        sqlx::query_scalar("SELECT use_internal FROM accounts WHERE id_account = ?1")
+            .bind(account)
+            .fetch_one(connection)
+            .await
+            .expect("use_internal")
+    }
+
+    #[tokio::test]
+    async fn create_schema_migrates_legacy_accounts_to_internal_scope() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        assert!(!use_internal_of(&mut connection, ACCOUNT).await);
+
+        create_schema(&mut connection).await.expect("re-open");
+        assert!(use_internal_of(&mut connection, ACCOUNT).await);
+
+        create_schema(&mut connection).await.expect("re-open again");
+        assert!(use_internal_of(&mut connection, ACCOUNT).await);
     }
 }
