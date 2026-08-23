@@ -3,9 +3,10 @@ jdk:
 
 before_install:
   - |
-    set -eu
-    fail() { echo "INVALID NATIVE SET: $*" >&2; exit 1; }
-    case "${VERSION:-}" in
+    (
+      set -eu
+      fail() { echo "INVALID NATIVE SET: $*" >&2; exit 1; }
+      case "${VERSION:-}" in
       v*)
         mkdir -p zcash-sdk/prebuilt/desktop zcash-sdk/prebuilt/android
         base="https://github.com/piratecash/zcash-sdk-kmp/releases/download/$VERSION"
@@ -61,7 +62,11 @@ before_install:
       *)
         echo "Not a tagged build (${VERSION:-unset}) - no prebuilt natives."
         ;;
-    esac
+      esac
+    )
+    before_install_status=$?
+    [ "$before_install_status" -eq 0 ] || exit "$before_install_status"
+    unset before_install_status
 
 install:
   - ./gradlew :zcash-sdk:publishToMavenLocal --no-daemon
