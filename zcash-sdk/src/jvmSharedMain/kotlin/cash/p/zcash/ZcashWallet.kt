@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
@@ -17,6 +18,104 @@ private const val DEFAULT_CHECKPOINT_AGE = 10_000
 private const val DEFAULT_GAP_LIMIT = 20
 private const val PROGRESS_SAMPLE_MS = 250L
 private const val MEMPOOL_POLL_MS = 500L
+
+internal interface SyncBackend {
+    val cancelRequested: Boolean
+
+    suspend fun latestHeight(): Int
+
+    suspend fun synchronize(
+        accountIds: List<Int>,
+        target: Int,
+        actionsPerSync: Int,
+        transparentLimit: Int,
+        checkpointAge: Int,
+    )
+
+    suspend fun progress(): SyncProgress?
+
+    suspend fun syncedHeight(accountIds: List<Int>): Int?
+
+    fun onStart()
+
+    fun onFinish()
+}
+
+internal fun syncFlow(
+    accountIds: List<Int>,
+    actionsPerSync: Int,
+    transparentLimit: Int,
+    checkpointAge: Int,
+    mutex: Mutex,
+    backend: SyncBackend,
+): Flow<SyncState> = flow {
+    emit(SyncState.Connecting)
+    val target = backend.latestHeight()
+    mutex.withLock {
+        backend.onStart()
+        val error = try {
+            runNativeSync(accountIds, target, actionsPerSync, transparentLimit, checkpointAge, backend)
+        } finally {
+            backend.onFinish()
+        }
+        emitTerminalState(accountIds, target, error, backend)
+    }
+}
+
+private suspend fun FlowCollector<SyncState>.runNativeSync(
+    accountIds: List<Int>,
+    target: Int,
+    actionsPerSync: Int,
+    transparentLimit: Int,
+    checkpointAge: Int,
+    backend: SyncBackend,
+): ZcashException? = supervisorScope {
+    val native = async {
+        backend.synchronize(accountIds, target, actionsPerSync, transparentLimit, checkpointAge)
+    }
+    while (native.isActive) {
+        delay(PROGRESS_SAMPLE_MS)
+        backend.progress()?.let { emit(SyncState.Syncing(it.height, target)) }
+    }
+    try {
+        native.await()
+        null
+    } catch (error: ZcashException) {
+        error
+    }
+}
+
+private suspend fun FlowCollector<SyncState>.emitTerminalState(
+    accountIds: List<Int>,
+    target: Int,
+    error: ZcashException?,
+    backend: SyncBackend,
+) {
+    val state = terminalSyncState(error, backend.cancelRequested)
+    if (state != SyncState.Synced) {
+        emit(state)
+        return
+    }
+    if (accountIds.isEmpty()) {
+        emit(SyncState.Synced)
+        return
+    }
+
+    val height = try {
+        backend.syncedHeight(accountIds)
+    } catch (error: ZcashException) {
+        emit(SyncState.Failed(error))
+        return
+    }
+    height?.let { emit(SyncState.Syncing(it, target)) }
+    emit(completedSyncState(height, target))
+}
+
+private fun completedSyncState(height: Int?, target: Int): SyncState = when {
+    height == null -> SyncState.Failed(ZcashException("Sync completed without the requested accounts"))
+    height >= target -> SyncState.Synced
+    else -> SyncState.Failed(ZcashException("Sync ended at block $height before target $target"))
+}
 
 /**
  * One open wallet database.
@@ -35,6 +134,48 @@ public class ZcashWallet private constructor(private val handle: Long) {
 
     @Volatile
     private var syncing = false
+
+    private val syncBackend = object : SyncBackend {
+        override val cancelRequested: Boolean
+            get() = this@ZcashWallet.cancelRequested
+
+        override suspend fun latestHeight(): Int = this@ZcashWallet.latestHeight()
+
+        override suspend fun synchronize(
+            accountIds: List<Int>,
+            target: Int,
+            actionsPerSync: Int,
+            transparentLimit: Int,
+            checkpointAge: Int,
+        ) {
+            withNative {
+                ZcashJni.synchronize(
+                    handle,
+                    accountIds.toIntArray(),
+                    target,
+                    actionsPerSync,
+                    transparentLimit,
+                    checkpointAge,
+                    false,
+                )
+            }
+        }
+
+        override suspend fun progress(): SyncProgress? =
+            withNative { syncProgressOf(ZcashJni.syncProgress()) }
+
+        override suspend fun syncedHeight(accountIds: List<Int>): Int? =
+            this@ZcashWallet.syncedHeight(accountIds)
+
+        override fun onStart() {
+            this@ZcashWallet.cancelRequested = false
+            syncing = true
+        }
+
+        override fun onFinish() {
+            syncing = false
+        }
+    }
 
     /**
      * [key] is a seed phrase, a unified full viewing key, or a Sapling or transparent
@@ -219,63 +360,14 @@ public class ZcashWallet private constructor(private val handle: Long) {
         actionsPerSync: Int = DEFAULT_ACTIONS_PER_SYNC,
         transparentLimit: Int = DEFAULT_TRANSPARENT_LIMIT,
         checkpointAge: Int = DEFAULT_CHECKPOINT_AGE,
-    ): Flow<SyncState> = flow {
-        emit(SyncState.Connecting)
-        val target = latestHeight()
-        ZcashSdk.syncMutex.withLock {
-            cancelRequested = false
-            syncing = true
-            val error = try {
-                runSync(accountIds, target, actionsPerSync, transparentLimit, checkpointAge)
-            } finally {
-                syncing = false
-            }
-            val state = terminalSyncState(error, cancelRequested)
-            if (state == SyncState.Synced) {
-                // A close() racing this last read must not turn a finished sync into a failure.
-                val height = try {
-                    syncedHeight(accountIds)
-                } catch (_: ZcashException) {
-                    null
-                }
-                height?.let { emit(SyncState.Syncing(it, target)) }
-            }
-            emit(state)
-        }
-    }
-
-    /** Runs the blocking native sync while sampling its progress; returns what it failed with. */
-    private suspend fun FlowCollector<SyncState>.runSync(
-        accountIds: List<Int>,
-        target: Int,
-        actionsPerSync: Int,
-        transparentLimit: Int,
-        checkpointAge: Int,
-    ): ZcashException? = supervisorScope {
-        val native = async {
-            withNative {
-                ZcashJni.synchronize(
-                    handle,
-                    accountIds.toIntArray(),
-                    target,
-                    actionsPerSync,
-                    transparentLimit,
-                    checkpointAge,
-                    false,
-                )
-            }
-        }
-        while (native.isActive) {
-            delay(PROGRESS_SAMPLE_MS)
-            syncProgressOf(ZcashJni.syncProgress())?.let { emit(SyncState.Syncing(it.height, target)) }
-        }
-        try {
-            native.await()
-            null
-        } catch (e: ZcashException) {
-            e
-        }
-    }
+    ): Flow<SyncState> = syncFlow(
+        accountIds = accountIds,
+        actionsPerSync = actionsPerSync,
+        transparentLimit = transparentLimit,
+        checkpointAge = checkpointAge,
+        mutex = ZcashSdk.syncMutex,
+        backend = syncBackend,
+    )
 
     /**
      * Stops the running sync, whichever wallet started it: rlz cancels globally. Only the wallet

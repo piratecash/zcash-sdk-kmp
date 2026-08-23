@@ -5,6 +5,7 @@
 //! Handles Sapling, Orchard, and Ironwood (NU6.3) bundle decoding.
 
 use std::{
+    future::Future,
     io::Read,
     pin::Pin,
     sync::Arc,
@@ -12,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use futures::{Stream, StreamExt};
 use httparse::Status;
 use reqwest::Url;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
@@ -33,7 +35,7 @@ const COMPACT_NOTE_SIZE: usize = 52;
 use crate::{
     api::coin::Network,
     lwd::*,
-    net::{BroadcastOutcome, LwdServer},
+    net::{forward_stream, BroadcastOutcome, LwdServer},
     IntoAnyhow,
 };
 
@@ -166,11 +168,7 @@ impl ZebraClient {
         Ok(res)
     }
 
-    async fn post_stream(
-        &self,
-        stream: Pin<Box<dyn AsyncRW + Send>>,
-        req: Value,
-    ) -> Result<Value> {
+    async fn post_stream(&self, stream: Pin<Box<dyn AsyncRW + Send>>, req: Value) -> Result<Value> {
         let mut stream: Pin<Box<dyn AsyncRW + Send>> = if self.ssl {
             let connector = TlsConnector::from(self.tls_config.clone());
             let server_name: ServerName = self.host.clone().try_into().anyhow()?;
@@ -251,27 +249,25 @@ impl LwdServer for ZebraClient {
         Ok((height as u32, tx))
     }
 
-    type CompactBlockStream = ReceiverStream<CompactBlock>;
+    type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
     async fn block_range(
         &mut self,
         network: &Network,
         start: u32,
         end: u32,
     ) -> Result<Self::CompactBlockStream> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<CompactBlock>(10);
-        let mut client = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<CompactBlock>>(10);
+        let client = self.clone();
         let network = *network;
-        tokio::spawn(async move {
-            for height in start..=end {
-                let cb = client.block(&network, height).await?;
-                tx.send(cb).await.ok();
-            }
-            Ok::<_, anyhow::Error>(())
+        let blocks = fetch_stream(start..=end, move |height| {
+            let mut client = client.clone();
+            async move { client.block(&network, height).await }
         });
+        tokio::spawn(forward_stream(blocks, tx));
         Ok(ReceiverStream::new(rx))
     }
 
-    type TransactionStream = ReceiverStream<(u32, Transaction, usize)>;
+    type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
     async fn taddress_txs(
         &mut self,
         network: &Network,
@@ -298,20 +294,20 @@ impl LwdServer for ZebraClient {
                 Ok::<_, anyhow::Error>(txid_str)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut client = self.clone();
+        let client = self.clone();
         let network = *network;
-        let (txs, rx) = tokio::sync::mpsc::channel::<(u32, Transaction, usize)>(10);
-        tokio::spawn(async move {
-            for txid in txids.iter() {
+        let (txs, rx) = tokio::sync::mpsc::channel::<Result<(u32, Transaction, usize)>>(10);
+        let transactions = fetch_stream(txids, move |txid| {
+            let mut client = client.clone();
+            async move {
                 let mut txid_hex = hex::decode(txid)
                     .map_err(|e| anyhow::anyhow!("Invalid txid hex from node: {}", e))?;
                 txid_hex.reverse();
                 let (height, tx) = client.transaction(&network, &txid_hex).await?;
-                txs.send((height, tx, 0)).await?;
+                Ok((height, tx, 0))
             }
-
-            Ok::<_, anyhow::Error>(())
         });
+        tokio::spawn(forward_stream(transactions, txs));
 
         Ok(ReceiverStream::new(rx))
     }
@@ -349,6 +345,15 @@ impl LwdServer for ZebraClient {
             hex::decode(&ironwood_tree).unwrap_or_default(),
         ))
     }
+}
+
+fn fetch_stream<I, T, F, Fut>(items: I, fetch: F) -> impl Stream<Item = Result<T>>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    futures::stream::iter(items).then(fetch)
 }
 
 pub fn parse_block(
@@ -490,6 +495,8 @@ pub fn read_compact_u32<R: Read>(mut reader: R) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::api::coin::Network;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio_stream::wrappers::ReceiverStream;
 
     #[tokio::test]
     async fn jsonrpc_rejects_transport_2_when_nym_is_off() {
@@ -522,5 +529,58 @@ mod tests {
             .to_string();
 
         assert!(err.contains("mempool"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn block_producer_fetch_fails_forwards_the_error() {
+        let source = fetch_stream(7..=8, |height| async move {
+            anyhow::ensure!(height == 7, "block fetch failed");
+            Ok(height)
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+
+        forward_stream(source, sender).await;
+
+        let items = ReceiverStream::new(receiver).collect::<Vec<_>>().await;
+        assert_eq!(7, *items[0].as_ref().expect("first block"));
+        assert!(items[1]
+            .as_ref()
+            .expect_err("fetch error")
+            .to_string()
+            .contains("block fetch failed"));
+    }
+
+    #[tokio::test]
+    async fn transaction_producer_fetch_fails_forwards_the_error() {
+        let source = fetch_stream(["first", "second"], |txid| async move {
+            anyhow::ensure!(txid == "first", "transaction fetch failed");
+            Ok(txid)
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+
+        forward_stream(source, sender).await;
+
+        let items = ReceiverStream::new(receiver).collect::<Vec<_>>().await;
+        assert_eq!("first", *items[0].as_ref().expect("first transaction"));
+        assert!(items[1]
+            .as_ref()
+            .expect_err("fetch error")
+            .to_string()
+            .contains("transaction fetch failed"));
+    }
+
+    #[tokio::test]
+    async fn producer_receiver_closes_stops_fetching() {
+        let calls = AtomicU32::new(0);
+        let source = fetch_stream(1..=3, |_| async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+
+        forward_stream(source, sender).await;
+
+        assert_eq!(1, calls.load(Ordering::Relaxed));
     }
 }

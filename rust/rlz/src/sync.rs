@@ -2,11 +2,10 @@ use anyhow::{Context as _, Result};
 use sqlx::SqliteConnection;
 use sqlx::{sqlite::SqliteRow, Row};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::channel;
 use tokio_stream::StreamExt;
-use tracing::{debug, info};
+use tracing::debug;
 use zcash_transparent::address::TransparentAddress;
 
 use crate::api::account::get_ledger;
@@ -32,7 +31,7 @@ use crate::{
 use bincode::config;
 use sqlx::pool::PoolConnection;
 use sqlx::{Connection, Sqlite, SqlitePool};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use zcash_keys::encoding::AddressCodec;
@@ -68,7 +67,7 @@ pub struct OrchardAccountKeys {
 }
 
 /// Cache of all per-account key material needed during shielded sync.
-/// Preloaded once and shared via Arc between the db_writer and warp_sync tasks.
+/// Preloaded once so key derivation stays out of the database writer's hot path.
 pub struct AccountKeyCache {
     pub sapling: HashMap<u32, SaplingAccountKeys>,
     pub orchard: HashMap<u32, OrchardAccountKeys>,
@@ -368,7 +367,8 @@ pub(crate) async fn transparent_sync(
                     anyhow::bail!("Sync canceled");
                 }
                 m = txs.recv() => {
-                    if let Some((height, transaction, _)) = m {
+                    if let Some(item) = m {
+                        let (height, transaction, _) = item?;
                         let txid = transaction.txid().as_ref().to_vec();
                         debug!(
                             "transparent_sync: found tx {} at height {} for account {} version={:?} branch_id={:?}",
@@ -499,8 +499,7 @@ pub(crate) async fn transparent_sync(
                                 height,
                             );
                         }
-                    }
-                    else {
+                    } else {
                         // No more transactions
                         break;
                     }
@@ -531,7 +530,7 @@ pub async fn get_compact_block_range(
     client: &mut Client,
     start: u32,
     end: u32,
-) -> Result<ReceiverStream<CompactBlock>> {
+) -> Result<ReceiverStream<Result<CompactBlock>>> {
     let blocks = client.block_range(network, start, end).await?;
     Ok(blocks)
 }
@@ -650,6 +649,58 @@ fn resolve_diversifier_index(
     }
 }
 
+async fn commit_warp_messages(
+    network: &Network,
+    writer_connection: &mut SqliteConnection,
+    messages: &mut Vec<WarpSyncMessage>,
+    tx_progress: &Sender<SyncProgress>,
+    key_cache: &AccountKeyCache,
+) -> Result<()> {
+    let mut db_tx = writer_connection.begin().await?;
+    for message in mem::take(messages) {
+        handle_message(network, &mut db_tx, message, tx_progress, key_cache).await?;
+    }
+    db_tx.commit().await?;
+    debug!("Committing transaction");
+    Ok(())
+}
+
+async fn write_warp_messages(
+    network: &Network,
+    writer_connection: &mut SqliteConnection,
+    mut rx_messages: Receiver<WarpSyncMessage>,
+    tx_progress: &Sender<SyncProgress>,
+    key_cache: &AccountKeyCache,
+) -> Result<()> {
+    debug!("[db handler] starting");
+    let mut messages = vec![];
+    while let Some(message) = rx_messages.recv().await {
+        if matches!(message, WarpSyncMessage::Commit) {
+            commit_warp_messages(
+                network,
+                writer_connection,
+                &mut messages,
+                tx_progress,
+                key_cache,
+            )
+            .await?;
+        } else {
+            messages.push(message);
+        }
+    }
+    commit_warp_messages(
+        network,
+        writer_connection,
+        &mut messages,
+        tx_progress,
+        key_cache,
+    )
+    .await?;
+
+    debug!("[db handler] stopped");
+    check_witness_consistency(writer_connection).await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn shielded_sync(
     network: &Network,
@@ -670,101 +721,62 @@ pub async fn shielded_sync(
     let end = end.max(activation_height);
 
     let accounts = accounts.to_vec();
-    let db_writer_task = {
-        let (s, o, i) = get_tree_state(network, client, start - 1).await?;
+    let (s, o, i) = get_tree_state(network, client, start - 1).await?;
 
-        debug!("get compact block range");
-        let blocks = get_compact_block_range(network, client, start, end).await?;
-        debug!("got streaming blocks");
-        let (tx_messages, mut rx_messages) = channel::<WarpSyncMessage>(100);
+    debug!("get compact block range");
+    let blocks = get_compact_block_range(network, client, start, end).await?;
+    debug!("got streaming blocks");
+    let (tx_messages, rx_messages) = channel::<WarpSyncMessage>(100);
 
-        let mut connection = pool.acquire().await?;
-        // get the list of transaction heights for which the time is 0
-        // because raw transactions do not have timestamp (it comes from the block header)
-        let heights_without_time = get_heights_without_time(&mut connection, start, end).await?;
+    let mut connection = pool.acquire().await?;
+    // get the list of transaction heights for which the time is 0
+    // because raw transactions do not have timestamp (it comes from the block header)
+    let heights_without_time = get_heights_without_time(&mut connection, start, end).await?;
 
-        let mut writer_connection = pool.acquire().await?;
-
-        // Preload all account keys ONCE before sync starts.
-        // Key derivations happen once upfront — no per-note DB queries in the hot path.
-        let key_cache = Arc::new(preload_account_key_cache(&mut writer_connection).await?);
-
-        let network = *network;
-        let mut messages = vec![];
-        let db_writer_task = tokio::spawn(async move {
-            debug!("[db handler] starting");
-            while let Some(msg) = rx_messages.recv().await {
-                //debug!("Received message: {:?}", msg);
-                if let WarpSyncMessage::Commit = msg {
-                    let mut db_tx = writer_connection.begin().await.unwrap();
-                    let mut new_messages = vec![];
-                    mem::swap(&mut new_messages, &mut messages);
-                    for msg in new_messages {
-                        match handle_message(&network, &mut db_tx, msg, &tx_progress, &key_cache)
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => {
-                                info!("ERROR HANDLING MESSAGE: {:?}", e);
-                                return Err(e);
-                            }
-                        }
-                    }
-                    db_tx.commit().await.unwrap();
-                    debug!("Committing transaction");
-                } else {
-                    messages.push(msg);
-                }
-            }
-
-            let mut db_tx = writer_connection.begin().await.unwrap();
-            for msg in messages {
-                match handle_message(&network, &mut db_tx, msg, &tx_progress, &key_cache).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        info!("ERROR HANDLING MESSAGE: {:?}", e);
-                        return Err(e);
-                    }
-                }
-            }
-            db_tx.commit().await.unwrap();
-
-            debug!("[db handler] stopped");
-            check_witness_consistency(&mut writer_connection).await?;
-
-            Ok::<_, anyhow::Error>(())
-        });
-
-        tokio::spawn(async move {
-            debug!("Start sync");
-            if let Err(e) = warp_sync(
-                &network,
-                &mut connection,
-                start,
-                &accounts,
-                blocks,
-                heights_without_time,
-                actions_per_sync,
-                &s,
-                &o,
-                &i,
-                tx_messages.clone(),
-                rx_cancel,
-            )
-            .await
-            {
-                tracing::error!("Error during warp sync: {:?}", e);
-                let _ = tx_messages.send(WarpSyncMessage::Error(e)).await;
-            }
-
-            debug!("Sync finished");
-        });
-
-        db_writer_task
+    let mut writer_connection = pool.acquire().await?;
+    // Key derivations happen once upfront — no per-note DB queries in the hot path.
+    let key_cache = preload_account_key_cache(&mut writer_connection).await?;
+    let network = *network;
+    let error_sender = tx_messages.clone();
+    let sync = async move {
+        debug!("Start sync");
+        if let Err(error) = warp_sync(
+            &network,
+            &mut connection,
+            start,
+            end,
+            &accounts,
+            blocks,
+            heights_without_time,
+            actions_per_sync,
+            &s,
+            &o,
+            &i,
+            tx_messages,
+            rx_cancel,
+        )
+        .await
+        {
+            tracing::error!("Error during warp sync: {:?}", error);
+            error_sender
+                .send(WarpSyncMessage::Error(error))
+                .await
+                .context("sending warp sync error")?;
+        }
+        debug!("Sync finished");
+        Ok::<_, anyhow::Error>(())
     };
+    let writer = write_warp_messages(
+        &network,
+        &mut writer_connection,
+        rx_messages,
+        &tx_progress,
+        &key_cache,
+    );
 
-    db_writer_task.await??;
-    Ok(())
+    let (sync_result, writer_result) = tokio::join!(sync, writer);
+    writer_result?;
+    sync_result
 }
 
 async fn handle_message(
@@ -1215,7 +1227,7 @@ pub async fn discover_transparent_addresses(
                     .taddress_txs(network, &taddr, start_height, end_height)
                     => {
                     let mut txids = txids?;
-                    if txids.next().await.is_some() {
+                    if txids.next().await.transpose()?.is_some() {
                         // The wallet reached this far, so the window reopens from here.
                         gap = 0;
                         let sk = tk
@@ -1330,6 +1342,63 @@ mod tests {
             .expect("heights")
     }
 
+    #[tokio::test]
+    async fn write_warp_messages_reorg_commits_the_rewind_before_returning_the_error() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        for pool in 0..=2 {
+            set_pool_sync_height_for_account(&mut connection, account, pool, 2_000_010).await;
+        }
+        sqlx::query(
+            "INSERT INTO transactions (account, txid, height, time) VALUES (?1, ?2, ?3, 0)",
+        )
+        .bind(account)
+        .bind([7_u8; 32].as_slice())
+        .bind(2_000_008_u32)
+        .execute(&mut connection)
+        .await
+        .expect("transaction");
+        let key_cache = preload_account_key_cache(&mut connection)
+            .await
+            .expect("key cache");
+        let (tx_progress, _rx_progress) = channel(1);
+        let (sender, receiver) = channel(3);
+
+        crate::warp::sync::send_reorg(&sender, vec![account], 2_000_004)
+            .await
+            .expect("queue reorg");
+        sender
+            .send(WarpSyncMessage::Error(SyncError::Reorg(2_000_004)))
+            .await
+            .expect("queue error");
+        drop(sender);
+
+        let result = write_warp_messages(
+            &Network::Main,
+            &mut connection,
+            receiver,
+            &tx_progress,
+            &key_cache,
+        )
+        .await;
+
+        assert!(result
+            .expect_err("reorg")
+            .to_string()
+            .contains("Reorganization"));
+        assert!(sync_heights(&mut connection)
+            .await
+            .into_iter()
+            .all(|height| height < 2_000_010));
+        let transactions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&mut connection)
+            .await
+            .expect("transaction count");
+        assert_eq!(0, transactions);
+    }
+
     /// `transparent_sync` commits pool 0 for the whole range before the shielded pass runs, so a
     /// failure there leaves it ahead. The next pass must rewind it, not skip the missed range.
     #[tokio::test]
@@ -1364,6 +1433,7 @@ mod tests {
     struct EmptyStreams {
         calls: u32,
         fail_at_call: Option<u32>,
+        stream_failure: bool,
     }
 
     #[async_trait]
@@ -1376,7 +1446,7 @@ mod tests {
             unimplemented!()
         }
 
-        type CompactBlockStream = ReceiverStream<CompactBlock>;
+        type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
         async fn block_range(
             &mut self,
             _network: &Network,
@@ -1398,7 +1468,7 @@ mod tests {
             unimplemented!()
         }
 
-        type TransactionStream = ReceiverStream<(u32, Transaction, usize)>;
+        type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
         async fn taddress_txs(
             &mut self,
             _network: &Network,
@@ -1412,7 +1482,17 @@ mod tests {
                 "server failed on address {}",
                 self.calls
             );
-            let (sender, receiver) = channel(1);
+            let (sender, receiver) = channel(2);
+            if self.stream_failure {
+                sender
+                    .send(Ok((101, any_transaction(), 0)))
+                    .await
+                    .expect("queue transaction");
+                sender
+                    .send(Err(anyhow::anyhow!("transaction stream failed")))
+                    .await
+                    .expect("queue error");
+            }
             drop(sender);
             Ok(ReceiverStream::new(receiver))
         }
@@ -1464,6 +1544,7 @@ mod tests {
         let mut client: Client = Box::new(EmptyStreams {
             calls: 0,
             fail_at_call,
+            stream_failure: false,
         });
         let (_cancel, rx_cancel) = broadcast::channel(1);
 
@@ -1490,6 +1571,49 @@ mod tests {
         let result = scan_to_200(&mut connection, &[ACCOUNT], Some(2)).await;
 
         assert!(result.is_err());
+        assert_eq!(sync_heights(&mut connection).await, vec![100]);
+    }
+
+    #[tokio::test]
+    async fn transparent_sync_stream_fails_rolls_back_the_transaction_and_height() {
+        let mut connection = memory_db().await;
+        insert_scoped_taddress(
+            &mut connection,
+            1,
+            0,
+            0,
+            "t1h31WzbruQhnwHg4XDJ5anLM7CAtwjXmPt",
+        )
+        .await;
+        set_pool_sync_height(&mut connection, 0, 100).await;
+        let mut client: Client = Box::new(EmptyStreams {
+            calls: 0,
+            fail_at_call: None,
+            stream_failure: true,
+        });
+        let (_cancel, cancellation) = broadcast::channel(1);
+
+        let result = transparent_sync(
+            &Network::Main,
+            &mut connection,
+            &mut client,
+            &[ACCOUNT],
+            101,
+            200,
+            10,
+            cancellation,
+        )
+        .await;
+
+        assert!(result
+            .expect_err("stream failure")
+            .to_string()
+            .contains("transaction stream failed"));
+        let transactions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&mut connection)
+            .await
+            .expect("transaction count");
+        assert_eq!(0, transactions);
         assert_eq!(sync_heights(&mut connection).await, vec![100]);
     }
 
@@ -1560,6 +1684,7 @@ mod tests {
     struct UsedAtCalls {
         calls: Arc<AtomicU32>,
         used_at_calls: Vec<u32>,
+        fail_at_call: Option<u32>,
     }
 
     /// The smallest transaction that parses: the scan only asks whether the stream has an item.
@@ -1580,7 +1705,7 @@ mod tests {
             unimplemented!()
         }
 
-        type CompactBlockStream = ReceiverStream<CompactBlock>;
+        type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
         async fn block_range(
             &mut self,
             _network: &Network,
@@ -1602,7 +1727,7 @@ mod tests {
             unimplemented!()
         }
 
-        type TransactionStream = ReceiverStream<(u32, Transaction, usize)>;
+        type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
         async fn taddress_txs(
             &mut self,
             _network: &Network,
@@ -1611,10 +1736,15 @@ mod tests {
             _end: u32,
         ) -> Result<Self::TransactionStream> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-            let (sender, receiver) = channel(1);
-            if self.used_at_calls.contains(&call) {
+            let (sender, receiver) = channel(2);
+            if self.fail_at_call == Some(call) {
                 sender
-                    .send((1, any_transaction(), 0))
+                    .send(Err(anyhow::anyhow!("discovery stream failed")))
+                    .await
+                    .expect("queue error");
+            } else if self.used_at_calls.contains(&call) {
+                sender
+                    .send(Ok((1, any_transaction(), 0)))
                     .await
                     .expect("queue transaction");
             }
@@ -1655,6 +1785,7 @@ mod tests {
         let mut client: Client = Box::new(UsedAtCalls {
             calls: calls.clone(),
             used_at_calls,
+            fail_at_call: None,
         });
 
         let n_added = discover_transparent_addresses(
@@ -1720,6 +1851,37 @@ mod tests {
 
         assert_eq!(n_added, 0);
         assert_eq!(calls, 6, "three addresses in each scope");
+        assert_eq!(receive_dindexes(&mut connection, account).await, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_addresses_stream_fails_returns_error_without_storing_address() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let mut client: Client = Box::new(UsedAtCalls {
+            calls: Arc::new(AtomicU32::new(0)),
+            used_at_calls: vec![],
+            fail_at_call: Some(1),
+        });
+
+        let result = discover_transparent_addresses(
+            &Network::Main,
+            &mut connection,
+            &mut client,
+            account,
+            2_000_100,
+            2,
+            |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result
+            .expect_err("stream failure")
+            .to_string()
+            .contains("discovery stream failed"));
         assert_eq!(receive_dindexes(&mut connection, account).await, vec![0]);
     }
 }

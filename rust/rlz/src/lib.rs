@@ -43,8 +43,8 @@ pub type Hash32 = [u8; 32];
 pub(crate) type GRPCClient = CompactTxStreamerClient<tonic::transport::Channel>;
 pub type Client = Box<
     dyn LwdServer<
-        CompactBlockStream = ReceiverStream<CompactBlock>,
-        TransactionStream = ReceiverStream<(u32, Transaction, usize)>,
+        CompactBlockStream = ReceiverStream<anyhow::Result<CompactBlock>>,
+        TransactionStream = ReceiverStream<anyhow::Result<(u32, Transaction, usize)>>,
         MempoolStream = ReceiverStream<anyhow::Result<(u32, Transaction, usize)>>,
     >,
 >;

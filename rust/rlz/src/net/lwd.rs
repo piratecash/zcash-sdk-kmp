@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures::StreamExt;
 use tracing::debug;
 use zcash_primitives::transaction::Transaction;
 
@@ -9,7 +10,7 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 use crate::{
     api::{coin::Network, network::LWDInfo},
     lwd::*,
-    net::{BroadcastOutcome, LwdServer},
+    net::{forward_stream, BroadcastOutcome, LwdServer},
     GRPCClient,
 };
 
@@ -34,7 +35,7 @@ impl LwdServer for GRPCClient {
         Ok(block)
     }
 
-    type CompactBlockStream = ReceiverStream<CompactBlock>;
+    type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
     async fn block_range(
         &mut self,
         _network: &Network,
@@ -42,7 +43,7 @@ impl LwdServer for GRPCClient {
         end: u32,
     ) -> Result<Self::CompactBlockStream> {
         debug!("Fetching block range from {} to {}", start, end);
-        let mut blocks = self
+        let blocks = self
             .get_block_range(Request::new(BlockRange {
                 start: Some(BlockId {
                     height: start as u64,
@@ -56,13 +57,11 @@ impl LwdServer for GRPCClient {
             }))
             .await?
             .into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel::<CompactBlock>(10);
-        tokio::spawn(async move {
-            while let Some(block) = blocks.message().await? {
-                tx.send(block).await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        });
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<CompactBlock>>(10);
+        tokio::spawn(forward_stream(
+            blocks.map(|block| block.map_err(anyhow::Error::new)),
+            tx,
+        ));
         Ok(ReceiverStream::new(rx))
     }
 
@@ -99,7 +98,7 @@ impl LwdServer for GRPCClient {
         })
     }
 
-    type TransactionStream = ReceiverStream<(u32, Transaction, usize)>;
+    type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
     async fn taddress_txs(
         &mut self,
         network: &Network,
@@ -107,7 +106,7 @@ impl LwdServer for GRPCClient {
         start: u32,
         end: u32,
     ) -> Result<Self::TransactionStream> {
-        let mut txs = self
+        let txs = self
             .get_taddress_txids(Request::new(TransparentAddressBlockFilter {
                 address: taddress.to_string(),
                 range: Some(BlockRange {
@@ -125,9 +124,10 @@ impl LwdServer for GRPCClient {
             .await?
             .into_inner();
         let network = *network;
-        let (sender, rx) = tokio::sync::mpsc::channel::<(u32, Transaction, usize)>(10);
-        tokio::spawn(async move {
-            while let Some(rtx) = txs.message().await? {
+        let (sender, rx) = tokio::sync::mpsc::channel::<Result<(u32, Transaction, usize)>>(10);
+        tokio::spawn(forward_stream(
+            txs.map(move |rtx| {
+                let rtx = rtx.map_err(anyhow::Error::new)?;
                 let len = rtx.data.len();
                 let branch_id =
                     BranchId::for_height(&network, BlockHeight::from_u32(rtx.height as u32));
@@ -149,48 +149,32 @@ impl LwdServer for GRPCClient {
                     n_vout,
                     hex::encode(&rtx.data[..rtx.data.len().min(120)]),
                 );
-                sender.send((rtx.height as u32, tx, len)).await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        });
+                Ok((rtx.height as u32, tx, len))
+            }),
+            sender,
+        ));
         Ok(ReceiverStream::new(rx))
     }
 
     type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
     async fn mempool_stream(&mut self, network: &Network) -> Result<Self::MempoolStream> {
-        let mut txs = self
+        let txs = self
             .get_mempool_stream(Request::new(Empty {}))
             .await?
             .into_inner();
         let network = *network;
         let (sender, rx) = tokio::sync::mpsc::channel::<Result<(u32, Transaction, usize)>>(10);
-        tokio::spawn(async move {
-            loop {
-                let read = async {
-                    let Some(rtx) = txs.message().await? else {
-                        return Ok(None);
-                    };
-                    let len = rtx.data.len();
-                    let branch_id =
-                        BranchId::for_height(&network, BlockHeight::from_u32(rtx.height as u32));
-                    let tx = Transaction::read(&mut &rtx.data[..], branch_id)?;
-                    Ok(Some((rtx.height as u32, tx, len)))
-                }
-                .await;
-                match read {
-                    Ok(None) => break,
-                    Ok(Some(tx)) => {
-                        if sender.send(Ok(tx)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = sender.send(Err(e)).await;
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(forward_stream(
+            txs.map(move |rtx| {
+                let rtx = rtx.map_err(anyhow::Error::new)?;
+                let len = rtx.data.len();
+                let branch_id =
+                    BranchId::for_height(&network, BlockHeight::from_u32(rtx.height as u32));
+                let tx = Transaction::read(&mut &rtx.data[..], branch_id)?;
+                Ok((rtx.height as u32, tx, len))
+            }),
+            sender,
+        ));
         Ok(ReceiverStream::new(rx))
     }
 
