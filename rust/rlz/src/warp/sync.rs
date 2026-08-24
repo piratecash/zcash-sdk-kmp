@@ -26,6 +26,8 @@ pub use zcash_trees::types::SyncError;
 
 mod shielded;
 
+const MAX_BLOCKS_PER_CHUNK: usize = 1000;
+
 pub type SaplingSync = Synchronizer<shielded::sapling::SaplingProtocol>;
 pub type OrchardSync = Synchronizer<shielded::orchard::OrchardProtocol>;
 pub type IronwoodSync = Synchronizer<shielded::ironwood::IronwoodProtocol>;
@@ -251,7 +253,6 @@ async fn read_block_stream(
             }
             _ = rx_cancel.recv() => {
                 debug!("Sync cancelled");
-                flush_chunk(&tx_blocks, &mut chunk).await?;
                 return Err(SyncError::Cancelled);
             }
             message = blocks.next() => {
@@ -298,7 +299,7 @@ async fn read_block_stream(
                     }
                     chunk.push(block);
 
-                    if actions >= actions_per_sync as usize && !chunk.is_empty() {
+                    if actions >= actions_per_sync as usize || chunk.len() >= MAX_BLOCKS_PER_CHUNK {
                         flush_chunk(&tx_blocks, &mut chunk).await?;
                         actions = 0;
                     }
@@ -441,6 +442,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_block_stream_sparse_range_chunks_at_one_thousand_blocks() {
+        let mut previous_hash = vec![];
+        let mut items = vec![];
+        for height in 10u32..=1010 {
+            let hash = height.to_le_bytes().to_vec();
+            items.push(Ok(block(height, &previous_hash, &hash)));
+            previous_hash = hash;
+        }
+
+        let (result, messages) = read(items, 10, 1010, None).await;
+
+        result.expect("complete sparse range");
+        assert!(matches!(
+            messages.as_slice(),
+            [BlockMessage::Chunk(first), BlockMessage::Chunk(second)]
+                if first.len() == 1000 && second.len() == 1
+        ));
+    }
+
+    #[tokio::test]
     async fn read_block_stream_is_cancelled_returns_cancelled() {
         let (source, receiver) = tokio::sync::mpsc::channel(1);
         let (messages, _output) = tokio::sync::mpsc::channel(1);
@@ -463,6 +484,41 @@ mod tests {
         drop(source);
 
         assert!(matches!(result, Err(SyncError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn read_block_stream_cancelled_with_pending_block_discards_the_block() {
+        let (source, receiver) = tokio::sync::mpsc::channel(1);
+        source
+            .send(Ok(block(10, &[], &[10])))
+            .await
+            .expect("source block");
+        let (messages, mut output) = tokio::sync::mpsc::channel(1);
+        let (cancel, cancellation) = broadcast::channel(1);
+        let reader = tokio::spawn(read_block_stream(
+            ReceiverStream::new(receiver),
+            10,
+            11,
+            None,
+            vec![7],
+            HashSet::new(),
+            100,
+            messages,
+            cancellation,
+            Duration::from_secs(60),
+        ));
+
+        let permit = source
+            .reserve()
+            .await
+            .expect("reader consumed pending block");
+        cancel.send(()).expect("cancel");
+        let result = reader.await.expect("reader task");
+        drop(permit);
+        drop(source);
+
+        assert!(matches!(result, Err(SyncError::Cancelled)));
+        assert!(output.try_recv().is_err());
     }
 
     #[tokio::test]

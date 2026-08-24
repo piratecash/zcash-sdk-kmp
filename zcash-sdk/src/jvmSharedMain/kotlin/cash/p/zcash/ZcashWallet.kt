@@ -1,18 +1,20 @@
 package cash.p.zcash
 
+import co.touchlab.kermit.Logger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-private const val DEFAULT_ACTIONS_PER_SYNC = 100_000
+private const val DEFAULT_ACTIONS_PER_SYNC = 10_000
 private const val DEFAULT_TRANSPARENT_LIMIT = 100
 private const val DEFAULT_CHECKPOINT_AGE = 10_000
 private const val DEFAULT_GAP_LIMIT = 20
@@ -50,17 +52,28 @@ internal fun syncFlow(
     backend: SyncBackend,
 ): Flow<SyncState> = flow {
     emit(SyncState.Connecting)
-    val target = backend.latestHeight()
+    val target = try {
+        backend.latestHeight()
+    } catch (error: Throwable) {
+        logSyncFailure(stage = "target", error)
+        throw error
+    }
     mutex.withLock {
         backend.onStart()
-        val error = try {
+        val result = try {
             runNativeSync(accountIds, target, actionsPerSync, transparentLimit, checkpointAge, backend)
         } finally {
             backend.onFinish()
         }
-        emitTerminalState(accountIds, target, error, backend)
+        val terminal = emitTerminalState(accountIds, target, result.error, backend)
+        logSyncTerminal(terminal, target, result.madeProgress)
     }
-}
+}.distinctUntilChanged()
+
+private data class NativeSyncResult(
+    val error: ZcashException?,
+    val madeProgress: Boolean,
+)
 
 private suspend fun FlowCollector<SyncState>.runNativeSync(
     accountIds: List<Int>,
@@ -69,20 +82,31 @@ private suspend fun FlowCollector<SyncState>.runNativeSync(
     transparentLimit: Int,
     checkpointAge: Int,
     backend: SyncBackend,
-): ZcashException? = supervisorScope {
+): NativeSyncResult = supervisorScope {
     val native = async {
         backend.synchronize(accountIds, target, actionsPerSync, transparentLimit, checkpointAge)
     }
+    var madeProgress = false
     while (native.isActive) {
         delay(PROGRESS_SAMPLE_MS)
-        backend.progress()?.let { emit(SyncState.Syncing(it.height, target)) }
+        if (!native.isActive) break
+        backend.progress()?.let { progress ->
+            if (!madeProgress) {
+                madeProgress = true
+                Logger.d {
+                    "sync progress current=${progress.height} target=$target actionsPerSync=$actionsPerSync"
+                }
+            }
+            emit(SyncState.Syncing(progress.height, target))
+        }
     }
-    try {
+    val error = try {
         native.await()
         null
     } catch (error: ZcashException) {
         error
     }
+    NativeSyncResult(error, madeProgress)
 }
 
 private suspend fun FlowCollector<SyncState>.emitTerminalState(
@@ -90,25 +114,51 @@ private suspend fun FlowCollector<SyncState>.emitTerminalState(
     target: Int,
     error: ZcashException?,
     backend: SyncBackend,
-) {
+): SyncState {
     val state = terminalSyncState(error, backend.cancelRequested)
     if (state != SyncState.Synced) {
         emit(state)
-        return
+        return state
     }
     if (accountIds.isEmpty()) {
         emit(SyncState.Synced)
-        return
+        return SyncState.Synced
     }
 
     val height = try {
         backend.syncedHeight(accountIds)
     } catch (error: ZcashException) {
-        emit(SyncState.Failed(error))
-        return
+        return SyncState.Failed(error).also { emit(it) }
     }
     height?.let { emit(SyncState.Syncing(it, target)) }
-    emit(completedSyncState(height, target))
+    return completedSyncState(height, target).also { emit(it) }
+}
+
+private fun logSyncTerminal(state: SyncState, target: Int, madeProgress: Boolean) {
+    when (state) {
+        SyncState.Stopped -> Logger.d { "sync cancelled target=$target" }
+        SyncState.Synced -> if (madeProgress) Logger.d { "sync completed target=$target" }
+        is SyncState.Failed -> logSyncFailure(stage = "sync", state.error, target)
+        SyncState.Connecting,
+        is SyncState.Syncing,
+            -> Unit
+    }
+}
+
+private fun logSyncFailure(stage: String, error: Throwable, target: Int? = null) {
+    val targetField = target?.let { " target=$it" }.orEmpty()
+    Logger.e { "sync failed stage=$stage category=${error.syncFailureCategory()}$targetField" }
+}
+
+private fun Throwable.syncFailureCategory(): String {
+    val detail = message.orEmpty().lowercase()
+    return when {
+        "tls" in detail || "handshake" in detail -> "tls"
+        "timeout" in detail || "timed out" in detail -> "timeout"
+        "eof" in detail || "connection" in detail || "network" in detail || "socket" in detail -> "network"
+        "sqlite" in detail || "database" in detail -> "database"
+        else -> "other"
+    }
 }
 
 private fun completedSyncState(height: Int?, target: Int): SyncState = when {
@@ -124,7 +174,10 @@ private fun completedSyncState(height: Int?, target: Int): SyncState = when {
  * the same file is not a second wallet — keep one instance per path. [close] releases this
  * object; the pool itself lives until the process ends.
  */
-public class ZcashWallet private constructor(private val handle: Long) {
+public class ZcashWallet private constructor(
+    private val handle: Long,
+    syncBackendForTest: SyncBackend? = null,
+) {
 
     @Volatile
     private var closed = false
@@ -135,7 +188,7 @@ public class ZcashWallet private constructor(private val handle: Long) {
     @Volatile
     private var syncing = false
 
-    private val syncBackend = object : SyncBackend {
+    private val nativeSyncBackend = object : SyncBackend {
         override val cancelRequested: Boolean
             get() = this@ZcashWallet.cancelRequested
 
@@ -176,6 +229,8 @@ public class ZcashWallet private constructor(private val handle: Long) {
             syncing = false
         }
     }
+
+    private val syncBackend = syncBackendForTest ?: nativeSyncBackend
 
     /**
      * [key] is a seed phrase, a unified full viewing key, or a Sapling or transparent
@@ -436,6 +491,8 @@ public class ZcashWallet private constructor(private val handle: Long) {
     }
 
     public companion object {
+
+        internal fun forSyncTest(backend: SyncBackend): ZcashWallet = ZcashWallet(0, backend)
 
         /**
          * [ZcashSdk.initialize] must have run first.

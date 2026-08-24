@@ -10,6 +10,7 @@ composeMultiplatform = "1.10.1"
 composeMaterial3 = "1.10.0-alpha05"
 activityCompose = "1.13.0"
 lifecycleViewmodelCompose = "2.10.0"
+kermit = "2.1.0"
 
 junit = "4.13.2"
 
@@ -27,6 +28,7 @@ compose-multiplatform-material3 = { module = "org.jetbrains.compose.material3:ma
 compose-multiplatform-resources = { module = "org.jetbrains.compose.components:components-resources", version.ref = "composeMultiplatform" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
 androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycleViewmodelCompose" }
+kermit = { module = "co.touchlab:kermit", version.ref = "kermit" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }

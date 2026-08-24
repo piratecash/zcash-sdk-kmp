@@ -155,6 +155,7 @@ kotlin {
 
         commonMain {
             dependencies {
+                implementation(libs.kermit)
                 implementation(libs.kotlinx.coroutines.core)
                 implementation(libs.kotlinx.serialization.json)
             }
