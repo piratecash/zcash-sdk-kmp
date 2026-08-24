@@ -334,6 +334,7 @@ public class ZcashWallet private constructor(
             options.sourcePools.mask.toByte(),
             options.recipientPaysFee,
             options.smartTransparent,
+            options.confirmations,
         )
         PreparedTransaction(bytes)
     }
@@ -363,9 +364,18 @@ public class ZcashWallet private constructor(
     public suspend fun extract(transaction: PreparedTransaction): ByteArray =
         withNative { ZcashJni.extractTransaction(transaction.bytes) }
 
+    /** Reserves wallet-owned inputs before a caller starts network I/O. Idempotent for the same tx. */
+    public suspend fun reserveForBroadcast(account: Int, rawTransaction: ByteArray): Unit =
+        withNative { ZcashJni.reserveForBroadcast(handle, account, rawTransaction) }
+
     /** Hands [rawTransaction] to the node and reports its verdict without interpreting it. */
-    public suspend fun broadcast(rawTransaction: ByteArray, height: Int): BroadcastResult =
-        withNative { parseBroadcastResult(ZcashJni.broadcastTransaction(handle, height, rawTransaction)) }
+    public suspend fun broadcast(
+        account: Int,
+        rawTransaction: ByteArray,
+        height: Int,
+    ): BroadcastResult = withNative {
+        parseBroadcastResult(ZcashJni.broadcastTransaction(handle, account, height, rawTransaction))
+    }
 
     /**
      * The full send path: prepare, plan (for its height), sign, extract, broadcast. Returns
@@ -385,7 +395,7 @@ public class ZcashWallet private constructor(
         val height = plan(prepared).height
         val signed = sign(account, prepared, spendingKey)
         val raw = extract(signed)
-        val result = broadcast(raw, height)
+        val result = broadcast(account, raw, height)
         if (!result.accepted) {
             throw ZcashException("Broadcast rejected (${result.errorCode}): ${result.message}")
         }

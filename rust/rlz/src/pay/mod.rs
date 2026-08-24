@@ -19,6 +19,7 @@ pub mod fee;
 pub mod plan;
 pub mod pool;
 pub mod prepare;
+pub mod reserve;
 pub mod select;
 pub mod solve;
 

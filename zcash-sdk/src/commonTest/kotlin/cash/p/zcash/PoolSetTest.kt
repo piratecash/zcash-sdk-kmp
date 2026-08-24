@@ -3,6 +3,7 @@ package cash.p.zcash
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class PoolSetTest {
@@ -38,10 +39,18 @@ class PoolSetTest {
 
     @Test
     fun balance_pendingAndTotal_sumTheirParts() {
-        val balance = Balance(available = 10L, changePending = 3L, valuePending = 7L)
+        val balance = Balance(available = 10L, locked = 2L, changePending = 3L, valuePending = 7L)
 
         assertEquals(10L, balance.pending)
-        assertEquals(20L, balance.total)
+        assertEquals(22L, balance.total)
+    }
+
+    @Test
+    fun balance_legacyPositionalConstructor_keepsPendingFieldOrder() {
+        val balance = Balance(10L, 3L, 7L)
+
+        assertEquals(10L, balance.pending)
+        assertEquals(0L, balance.locked)
     }
 
     @Test
@@ -55,5 +64,10 @@ class PoolSetTest {
         assertEquals(350L, balance.total)
         assertEquals(250L, balance.shielded)
         assertEquals(Balance(), balance[Pool.SAPLING])
+    }
+
+    @Test
+    fun paymentOptions_negativeConfirmations_areRejected() {
+        assertFailsWith<IllegalArgumentException> { PaymentOptions(confirmations = -1) }
     }
 }

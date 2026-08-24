@@ -162,7 +162,7 @@ class DemoController(
                     spendingKey.fill(0)
                 }
                 val raw = wallet.extract(signed)
-                val result = wallet.broadcast(raw, planned.plan.height)
+                val result = wallet.broadcast(id, raw, planned.plan.height)
                 if (!result.accepted) {
                     uiState = uiState.copy(send = SendState.Failed(planned, result.message))
                     return@runGuarded

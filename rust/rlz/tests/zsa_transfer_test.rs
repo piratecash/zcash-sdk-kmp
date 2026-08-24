@@ -219,6 +219,7 @@ async fn test_orchard_transfer() {
         src_pools: ALL_POOLS,
         recipient_pays_fee: false,
         smart_transparent: false,
+        confirmations: 0,
         category: None,
     };
 
@@ -718,6 +719,7 @@ async fn test_zsa_transfer() {
         src_pools: ALL_POOLS,
         recipient_pays_fee: false,
         smart_transparent: false,
+        confirmations: 0,
         category: None,
     };
 

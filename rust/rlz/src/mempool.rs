@@ -152,35 +152,9 @@ pub async fn decode_raw_transaction(
     okeys: &[(u32, String, orchard::keys::FullViewingKey)],
     tx_data: &TransactionData<Authorized>,
 ) -> Result<Vec<MempoolNote>> {
-    let mut notes = vec![];
+    let mut notes = spent_notes(connection, tx_data).await?;
 
     if let Some(tbundle) = tx_data.transparent_bundle() {
-        for v in tbundle.vin.iter() {
-            let mut nf = vec![];
-            v.prevout().write(&mut nf)?;
-            let spent_amount = sqlx::query(
-                "SELECT a.id_account, a.name, n.value, n.pool, n.scope, n.diversifier, m.memo_text
-                FROM notes n
-                JOIN accounts a ON n.account = a.id_account
-                LEFT JOIN memos m ON m.note = n.id_note
-                WHERE n.nullifier = ?",
-            )
-            .bind(&nf)
-            .map(|row: SqliteRow| MempoolNote {
-                account: row.get(0),
-                name: row.get(1),
-                value: -(row.get::<i64, _>(2)),
-                pool: row.get(3),
-                scope: row.get::<Option<u8>, _>(4).unwrap_or(0),
-                diversifier: row.get(5),
-                diversifier_index: None,
-                address: None,
-                memo: row.get(6),
-            })
-            .fetch_all(&mut *connection)
-            .await?;
-            notes.extend(spent_amount);
-        }
         for v in tbundle.vout.iter() {
             if let Some(vout_address) = v.recipient_address() {
                 if let Some((account, name, _)) = tkeys.iter().find(|(_, _, a)| a == &vout_address)
@@ -202,31 +176,6 @@ pub async fn decode_raw_transaction(
     }
 
     if let Some(sbundle) = tx_data.sapling_bundle() {
-        for v in sbundle.shielded_spends().iter() {
-            let nf = &v.nullifier().to_vec();
-            let spent_amount = sqlx::query(
-                "SELECT a.id_account, a.name, n.value, n.pool, n.scope, n.diversifier, m.memo_text
-                FROM notes n
-                JOIN accounts a ON n.account = a.id_account
-                LEFT JOIN memos m ON m.note = n.id_note
-                WHERE n.nullifier = ?",
-            )
-            .bind(nf)
-            .map(|row: SqliteRow| MempoolNote {
-                account: row.get(0),
-                name: row.get(1),
-                value: -(row.get::<i64, _>(2)),
-                pool: row.get(3),
-                scope: row.get::<Option<u8>, _>(4).unwrap_or(0),
-                diversifier: row.get(5),
-                diversifier_index: None,
-                address: None,
-                memo: row.get(6),
-            })
-            .fetch_all(&mut *connection)
-            .await?;
-            notes.extend(spent_amount);
-        }
         let domain = SaplingDomain::new(zip212_enforcement(network, height.into()));
         for v in sbundle.shielded_outputs().iter() {
             for (account, name, dfvk) in zkeys.iter() {
@@ -265,30 +214,6 @@ pub async fn decode_raw_transaction(
             let bundle = $bundle;
             let pool: u8 = $pool;
             for v in bundle.actions().iter() {
-                let nf = v.nullifier().to_bytes().to_vec();
-                let spent_amount = sqlx::query(
-                    "SELECT a.id_account, a.name, n.value, n.pool, n.scope, n.diversifier, m.memo_text
-                    FROM notes n
-                    JOIN accounts a ON n.account = a.id_account
-                    LEFT JOIN memos m ON m.note = n.id_note
-                    WHERE n.nullifier = ?",
-                )
-                .bind(&nf)
-                .map(|row: SqliteRow| MempoolNote {
-                    account: row.get(0),
-                    name: row.get(1),
-                    value: -(row.get::<i64, _>(2)),
-                    pool: row.get(3),
-                    scope: row.get::<Option<u8>, _>(4).unwrap_or(0),
-                    diversifier: row.get(5),
-                    diversifier_index: None,
-                    address: None,
-                    memo: row.get(6),
-                })
-                .fetch_all(&mut *connection)
-                .await?;
-                notes.extend(spent_amount);
-
                 let domain = $domain::for_action(v);
                 for (account, name, fvk) in okeys.iter() {
                     for scope in [Scope::External, Scope::Internal] {
@@ -336,6 +261,38 @@ pub async fn decode_raw_transaction(
     }
     if let Some(iwbundle) = tx_data.ironwood_bundle() {
         process_orchard_bundle!(iwbundle, 3, IronwoodDomain);
+    }
+    Ok(notes)
+}
+
+async fn spent_notes(
+    connection: &mut SqliteConnection,
+    tx_data: &TransactionData<Authorized>,
+) -> Result<Vec<MempoolNote>> {
+    let mut notes = Vec::new();
+    for input in crate::pay::reserve::transaction_inputs(tx_data) {
+        let spent = sqlx::query(
+            "SELECT a.id_account, a.name, n.value, n.pool, n.scope, n.diversifier, m.memo_text
+            FROM notes n
+            JOIN accounts a ON n.account = a.id_account
+            LEFT JOIN memos m ON m.note = n.id_note
+            WHERE n.nullifier = ?",
+        )
+        .bind(input)
+        .map(|row: SqliteRow| MempoolNote {
+            account: row.get(0),
+            name: row.get(1),
+            value: -row.get::<i64, _>(2),
+            pool: row.get(3),
+            scope: row.get::<Option<u8>, _>(4).unwrap_or(0),
+            diversifier: row.get(5),
+            diversifier_index: None,
+            address: None,
+            memo: row.get(6),
+        })
+        .fetch_all(&mut *connection)
+        .await?;
+        notes.extend(spent);
     }
     Ok(notes)
 }

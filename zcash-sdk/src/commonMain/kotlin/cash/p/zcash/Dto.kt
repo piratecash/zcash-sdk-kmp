@@ -147,20 +147,21 @@ internal fun encodeRecipients(recipients: List<Recipient>): String =
 internal fun parseTransactionPlan(json: String): TransactionPlan =
     nativeJson.decodeFromString<TxPlanDto>(json).toTransactionPlan()
 
-/** The native layer returns three longs per pool — available, change, value — in [Pool] bit order. */
+/** The native layer returns available, locked, change, value per pool in [Pool] bit order. */
 internal fun LongArray.toPoolBalance(): PoolBalance =
     PoolBalance(
         Pool.entries.associateWith { pool ->
             val base = pool.bit * BALANCE_FIELDS
             Balance(
                 available = getOrElse(base) { 0L },
-                changePending = getOrElse(base + 1) { 0L },
-                valuePending = getOrElse(base + 2) { 0L },
+                locked = getOrElse(base + 1) { 0L },
+                changePending = getOrElse(base + 2) { 0L },
+                valuePending = getOrElse(base + 3) { 0L },
             )
         }
     )
 
-private const val BALANCE_FIELDS = 3
+private const val BALANCE_FIELDS = 4
 
 /** [Pool.bit] is the wire index for a single pool (distinct from [PoolSet]'s bitmask). */
 private fun Int.toPool(): Pool =

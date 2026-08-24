@@ -88,6 +88,7 @@ internal object ZcashJni {
         srcPools: Byte,
         recipientPaysFee: Boolean,
         smartTransparent: Boolean,
+        confirmations: Int,
     ): ByteArray
 
     external fun transactionPlan(handle: Long, pkg: ByteArray): String
@@ -129,7 +130,9 @@ internal object ZcashJni {
     /** Stateless: needs no open wallet. */
     external fun transactionId(tx: ByteArray): String
 
-    external fun broadcastTransaction(handle: Long, height: Int, tx: ByteArray): String
+    external fun reserveForBroadcast(handle: Long, account: Int, tx: ByteArray)
+
+    external fun broadcastTransaction(handle: Long, account: Int, height: Int, tx: ByteArray): String
 
     external fun migrationStatus(handle: Long, account: Int): String
 

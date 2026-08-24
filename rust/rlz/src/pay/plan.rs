@@ -35,7 +35,7 @@ use zcash_keys::{
 use zcash_note_encryption::Domain;
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding},
-    Transaction, TxVersion,
+    TxVersion,
     fees::zip317::FeeRule,
 };
 use zcash_proofs::prover::LocalTxProver;
@@ -262,7 +262,7 @@ pub async fn plan_transaction(
     let mut input_pools = fetch_unspent_notes_by_pool(connection, account).await?;
     let height = client.latest_height().await?;
     let confirmations = confirmations.unwrap_or_default();
-    let max_height = height.saturating_sub(confirmations);
+    let max_height = crate::db::confirmed_height(&mut *connection, account, confirmations).await?;
     for pool in 0..NUM_POOLS {
         if src_pools & (1 << pool) == 0 {
             input_pools[pool].clear();
@@ -1443,20 +1443,10 @@ pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
 /// A v5 transaction carries its own consensus branch id, so the one passed to the parser is
 /// only a fallback for older versions - hence the walk from the newest branch down.
 pub fn transaction_id(raw: &[u8]) -> Result<String> {
-    for branch in [
-        BranchId::Nu6_3,
-        BranchId::Nu6_2,
-        BranchId::Nu6,
-        BranchId::Nu5,
-    ] {
-        let mut remaining = raw;
-        if let Ok(tx) = Transaction::read(&mut remaining, branch) {
-            if remaining.is_empty() {
-                return Ok(tx.txid().to_string());
-            }
-        }
-    }
-    Err(anyhow!("Not a valid transaction"))
+    let parsed = crate::pay::reserve::parse_transaction(raw)?;
+    let mut display = parsed.txid;
+    display.reverse();
+    Ok(hex::encode(display))
 }
 
 struct MyTransparentAddress(TransparentAddress);
@@ -1533,15 +1523,27 @@ pub async fn fetch_unspent_notes_grouped_by_pool(
     connection: &mut SqliteConnection,
     account: u32,
 ) -> Result<Vec<InputNote>> {
-    let unspent_notes = sqlx::query(
+    let mut unspent_notes = fetch_unspent_notes(connection, account).await?;
+    unspent_notes.sort_by_key(|note| note.pool);
+    Ok(unspent_notes)
+}
+
+async fn fetch_unspent_notes(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<Vec<InputNote>> {
+    sqlx::query(
         "SELECT a.id_note, a.height, a.pool, a.value, a.id_asset, a.taddress,
                 COALESCE(ast.asset_base, X'0000000000000000000000000000000000000000000000000000000000000000') as asset_base
         FROM notes a
         LEFT JOIN spends b ON a.id_note = b.id_note
         LEFT JOIN assets ast ON a.id_asset = ast.id_asset
-        WHERE b.id_note IS NULL AND a.account = ?
+        LEFT JOIN active_pending_spend_inputs p
+            ON p.account = a.account
+            AND p.nullifier = a.nullifier
+        WHERE b.id_note IS NULL AND a.account = ?1
         AND locked = 0
-        ORDER BY a.pool",
+        AND p.nullifier IS NULL",
     )
     .bind(account)
     .map(|row: SqliteRow| {
@@ -1564,46 +1566,15 @@ pub async fn fetch_unspent_notes_grouped_by_pool(
         }
     })
     .fetch_all(connection)
-    .await?;
-
-    Ok(unspent_notes)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn fetch_unspent_notes_by_pool(
     connection: &mut SqliteConnection,
     account: u32,
 ) -> Result<Vec<Vec<InputNote>>> {
-    let unspent_notes = sqlx::query(
-        "SELECT a.id_note, a.height, a.pool, a.value, a.id_asset, a.taddress,
-                COALESCE(ast.asset_base, X'0000000000000000000000000000000000000000000000000000000000000000') as asset_base
-        FROM notes a
-        LEFT JOIN spends b ON a.id_note = b.id_note
-        LEFT JOIN assets ast ON a.id_asset = ast.id_asset
-        WHERE b.id_note IS NULL AND a.account = ?
-        AND locked = 0",
-    )
-    .bind(account)
-    .map(|row: SqliteRow| {
-        let id_note: u32 = row.get(0);
-        let height: u32 = row.get(1);
-        let pool: u8 = row.get(2);
-        let value: i64 = row.get(3);
-        let id_asset: Option<i64> = row.get(4);
-        let taddress: Option<i64> = row.get(5);
-        let asset_base: Vec<u8> = row.get(6);
-        InputNote {
-            id: id_note,
-            height,
-            amount: value as u64,
-            remaining: value as u64,
-            pool,
-            id_asset: id_asset.map(|v| v as u32),
-            asset_base,
-            taddress: taddress.map(|v| v as u32),
-        }
-    })
-    .fetch_all(connection)
-    .await?;
+    let unspent_notes = fetch_unspent_notes(connection, account).await?;
 
     let mut result: Vec<Vec<InputNote>> = vec![vec![]; NUM_POOLS as usize];
     for note in unspent_notes {

@@ -114,6 +114,7 @@ pub struct PoolBalance(pub Vec<u64>);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Balance {
     pub available: u64,
+    pub locked: u64,
     pub change_pending: u64,
     pub value_pending: u64,
 }

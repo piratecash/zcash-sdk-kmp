@@ -11,10 +11,13 @@ use crate::{
 #[cfg(feature = "flutter")]
 use flutter_rust_bridge::frb;
 
+pub const DEFAULT_CONFIRMATIONS: u32 = 10;
+
 pub struct PaymentOptions {
     pub src_pools: u8,
     pub recipient_pays_fee: bool,
     pub smart_transparent: bool,
+    pub confirmations: u32,
     pub category: Option<u32>,
 }
 
@@ -42,7 +45,7 @@ pub async fn prepare(
         options.src_pools,
         recipients,
         options.recipient_pays_fee,
-        None,
+        Some(options.confirmations),
         options.smart_transparent,
         options.category,
         None,  // issuance — normal sends have no issuance
@@ -74,7 +77,7 @@ pub async fn prepare_migration(
         src_pools,
         recipients,
         false, // recipient_pays_fee
-        None,  // confirmations
+        Some(DEFAULT_CONFIRMATIONS),
         false, // smart_transparent
         None,  // category
         None,  // issuance
@@ -163,8 +166,22 @@ pub async fn broadcast(
     tx_bytes: &[u8],
     c: &Coin,
 ) -> Result<crate::net::BroadcastOutcome> {
+    let mut connection = c.get_connection().await?;
     let mut client = c.client().await?;
-    crate::pay::send(&mut client, height, tx_bytes).await
+    crate::pay::reserve::reserve_and_send(
+        &mut connection,
+        &mut client,
+        c.account,
+        height,
+        tx_bytes,
+    )
+    .await
+}
+
+#[cfg_attr(feature = "flutter", frb)]
+pub async fn reserve_for_broadcast(tx_bytes: &[u8], c: &Coin) -> Result<()> {
+    let mut connection = c.get_connection().await?;
+    crate::pay::reserve::reserve_transaction(&mut connection, c.account, tx_bytes).await
 }
 
 #[cfg_attr(feature = "flutter", frb(sync))]

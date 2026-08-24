@@ -9,10 +9,11 @@ public data class Balance(
     val available: Long = 0L,
     val changePending: Long = 0L,
     val valuePending: Long = 0L,
+    val locked: Long = 0L,
 ) {
     public val pending: Long get() = changePending + valuePending
 
-    public val total: Long get() = available + pending
+    public val total: Long get() = available + locked + pending
 }
 
 /** Per-pool balances of a single account, in zatoshi. */
@@ -21,6 +22,8 @@ public data class PoolBalance(private val byPool: Map<Pool, Balance>) {
     public operator fun get(pool: Pool): Balance = byPool[pool] ?: Balance()
 
     public val available: Long get() = byPool.values.sumOf { it.available }
+
+    public val locked: Long get() = byPool.values.sumOf { it.locked }
 
     public val total: Long get() = byPool.values.sumOf { it.total }
 
@@ -117,7 +120,14 @@ public data class PaymentOptions(
     val sourcePools: PoolSet = PoolSet.ALL,
     val recipientPaysFee: Boolean = false,
     val smartTransparent: Boolean = false,
-)
+    val confirmations: Int = DEFAULT_CONFIRMATIONS,
+) {
+    init {
+        require(confirmations >= 0) { "Confirmations must not be negative: $confirmations" }
+    }
+}
+
+public const val DEFAULT_CONFIRMATIONS: Int = 10
 
 /** Opaque, packed transaction state as it moves through prepare → plan → sign → extract → broadcast. */
 @JvmInline

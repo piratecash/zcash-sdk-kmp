@@ -450,7 +450,37 @@ pub async fn create_schema(connection: &mut SqliteConnection) -> Result<()> {
         height INTEGER NOT NULL,
         price REAL,
         category INTEGER,
+        expiry_height INTEGER,
         UNIQUE (account, txid))",
+    )
+    .execute(&mut *connection)
+    .await?;
+
+    let _ = sqlx::query("ALTER TABLE pending_txs ADD COLUMN expiry_height INTEGER")
+        .execute(&mut *connection)
+        .await;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_spend_inputs (
+        account INTEGER NOT NULL,
+        nullifier BLOB NOT NULL,
+        owner_txid BLOB NOT NULL,
+        expiry_height INTEGER NOT NULL,
+        PRIMARY KEY (account, nullifier))",
+    )
+    .execute(&mut *connection)
+    .await?;
+
+    sqlx::query(
+        "CREATE VIEW IF NOT EXISTS active_pending_spend_inputs AS
+        SELECT p.account, p.nullifier, p.owner_txid, p.expiry_height
+        FROM pending_spend_inputs p
+        WHERE p.expiry_height = 0
+            OR p.expiry_height > COALESCE((
+                SELECT MIN(s.height)
+                FROM sync_heights s
+                WHERE s.account = p.account
+            ), 0)",
     )
     .execute(&mut *connection)
     .await?;
@@ -1214,6 +1244,15 @@ pub async fn get_account_fingerprint(
 pub async fn delete_account(connection: &mut SqliteConnection, account: u32) -> Result<()> {
     let mut tx = connection.begin().await?;
 
+    sqlx::query("DELETE FROM pending_spend_inputs WHERE account = ?")
+        .bind(account)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM pending_txs WHERE account = ?")
+        .bind(account)
+        .execute(&mut *tx)
+        .await?;
+
     sqlx::query("DELETE FROM dkg_params WHERE account = ?")
         .bind(account)
         .execute(&mut *tx)
@@ -1357,6 +1396,17 @@ pub async fn get_sync_height(conn: &mut SqliteConnection, account: u32) -> Resul
     Ok(h)
 }
 
+pub async fn confirmed_height(
+    connection: &mut SqliteConnection,
+    account: u32,
+    confirmations: u32,
+) -> Result<u32> {
+    Ok(get_sync_height(connection, account)
+        .await?
+        .unwrap_or_default()
+        .saturating_sub(confirmations))
+}
+
 pub async fn calculate_balance(
     pool: &mut SqliteConnection,
     account: u32,
@@ -1389,18 +1439,19 @@ pub async fn calculate_balance_breakdown(
     account: u32,
     confirmations: u32,
 ) -> Result<PoolBalanceBreakdown> {
-    let confirmed_height = get_sync_height(&mut *connection, account)
-        .await?
-        .unwrap_or_default()
-        .saturating_sub(confirmations);
+    let confirmed_height = confirmed_height(&mut *connection, account, confirmations).await?;
 
     let mut balance = PoolBalanceBreakdown(vec![Balance::default(); NUM_POOLS]);
     let mut rows = sqlx::query(
         "SELECT n.pool,
-            SUM(CASE WHEN n.height <= ?2 THEN n.value ELSE 0 END),
+            SUM(CASE WHEN n.height <= ?2 AND NOT n.locked AND p.nullifier IS NULL THEN n.value ELSE 0 END),
+            SUM(CASE WHEN n.height <= ?2 AND (n.locked OR p.nullifier IS NOT NULL) THEN n.value ELSE 0 END),
             SUM(CASE WHEN n.height > ?2 AND n.scope = 1 THEN n.value ELSE 0 END),
             SUM(CASE WHEN n.height > ?2 AND (n.scope IS NULL OR n.scope <> 1) THEN n.value ELSE 0 END)
         FROM notes n LEFT JOIN spends s ON s.id_note = n.id_note
+        LEFT JOIN active_pending_spend_inputs p
+            ON p.account = n.account
+            AND p.nullifier = n.nullifier
         WHERE n.account = ?1 AND n.id_asset IS NULL AND s.id_note IS NULL
         GROUP BY n.pool",
     )
@@ -1412,12 +1463,16 @@ pub async fn calculate_balance_breakdown(
             row.get::<i64, _>(1),
             row.get::<i64, _>(2),
             row.get::<i64, _>(3),
+            row.get::<i64, _>(4),
         )
     })
     .fetch(connection);
-    while let Some((pool, available, change_pending, value_pending)) = rows.try_next().await? {
+    while let Some((pool, available, locked, change_pending, value_pending)) =
+        rows.try_next().await?
+    {
         balance.0[pool as usize] = Balance {
             available: available as u64,
+            locked: locked as u64,
             change_pending: change_pending as u64,
             value_pending: value_pending as u64,
         };
@@ -2028,8 +2083,12 @@ pub async fn store_pending_tx(
     let mut txid = txid.to_vec();
     txid.reverse();
     sqlx::query(
-        "INSERT OR REPLACE INTO pending_txs(account, height, txid, price, category)
-    VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO pending_txs(account, height, txid, price, category)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(account, txid) DO UPDATE SET
+            height = excluded.height,
+            price = excluded.price,
+            category = excluded.category",
     )
     .bind(account)
     .bind(height)
@@ -2184,11 +2243,28 @@ pub async fn unlock_all_notes(connection: &mut SqliteConnection, account: u32) -
 // the source pool selection. Therefore we don't know what the user
 // wants to use yet
 pub async fn max_spendable(connection: &mut SqliteConnection, account: u32) -> Result<u64> {
+    let confirmed_height = confirmed_height(
+        &mut *connection,
+        account,
+        crate::api::pay::DEFAULT_CONFIRMATIONS,
+    )
+    .await?;
     let (amount,): (Option<u64>,) = sqlx::query_as(
-        "SELECT SUM(n.value) FROM notes n LEFT JOIN spends s ON n.id_note = s.id_note
-    WHERE s.id_note IS NULL AND n.account = ?1 AND n.id_asset IS NULL AND NOT(locked)",
+        "SELECT SUM(n.value)
+        FROM notes n
+        LEFT JOIN spends s ON n.id_note = s.id_note
+        LEFT JOIN active_pending_spend_inputs p
+            ON p.account = n.account
+            AND p.nullifier = n.nullifier
+        WHERE s.id_note IS NULL
+            AND n.account = ?1
+            AND n.id_asset IS NULL
+            AND n.height <= ?2
+            AND NOT n.locked
+            AND p.nullifier IS NULL",
     )
     .bind(account)
+    .bind(confirmed_height)
     .fetch_one(connection)
     .await?;
     Ok(amount.unwrap_or_default())
@@ -2339,6 +2415,50 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn create_schema_legacy_pending_table_preserves_rows_and_adds_reservations() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("database");
+        sqlx::query(
+            "CREATE TABLE pending_txs (
+                id_pending_tx INTEGER PRIMARY KEY,
+                account INTEGER NOT NULL,
+                txid BLOB NOT NULL,
+                height INTEGER NOT NULL,
+                price REAL,
+                category INTEGER,
+                UNIQUE (account, txid))",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("legacy table");
+        sqlx::query(
+            "INSERT INTO pending_txs(account, txid, height, price, category)
+            VALUES (1, x'0102', 100, 2.5, 7)",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("legacy row");
+
+        create_schema(&mut connection).await.expect("upgrade");
+
+        let row: (Vec<u8>, u32, f64, u32, Option<u32>) = sqlx::query_as(
+            "SELECT txid, height, price, category, expiry_height FROM pending_txs",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("preserved row");
+        assert_eq!(row, (vec![1, 2], 100, 2.5, 7, None));
+        let columns: u32 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('pending_spend_inputs')",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("reservation table");
+        assert_eq!(columns, 4);
+    }
+
+    #[tokio::test]
     async fn calculate_balance_breakdown_splits_pending_by_note_scope() {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, 100).await;
@@ -2355,6 +2475,7 @@ pub(crate) mod tests {
             breakdown.0[1],
             Balance {
                 available: 100,
+                locked: 0,
                 change_pending: 7,
                 value_pending: 30,
             }
@@ -2384,6 +2505,7 @@ pub(crate) mod tests {
             breakdown.0[1],
             Balance {
                 available: 0,
+                locked: 0,
                 change_pending: 0,
                 value_pending: 30,
             }
@@ -2427,6 +2549,7 @@ pub(crate) mod tests {
             breakdown.0[1],
             Balance {
                 available: 0,
+                locked: 0,
                 change_pending: 0,
                 value_pending: 100,
             }
@@ -2447,10 +2570,29 @@ pub(crate) mod tests {
             breakdown.0[0],
             Balance {
                 available: 0,
+                locked: 0,
                 change_pending: 0,
                 value_pending: 42,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn calculate_balance_breakdown_confirmation_boundary_matches_spend_cutoff() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 1, 91, 42, Some(0)).await;
+
+        let nine = calculate_balance_breakdown(&mut connection, ACCOUNT, 9)
+            .await
+            .expect("nine confirmations");
+        let ten = calculate_balance_breakdown(&mut connection, ACCOUNT, 10)
+            .await
+            .expect("ten confirmations");
+
+        assert_eq!(nine.0[1].available, 42);
+        assert_eq!(ten.0[1].available, 0);
+        assert_eq!(ten.0[1].value_pending, 42);
     }
 
     const TX: u32 = 7;

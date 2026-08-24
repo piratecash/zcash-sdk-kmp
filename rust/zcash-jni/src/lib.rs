@@ -28,8 +28,9 @@ use rlz::api::key::{derive_spending_key, generate_seed};
 use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::get_current_height;
 use rlz::api::pay::{
-    broadcast, extract_transaction, pack_transaction, prepare, sign_transaction_with_key, to_plan,
-    transaction_id, unpack_transaction, PaymentOptions, PcztPackage,
+    broadcast, extract_transaction, pack_transaction, prepare, reserve_for_broadcast,
+    sign_transaction_with_key, to_plan, transaction_id, unpack_transaction, PaymentOptions,
+    PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sweep::discover_transparent_addresses;
@@ -549,7 +550,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_addressesFromViewingKey<'local
         .resolve::<ThrowNativeError>()
 }
 
-/// Three longs per pool — available, change pending, value pending — from a single snapshot,
+/// Four longs per pool — available, locked, change pending, value pending — from a single snapshot,
 /// so the split can never be read across two different sync states.
 #[no_mangle]
 pub extern "system" fn Java_cash_p_zcash_ZcashJni_balance<'local>(
@@ -570,6 +571,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_balance<'local>(
                 .flat_map(|b| {
                     [
                         b.available as i64,
+                        b.locked as i64,
                         b.change_pending as i64,
                         b.value_pending as i64,
                     ]
@@ -751,15 +753,20 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_prepare<'local>(
     src_pools: jbyte,
     recipient_pays_fee: jboolean,
     smart_transparent: jboolean,
+    confirmations: jint,
 ) -> JByteArray<'local> {
     unowned_env
         .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
             let recipients = parse_recipients(&recipients_json.try_to_string(env)?)?;
+            if confirmations < 0 {
+                return Err(BridgeError("Confirmations must not be negative".to_string()));
+            }
             let coin = wallet_account(handle, account)?;
             let options = PaymentOptions {
                 src_pools: src_pools as u8,
                 recipient_pays_fee,
                 smart_transparent,
+                confirmations: confirmations as u32,
                 category: None,
             };
             let package = runtime().block_on(prepare(&recipients, options, &coin))?;
@@ -867,15 +874,34 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_broadcastTransaction<'local>(
     mut unowned_env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
+    account: jint,
     height: jint,
     tx: JByteArray<'local>,
 ) -> JString<'local> {
     unowned_env
         .with_env(|env| -> Result<JString<'local>, BridgeError> {
             let raw = env.convert_byte_array(&tx)?;
-            let coin = wallet(handle)?;
+            let coin = wallet_account(handle, account)?;
             let outcome = runtime().block_on(broadcast(height as u32, &raw, &coin))?;
             to_json(env, &BroadcastResultDto::from(outcome))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_reserveForBroadcast<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    tx: JByteArray<'local>,
+) {
+    unowned_env
+        .with_env(|env| -> Result<(), BridgeError> {
+            let raw = env.convert_byte_array(&tx)?;
+            let coin = wallet_account(handle, account)?;
+            runtime().block_on(reserve_for_broadcast(&raw, &coin))?;
+            Ok(())
         })
         .resolve::<ThrowNativeError>()
 }

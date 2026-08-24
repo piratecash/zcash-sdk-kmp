@@ -11,7 +11,8 @@ use crate::{
         fee::{FeeManager, COST_PER_ACTION},
         plan::{extract_transaction, plan_transaction, sign_transaction},
         pool::PoolMask,
-        send, Recipient,
+        reserve::reserve_and_send,
+        Recipient,
     },
     Client,
 };
@@ -135,6 +136,7 @@ async fn fetch_unspent_orchard_notes_with_cmx(
     connection: &mut SqliteConnection,
     account: u32,
     checkpoint_height: u32,
+    confirmed_height: u32,
 ) -> Result<Vec<OrchardZecNote>> {
     sqlx::query(
         "SELECT a.id_note, a.height, a.value, a.cmx,
@@ -147,14 +149,20 @@ async fn fetch_unspent_orchard_notes_with_cmx(
                 )
          FROM notes a
          LEFT JOIN spends b ON a.id_note = b.id_note
+         LEFT JOIN active_pending_spend_inputs p
+            ON p.account = a.account
+            AND p.nullifier = a.nullifier
          WHERE b.id_note IS NULL
          AND a.account = ?2
+         AND a.height <= ?3
          AND a.pool = 2
          AND a.id_asset IS NULL
-         AND a.locked = 0",
+         AND a.locked = 0
+         AND p.nullifier IS NULL",
     )
     .bind(checkpoint_height)
     .bind(account)
+    .bind(confirmed_height)
     .map(|row| OrchardZecNote {
         id: row.get(0),
         height: row.get(1),
@@ -198,8 +206,14 @@ fn broadcast_txid(outcome: BroadcastOutcome) -> Result<String> {
     Ok(outcome.message)
 }
 
-async fn broadcast(client: &mut Client, height: u32, tx: &[u8]) -> Result<String> {
-    broadcast_txid(send(client, height, tx).await?)
+async fn broadcast(
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    height: u32,
+    tx: &[u8],
+) -> Result<String> {
+    broadcast_txid(reserve_and_send(connection, client, account, height, tx).await?)
 }
 
 /// Run one migration step. Fully idempotent — re-scans notes on every call.
@@ -218,14 +232,25 @@ pub async fn step(
     let checkpoint_height = crate::sync::get_db_height(&mut *connection, account)
         .await?
         .height;
+    let confirmed_height = crate::db::confirmed_height(
+        &mut *connection,
+        account,
+        crate::api::pay::DEFAULT_CONFIRMATIONS,
+    )
+    .await?;
 
     // Get the wallet's own Orchard/Ironwood address
     let hw = get_account_hw(&mut *connection, account).await?;
     let own_address = get_account_full_address(network, &mut *connection, account, 0, hw).await?;
 
     // Fetch all unspent Orchard ZEC notes with cmx.
-    let orchard_zec =
-        fetch_unspent_orchard_notes_with_cmx(&mut *connection, account, checkpoint_height).await?;
+    let orchard_zec = fetch_unspent_orchard_notes_with_cmx(
+        &mut *connection,
+        account,
+        checkpoint_height,
+        confirmed_height,
+    )
+    .await?;
 
     info!(
         "Migration step: {} Orchard ZEC notes found",
@@ -346,7 +371,7 @@ pub async fn step(
                 PoolMask::from_pool(2).0, // Orchard source
                 &recipients,
                 false,
-                None,
+                Some(crate::api::pay::DEFAULT_CONFIRMATIONS),
                 false,
                 None,
                 None,
@@ -360,10 +385,9 @@ pub async fn step(
                 .map(|p| p.fee)
                 .unwrap_or(0);
             let pczt =
-                sign_transaction(&mut *connection, account, network, &pczt, usk_bytes)
-                    .await?;
+                sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
             let tx_bytes = extract_transaction(&pczt).await?;
-            let txid = broadcast(client, height, &tx_bytes).await?;
+            let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
 
             return Ok(MigrationEvent::SplitComplete { fee, txid });
         }
@@ -440,7 +464,7 @@ pub async fn step(
             PoolMask::from_pool(2).0, // Orchard source
             &recipients,
             false,
-            None,
+            Some(crate::api::pay::DEFAULT_CONFIRMATIONS),
             false,
             None,
             None,
@@ -453,10 +477,9 @@ pub async fn step(
         let fee = crate::pay::TxPlan::from_package(network, &pczt)
             .map(|p| p.fee)
             .unwrap_or(0);
-        let pczt =
-            sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
+        let pczt = sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
         let tx_bytes = extract_transaction(&pczt).await?;
-        let txid = broadcast(client, height, &tx_bytes).await?;
+        let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
 
         return Ok(MigrationEvent::MigrateComplete { fee, txid });
     }
@@ -468,6 +491,31 @@ pub async fn step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::tests::{memory_db, ACCOUNT};
+
+    #[tokio::test]
+    async fn fetch_unspent_orchard_notes_unconfirmed_note_excludes_value() {
+        let mut connection = memory_db().await;
+        for (height, nullifier) in [(90_u32, vec![1_u8]), (91, vec![2])] {
+            sqlx::query(
+                "INSERT INTO notes(height, account, pool, scope, nullifier, tx, value)
+                VALUES (?1, ?2, 2, 0, ?3, 0, 50)",
+            )
+            .bind(height)
+            .bind(ACCOUNT)
+            .bind(nullifier)
+            .execute(&mut connection)
+            .await
+            .expect("note");
+        }
+
+        let notes = fetch_unspent_orchard_notes_with_cmx(&mut connection, ACCOUNT, 100, 90)
+            .await
+            .expect("notes");
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].height, 90);
+    }
 
     #[test]
     fn test_is_sd() {
