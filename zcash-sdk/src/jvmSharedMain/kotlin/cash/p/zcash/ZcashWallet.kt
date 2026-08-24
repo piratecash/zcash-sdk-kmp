@@ -91,13 +91,14 @@ private suspend fun FlowCollector<SyncState>.runNativeSync(
         delay(PROGRESS_SAMPLE_MS)
         if (!native.isActive) break
         backend.progress()?.let { progress ->
+            val current = boundedSyncHeight(progress.height, target)
             if (!madeProgress) {
                 madeProgress = true
                 Logger.d {
-                    "sync progress current=${progress.height} target=$target actionsPerSync=$actionsPerSync"
+                    "sync progress current=$current target=$target actionsPerSync=$actionsPerSync"
                 }
             }
-            emit(SyncState.Syncing(progress.height, target))
+            emit(SyncState.Syncing(current, target))
         }
     }
     val error = try {
@@ -130,9 +131,11 @@ private suspend fun FlowCollector<SyncState>.emitTerminalState(
     } catch (error: ZcashException) {
         return SyncState.Failed(error).also { emit(it) }
     }
-    height?.let { emit(SyncState.Syncing(it, target)) }
+    height?.let { emit(SyncState.Syncing(boundedSyncHeight(it, target), target)) }
     return completedSyncState(height, target).also { emit(it) }
 }
+
+private fun boundedSyncHeight(height: Int, target: Int): Int = height.coerceAtMost(target)
 
 private fun logSyncTerminal(state: SyncState, target: Int, madeProgress: Boolean) {
     when (state) {

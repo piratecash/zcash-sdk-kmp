@@ -151,6 +151,31 @@ class ZcashSyncFlowTest {
     }
 
     @Test
+    fun syncFlow_progressAndFinalHeightExceedTarget_clampsAndDeduplicatesStates() = runTest {
+        val states = syncFlow(
+            accountIds = listOf(ACCOUNT_ID),
+            actionsPerSync = 1,
+            transparentLimit = 1,
+            checkpointAge = 1,
+            mutex = Mutex(),
+            backend = FakeSyncBackend(
+                localHeight = TARGET_HEIGHT + 100,
+                progress = SyncProgress(TARGET_HEIGHT + 200, 0),
+                syncDelayMs = 1_000,
+            ),
+        ).toList()
+
+        assertEquals(
+            listOf(
+                SyncState.Connecting,
+                SyncState.Syncing(TARGET_HEIGHT, TARGET_HEIGHT),
+                SyncState.Synced,
+            ),
+            states,
+        )
+    }
+
+    @Test
     fun sync_actionsPerSyncOmitted_passesPublicDefaultToBackend() = runTest {
         val backend = FakeSyncBackend()
 

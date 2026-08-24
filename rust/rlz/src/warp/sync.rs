@@ -240,6 +240,11 @@ async fn read_block_stream(
 
     loop {
         tokio::select! {
+            biased;
+            _ = rx_cancel.recv() => {
+                debug!("Sync cancelled");
+                return Err(SyncError::Cancelled);
+            }
             _ = interval.tick() => {
                 debug!("Syncing at height {}", current_height);
                 if previous_height == current_height {
@@ -250,10 +255,6 @@ async fn read_block_stream(
                     )));
                 }
                 previous_height = current_height;
-            }
-            _ = rx_cancel.recv() => {
-                debug!("Sync cancelled");
-                return Err(SyncError::Cancelled);
             }
             message = blocks.next() => {
                 match message {
@@ -519,6 +520,37 @@ mod tests {
 
         assert!(matches!(result, Err(SyncError::Cancelled)));
         assert!(output.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn read_block_stream_block_and_cancel_ready_never_flushes_the_block() {
+        for _ in 0..32 {
+            let (source, receiver) = tokio::sync::mpsc::channel(1);
+            source
+                .send(Ok(block(10, &[], &[10])))
+                .await
+                .expect("source block");
+            let (messages, mut output) = tokio::sync::mpsc::channel(1);
+            let (cancel, cancellation) = broadcast::channel(1);
+            cancel.send(()).expect("cancel");
+
+            let result = read_block_stream(
+                ReceiverStream::new(receiver),
+                10,
+                10,
+                None,
+                vec![7],
+                HashSet::new(),
+                0,
+                messages,
+                cancellation,
+                Duration::from_secs(60),
+            )
+            .await;
+
+            assert!(matches!(result, Err(SyncError::Cancelled)));
+            assert!(output.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
