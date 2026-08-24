@@ -20,6 +20,7 @@ private const val DEFAULT_CHECKPOINT_AGE = 10_000
 private const val DEFAULT_GAP_LIMIT = 20
 private const val PROGRESS_SAMPLE_MS = 250L
 private const val MEMPOOL_POLL_MS = 500L
+private val logger = Logger.withTag("ZEC")
 
 internal interface SyncBackend {
     val cancelRequested: Boolean
@@ -94,7 +95,7 @@ private suspend fun FlowCollector<SyncState>.runNativeSync(
             val current = boundedSyncHeight(progress.height, target)
             if (!madeProgress) {
                 madeProgress = true
-                Logger.d {
+                logger.d {
                     "sync progress current=$current target=$target actionsPerSync=$actionsPerSync"
                 }
             }
@@ -139,8 +140,8 @@ private fun boundedSyncHeight(height: Int, target: Int): Int = height.coerceAtMo
 
 private fun logSyncTerminal(state: SyncState, target: Int, madeProgress: Boolean) {
     when (state) {
-        SyncState.Stopped -> Logger.d { "sync cancelled target=$target" }
-        SyncState.Synced -> if (madeProgress) Logger.d { "sync completed target=$target" }
+        SyncState.Stopped -> logger.d { "sync cancelled target=$target" }
+        SyncState.Synced -> if (madeProgress) logger.d { "sync completed target=$target" }
         is SyncState.Failed -> logSyncFailure(stage = "sync", state.error, target)
         SyncState.Connecting,
         is SyncState.Syncing,
@@ -150,7 +151,7 @@ private fun logSyncTerminal(state: SyncState, target: Int, madeProgress: Boolean
 
 private fun logSyncFailure(stage: String, error: Throwable, target: Int? = null) {
     val targetField = target?.let { " target=$it" }.orEmpty()
-    Logger.e { "sync failed stage=$stage category=${error.syncFailureCategory()}$targetField" }
+    logger.e { "sync failed stage=$stage category=${error.syncFailureCategory()}$targetField" }
 }
 
 private fun Throwable.syncFailureCategory(): String {
