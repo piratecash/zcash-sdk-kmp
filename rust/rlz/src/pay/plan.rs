@@ -242,6 +242,33 @@ async fn account_can_sign(connection: &mut SqliteConnection, account: u32) -> Re
         .is_some())
 }
 
+/// The candidate set a plan may spend from: only the pools in `src_pools`, and within
+/// them only notes confirmed against `max_height`.
+pub(crate) fn restrict_to_source_pools(
+    input_pools: &mut [Vec<InputNote>],
+    src_pools: u8,
+    max_height: u32,
+) {
+    for pool in 0..NUM_POOLS {
+        if src_pools & (1 << pool) == 0 {
+            input_pools[pool].clear();
+        } else {
+            input_pools[pool].retain(|n| n.height <= max_height);
+        }
+    }
+}
+
+/// Drops ZEC notes too small to pay for a single logical action. ZSA amounts are
+/// denominated in their own asset and cannot pay fees, so the threshold ignores them.
+pub(crate) fn drop_zec_dust(input_pools: &mut [Vec<InputNote>]) {
+    for pool in input_pools.iter_mut() {
+        pool.retain(|n| {
+            let is_zec = n.asset_base.is_empty() || n.asset_base.iter().all(|&byte| byte == 0);
+            !is_zec || n.amount >= COST_PER_ACTION
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn plan_transaction(
     network: &Network,
@@ -263,13 +290,7 @@ pub async fn plan_transaction(
     let height = client.latest_height().await?;
     let confirmations = confirmations.unwrap_or_default();
     let max_height = crate::db::confirmed_height(&mut *connection, account, confirmations).await?;
-    for pool in 0..NUM_POOLS {
-        if src_pools & (1 << pool) == 0 {
-            input_pools[pool].clear();
-        } else {
-            input_pools[pool].retain(|n| n.height <= max_height);
-        }
-    }
+    restrict_to_source_pools(&mut input_pools, src_pools, max_height);
 
     // Preselected filter: restrict to specific note IDs (e.g. migration)
     if let Some(ids) = preselected {
@@ -380,16 +401,8 @@ pub async fn plan_transaction(
             .fetch_one(&mut *connection)
             .await?;
 
-    // Remove ZEC dust notes (too small to pay for a single logical action).
-    // ZSA amounts are denominated in their own asset and cannot pay fees, so
-    // comparing them against the zatoshi fee threshold is meaningless.
     let before_dust: [usize; NUM_POOLS] = std::array::from_fn(|p| input_pools[p].len());
-    for pool in input_pools.iter_mut() {
-        pool.retain(|n| {
-            let is_zec = n.asset_base.is_empty() || n.asset_base.iter().all(|&byte| byte == 0);
-            !is_zec || n.amount >= COST_PER_ACTION
-        });
-    }
+    drop_zec_dust(&mut input_pools);
     info!(
         "plan: after dust filter — t:{}→{}, s:{}→{}, o:{}→{}, iw:{}→{}",
         before_dust[0],

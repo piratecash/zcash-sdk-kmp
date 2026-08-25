@@ -4,8 +4,12 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::api::coin::Coin;
 
-use crate::db::{calculate_balance, calculate_balance_breakdown};
+use crate::db::{
+    calculate_balance, calculate_balance_breakdown,
+    max_spendable_from_pools as db_max_spendable_from_pools,
+};
 use crate::io::SyncHeight;
+use crate::pay::pool::PoolMask;
 use crate::sync::BlockHeader;
 
 #[cfg(feature = "flutter")]
@@ -57,6 +61,15 @@ pub async fn balance_breakdown(confirmations: u32, c: &Coin) -> Result<PoolBalan
     let account = c.account;
 
     calculate_balance_breakdown(&mut connection, account, confirmations).await
+}
+
+/// A conservative lower bound on what is spendable from `pool_mask` alone, fundable
+/// for any single recipient pool. A same-pool send can afford more.
+pub async fn max_spendable_from_pools(confirmations: u32, pool_mask: u8, c: &Coin) -> Result<u64> {
+    let mut connection = c.get_connection().await?;
+    let account = c.account;
+
+    db_max_spendable_from_pools(&mut connection, account, PoolMask(pool_mask), confirmations).await
 }
 
 #[cfg_attr(feature = "flutter", frb)]

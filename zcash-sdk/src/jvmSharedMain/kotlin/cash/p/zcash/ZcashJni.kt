@@ -59,6 +59,9 @@ internal object ZcashJni {
         gapLimit: Int,
     ): Int
 
+    /** Conservative lower bound on what is spendable using only the pools in [poolMask], in zatoshi. */
+    external fun maxSpendable(handle: Long, account: Int, confirmations: Int, poolMask: Int): Long
+
     external fun listTransactions(handle: Long, account: Int): String
 
     external fun synchronize(

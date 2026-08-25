@@ -24,7 +24,8 @@ use crate::api::account::TAddressTxCount;
 use crate::api::account::{Account, Memo, Tx};
 use crate::api::coin::Network;
 use crate::api::sync::{Balance, PoolBalance, PoolBalanceBreakdown};
-use crate::pay::pool::NUM_POOLS;
+use crate::pay::fee::COST_PER_ACTION;
+use crate::pay::pool::{PoolMask, NUM_POOLS};
 use crate::sync::BlockHeader;
 use crate::{api::account::TxNote, tiu};
 
@@ -1396,6 +1397,18 @@ pub async fn get_sync_height(conn: &mut SqliteConnection, account: u32) -> Resul
     Ok(h)
 }
 
+/// Every unspent ZEC note the account owns, joined to its pending-spend reservation.
+/// `?1` is the account.
+const OWNED_UNSPENT_ZEC_NOTES: &str = "FROM notes n
+        LEFT JOIN spends s ON s.id_note = n.id_note
+        LEFT JOIN active_pending_spend_inputs p
+            ON p.account = n.account
+            AND p.nullifier = n.nullifier
+        WHERE n.account = ?1 AND n.id_asset IS NULL AND s.id_note IS NULL";
+
+/// A note counts as available only when confirmed against `?2`, unlocked and unreserved.
+const AVAILABLE_NOTE: &str = "n.height <= ?2 AND NOT n.locked AND p.nullifier IS NULL";
+
 pub async fn confirmed_height(
     connection: &mut SqliteConnection,
     account: u32,
@@ -1442,31 +1455,28 @@ pub async fn calculate_balance_breakdown(
     let confirmed_height = confirmed_height(&mut *connection, account, confirmations).await?;
 
     let mut balance = PoolBalanceBreakdown(vec![Balance::default(); NUM_POOLS]);
-    let mut rows = sqlx::query(
+    let query = format!(
         "SELECT n.pool,
-            SUM(CASE WHEN n.height <= ?2 AND NOT n.locked AND p.nullifier IS NULL THEN n.value ELSE 0 END),
+            SUM(CASE WHEN {AVAILABLE_NOTE} THEN n.value ELSE 0 END),
             SUM(CASE WHEN n.height <= ?2 AND (n.locked OR p.nullifier IS NOT NULL) THEN n.value ELSE 0 END),
             SUM(CASE WHEN n.height > ?2 AND n.scope = 1 THEN n.value ELSE 0 END),
             SUM(CASE WHEN n.height > ?2 AND (n.scope IS NULL OR n.scope <> 1) THEN n.value ELSE 0 END)
-        FROM notes n LEFT JOIN spends s ON s.id_note = n.id_note
-        LEFT JOIN active_pending_spend_inputs p
-            ON p.account = n.account
-            AND p.nullifier = n.nullifier
-        WHERE n.account = ?1 AND n.id_asset IS NULL AND s.id_note IS NULL
-        GROUP BY n.pool",
-    )
-    .bind(account)
-    .bind(confirmed_height)
-    .map(|row: SqliteRow| {
-        (
-            row.get::<u8, _>(0),
-            row.get::<i64, _>(1),
-            row.get::<i64, _>(2),
-            row.get::<i64, _>(3),
-            row.get::<i64, _>(4),
-        )
-    })
-    .fetch(connection);
+        {OWNED_UNSPENT_ZEC_NOTES}
+        GROUP BY n.pool"
+    );
+    let mut rows = sqlx::query(&query)
+        .bind(account)
+        .bind(confirmed_height)
+        .map(|row: SqliteRow| {
+            (
+                row.get::<u8, _>(0),
+                row.get::<i64, _>(1),
+                row.get::<i64, _>(2),
+                row.get::<i64, _>(3),
+                row.get::<i64, _>(4),
+            )
+        })
+        .fetch(connection);
     while let Some((pool, available, locked, change_pending, value_pending)) =
         rows.try_next().await?
     {
@@ -2249,25 +2259,62 @@ pub async fn max_spendable(connection: &mut SqliteConnection, account: u32) -> R
         crate::api::pay::DEFAULT_CONFIRMATIONS,
     )
     .await?;
-    let (amount,): (Option<u64>,) = sqlx::query_as(
-        "SELECT SUM(n.value)
-        FROM notes n
-        LEFT JOIN spends s ON n.id_note = s.id_note
-        LEFT JOIN active_pending_spend_inputs p
-            ON p.account = n.account
-            AND p.nullifier = n.nullifier
-        WHERE s.id_note IS NULL
-            AND n.account = ?1
-            AND n.id_asset IS NULL
-            AND n.height <= ?2
-            AND NOT n.locked
-            AND p.nullifier IS NULL",
-    )
-    .bind(account)
-    .bind(confirmed_height)
-    .fetch_one(connection)
-    .await?;
+    let query = format!("SELECT SUM(n.value) {OWNED_UNSPENT_ZEC_NOTES} AND {AVAILABLE_NOTE}");
+    let (amount,): (Option<u64>,) = sqlx::query_as(&query)
+        .bind(account)
+        .bind(confirmed_height)
+        .fetch_one(connection)
+        .await?;
     Ok(amount.unwrap_or_default())
+}
+
+/// A conservative lower bound on what is spendable from `pools`, fundable for ANY
+/// single recipient pool. Not the exact maximum: a same-pool send can afford more.
+pub async fn max_spendable_from_pools(
+    connection: &mut SqliteConnection,
+    account: u32,
+    pools: PoolMask,
+    confirmations: u32,
+) -> Result<u64> {
+    let confirmed_height = confirmed_height(&mut *connection, account, confirmations).await?;
+    let query = format!(
+        "SELECT n.pool, SUM(n.value), COUNT(*)
+        {OWNED_UNSPENT_ZEC_NOTES} AND {AVAILABLE_NOTE} AND n.value >= ?3
+        GROUP BY n.pool"
+    );
+    let mut rows = sqlx::query(&query)
+        .bind(account)
+        .bind(confirmed_height)
+        .bind(COST_PER_ACTION as i64)
+        .map(|row: SqliteRow| {
+            (
+                row.get::<u8, _>(0),
+                row.get::<i64, _>(1),
+                row.get::<i64, _>(2),
+            )
+        })
+        .fetch(connection);
+
+    let mut available = 0u64;
+    let mut actions = 0u64;
+    while let Some((pool, value, count)) = rows.try_next().await? {
+        if !pools.has_pool(pool) {
+            continue;
+        }
+        available += value as u64;
+        // A shielded bundle is padded to two logical actions (ZIP-317);
+        // transparent inputs are counted one by one.
+        actions += if pool == 0 {
+            count as u64
+        } else {
+            (count as u64).max(2)
+        };
+    }
+
+    // At most two outputs (recipient and change) can land in pools outside the mask,
+    // and each such bundle costs at most two more actions.
+    let fee_bound = (actions + 4).max(2) * COST_PER_ACTION;
+    Ok(available.saturating_sub(fee_bound))
 }
 
 #[cfg(test)]
@@ -2344,7 +2391,7 @@ pub(crate) mod tests {
     pub(crate) const ACCOUNT: u32 = 1;
 
     /// `scope`: 0 external (incoming), 1 internal (change), NULL for transparent notes.
-    async fn insert_note(
+    pub(crate) async fn insert_note(
         connection: &mut SqliteConnection,
         id_note: u32,
         tx: u32,
@@ -2383,7 +2430,7 @@ pub(crate) mod tests {
         .expect("spend");
     }
 
-    async fn set_sync_height(connection: &mut SqliteConnection, height: u32) {
+    pub(crate) async fn set_sync_height(connection: &mut SqliteConnection, height: u32) {
         for pool in 0..NUM_POOLS as u8 {
             set_pool_sync_height(&mut *connection, pool, height).await;
         }
@@ -2449,12 +2496,11 @@ pub(crate) mod tests {
         .await
         .expect("preserved row");
         assert_eq!(row, (vec![1, 2], 100, 2.5, 7, None));
-        let columns: u32 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_table_info('pending_spend_inputs')",
-        )
-        .fetch_one(&mut connection)
-        .await
-        .expect("reservation table");
+        let columns: u32 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('pending_spend_inputs')")
+                .fetch_one(&mut connection)
+                .await
+                .expect("reservation table");
         assert_eq!(columns, 4);
     }
 
@@ -3082,5 +3128,196 @@ pub(crate) mod tests {
 
         create_schema(&mut connection).await.expect("re-open again");
         assert!(use_internal_of(&mut connection, ACCOUNT).await);
+    }
+
+    pub(crate) async fn delete_note(connection: &mut SqliteConnection, id_note: u32) {
+        sqlx::query("DELETE FROM notes WHERE id_note = ?1")
+            .bind(id_note)
+            .execute(connection)
+            .await
+            .expect("delete note");
+    }
+
+    /// The reservation a prepared-but-not-yet-broadcast transaction holds on a note.
+    async fn reserve_note(connection: &mut SqliteConnection, id_note: u32) {
+        sqlx::query(
+            "INSERT INTO pending_spend_inputs(account, nullifier, owner_txid, expiry_height)
+             VALUES (?1, ?2, ?3, 0)",
+        )
+        .bind(ACCOUNT)
+        .bind(id_note.to_le_bytes().to_vec())
+        .bind(vec![0u8; 32])
+        .execute(connection)
+        .await
+        .expect("reservation");
+    }
+
+    async fn lock_note(connection: &mut SqliteConnection, id_note: u32) {
+        sqlx::query("UPDATE notes SET locked = TRUE WHERE id_note = ?1")
+            .bind(id_note)
+            .execute(connection)
+            .await
+            .expect("lock");
+    }
+
+    const T: PoolMask = PoolMask(0b0001);
+    const S: PoolMask = PoolMask(0b0010);
+    const OI: PoolMask = PoolMask(0b1100);
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_mask_excludes_notes_of_other_pools() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 0, 80, 100_000, None).await;
+        insert_note(&mut connection, 2, 0, 1, 80, 900_000, Some(0)).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 100_000 - 25_000);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_transparent_pool_charges_one_action_per_note() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        for id in 1..=3u32 {
+            insert_note(&mut connection, id, 0, 0, 80, 100_000, None).await;
+        }
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 300_000 - 35_000);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_shielded_pool_pads_to_two_actions() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 1, 80, 100_000, Some(0)).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 100_000 - 30_000);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_two_shielded_pools_pad_independently() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 2, 80, 100_000, Some(0)).await;
+        insert_note(&mut connection, 2, 0, 3, 80, 200_000, Some(0)).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, OI, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 300_000 - 40_000);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_dust_notes_add_neither_value_nor_action() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 1, 80, 100_000, Some(0)).await;
+        insert_note(&mut connection, 2, 0, 1, 80, COST_PER_ACTION - 1, Some(0)).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 100_000 - 30_000);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_note_worth_exactly_one_action_is_not_dust() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 1, 80, 100_000, Some(0)).await;
+        insert_note(&mut connection, 2, 0, 1, 80, COST_PER_ACTION, Some(0)).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 105_000 - 30_000);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_fee_bound_above_available_returns_zero() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 0, 80, COST_PER_ACTION, None).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 0);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_empty_account_returns_zero() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 0);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_note_reserved_by_a_pending_spend_is_ignored() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 0, 80, 100_000, None).await;
+        insert_note(&mut connection, 2, 0, 0, 80, 500_000, None).await;
+        reserve_note(&mut connection, 2).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 100_000 - 25_000);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_wallet_of_only_dust_returns_zero() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        for id in 1..=4u32 {
+            insert_note(&mut connection, id, 0, 1, 80, COST_PER_ACTION - 1, Some(0)).await;
+        }
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 0);
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_unconfirmed_locked_and_spent_notes_are_ignored() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, 100).await;
+        insert_note(&mut connection, 1, 0, 0, 80, 100_000, None).await;
+        insert_note(&mut connection, 2, 0, 0, 95, 500_000, None).await;
+        insert_note(&mut connection, 3, 0, 0, 80, 500_000, None).await;
+        insert_note(&mut connection, 4, 0, 0, 80, 500_000, None).await;
+        lock_note(&mut connection, 3).await;
+        spend_note(&mut connection, 4, 0, 99).await;
+
+        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+            .await
+            .expect("max");
+
+        assert_eq!(max, 75_000);
     }
 }

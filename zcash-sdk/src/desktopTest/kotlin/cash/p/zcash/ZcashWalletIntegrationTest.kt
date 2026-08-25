@@ -121,6 +121,31 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun maxSpendable_freshAccount_isZeroForEverySourcePool() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        val sourcePools = listOf(
+            PoolSet.of(Pool.TRANSPARENT),
+            PoolSet.of(Pool.SAPLING),
+            PoolSet.of(Pool.ORCHARD, Pool.IRONWOOD),
+            PoolSet.ALL,
+        )
+
+        sourcePools.forEach {
+            assertEquals(0L, wallet.maxSpendable(id, it, confirmations = 0), "pools ${it.toList()}")
+        }
+    }
+
+    @Test
+    fun maxSpendable_negativeConfirmations_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> {
+            wallet.maxSpendable(id, PoolSet.ALL, confirmations = -1)
+        }
+    }
+
+    @Test
     fun nextTransparentAddress_calledTwice_yieldsTwoUnusedAddresses() = withWallet { wallet ->
         val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
         val own = assertNotNull(wallet.addresses(id).transparent)

@@ -314,6 +314,17 @@ public class ZcashWallet private constructor(
         return withNative { ZcashJni.discoverTransparentAddresses(handle, id, endHeight, gapLimit) }
     }
 
+    /**
+     * A conservative lower bound on what [id] can spend using only [pools], in zatoshi.
+     *
+     * Not the exact maximum: the amount stays fundable whichever pool the recipient's address
+     * belongs to, so a send that stays inside [pools] can afford slightly more.
+     */
+    public suspend fun maxSpendable(id: Int, pools: PoolSet, confirmations: Int): Long {
+        require(confirmations >= 0) { "Confirmations must not be negative: $confirmations" }
+        return withNative { ZcashJni.maxSpendable(handle, id, confirmations, pools.mask) }
+    }
+
     /** Transactions already written to the local database — a sync is what adds new ones. */
     public suspend fun transactions(id: Int): List<Transaction> =
         withNative { parseTransactions(ZcashJni.listTransactions(handle, id)) }

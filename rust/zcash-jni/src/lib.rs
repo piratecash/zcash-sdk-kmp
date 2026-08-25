@@ -34,7 +34,8 @@ use rlz::api::pay::{
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sweep::discover_transparent_addresses;
-use rlz::api::sync::{balance_breakdown, cancel_sync};
+use rlz::api::sync::{balance_breakdown, cancel_sync, max_spendable_from_pools};
+use rlz::pay::pool::ALL_POOLS;
 use rlz::pay::Recipient;
 use rlz::sync::synchronize_impl;
 use serde::Serialize;
@@ -581,6 +582,29 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_balance<'local>(
             let array = env.new_long_array(pools.len())?;
             array.set_region(env, 0, &pools)?;
             Ok(array)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// A conservative lower bound on what is spendable using only the pools in `pool_mask`,
+/// fundable for any single recipient pool. A same-pool send can afford more.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_maxSpendable<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    confirmations: jint,
+    pool_mask: jint,
+) -> jlong {
+    unowned_env
+        .with_env(|_env| -> Result<jlong, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let confirmations = confirmations.max(0) as u32;
+            let pool_mask = (pool_mask.max(0) as u32 & ALL_POOLS as u32) as u8;
+            let max =
+                runtime().block_on(max_spendable_from_pools(confirmations, pool_mask, &coin))?;
+            Ok(max as jlong)
         })
         .resolve::<ThrowNativeError>()
 }

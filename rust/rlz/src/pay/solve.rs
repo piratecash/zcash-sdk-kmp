@@ -1183,4 +1183,146 @@ mod tests {
         assert!(is_better_solution(100, 10, 100, 20));
         assert!(!is_better_solution(101, 5, 100, 20));
     }
+
+    // ---- Pool-restricted maximum ------------------------------------------
+
+    use crate::db::confirmed_height;
+    use crate::db::max_spendable_from_pools;
+    use crate::db::tests::{delete_note, insert_note, memory_db, set_sync_height, ACCOUNT};
+    use crate::pay::fee::COST_PER_ACTION;
+    use crate::pay::plan::{drop_zec_dust, fetch_unspent_notes_by_pool, restrict_to_source_pools};
+    use crate::pay::pool::PoolMask;
+    use crate::pay::InputNote;
+    use sqlx::SqliteConnection;
+
+    /// The three source masks pcash spends from — one per wallet kind.
+    const PCASH_SOURCE_MASKS: [(&str, PoolMask); 3] = [
+        ("transparent", PoolMask(0b0001)),
+        ("sapling", PoolMask(0b0010)),
+        ("orchard+ironwood", PoolMask(0b1100)),
+    ];
+
+    /// Notes in every pool: dust in two of them the maximum must ignore, and one
+    /// note worth exactly a single action, which sits on the dust boundary.
+    const FIXTURE_NOTES: [(u32, u8, u64); 9] = [
+        (1, 0, 60_000),
+        (2, 0, 40_000),
+        (3, 0, COST_PER_ACTION - 1),
+        (4, 1, 100_000),
+        (5, 1, 3_000),
+        (6, 1, COST_PER_ACTION),
+        (7, 2, 70_000),
+        (8, 2, 30_000),
+        (9, 3, 50_000),
+    ];
+
+    async fn account_with_notes_in_every_pool() -> SqliteConnection {
+        let mut connection = memory_db().await;
+        for (id, pool, value) in FIXTURE_NOTES {
+            let scope = if pool == 0 { None } else { Some(0) };
+            insert_note(&mut connection, id, id, pool, 100, value, scope).await;
+        }
+        set_sync_height(&mut connection, 100).await;
+        connection
+    }
+
+    /// The candidate notes production planning keeps for `mask`, through the very
+    /// preprocessing `plan_transaction` applies.
+    async fn planner_candidates(
+        connection: &mut SqliteConnection,
+        mask: PoolMask,
+        max_height: u32,
+    ) -> Vec<Vec<InputNote>> {
+        let mut input_pools = fetch_unspent_notes_by_pool(connection, ACCOUNT)
+            .await
+            .expect("unspent notes");
+        restrict_to_source_pools(&mut input_pools, mask.0, max_height);
+        drop_zec_dust(&mut input_pools);
+        for (pool, notes) in input_pools.iter().enumerate() {
+            assert!(
+                notes.is_empty() || mask.0 & (1 << pool) != 0,
+                "notes from pool {pool} survived preprocessing for source mask {:#06b}",
+                mask.0
+            );
+        }
+        input_pools
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_every_source_mask_is_fundable_for_every_recipient_pool() {
+        let mut connection = account_with_notes_in_every_pool().await;
+        let max_height = confirmed_height(&mut connection, ACCOUNT, 0)
+            .await
+            .expect("confirmed height");
+
+        for (name, mask) in PCASH_SOURCE_MASKS {
+            let max = max_spendable_from_pools(&mut connection, ACCOUNT, mask, 0)
+                .await
+                .expect("maximum");
+            assert!(
+                max > 0,
+                "{name}: the fixture must leave something spendable"
+            );
+
+            let input_pools = planner_candidates(&mut connection, mask, max_height).await;
+            let notes: Vec<Note> = input_pools
+                .iter()
+                .enumerate()
+                .flat_map(|(pool, notes)| {
+                    notes
+                        .iter()
+                        .enumerate()
+                        .map(move |(pool_index, note)| Note {
+                            pool: pool as u8,
+                            amount: note.amount,
+                            pool_index,
+                            asset_index: 0,
+                        })
+                })
+                .collect();
+
+            for recipient_pool in 0..N_POOLS as u8 {
+                let outputs = [Output {
+                    pool: recipient_pool,
+                    amount: max,
+                    asset_index: 0,
+                }];
+                assert!(
+                    select_notes(&notes, &outputs, COST_PER_ACTION, false, false, max).is_some(),
+                    "{name}: {max} zats is not fundable for a recipient in pool {recipient_pool}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn max_spendable_from_pools_counts_only_notes_the_planner_keeps() {
+        for (name, mask) in PCASH_SOURCE_MASKS {
+            let mut connection = account_with_notes_in_every_pool().await;
+            let max_height = confirmed_height(&mut connection, ACCOUNT, 0)
+                .await
+                .expect("confirmed height");
+            let advertised = max_spendable_from_pools(&mut connection, ACCOUNT, mask, 0)
+                .await
+                .expect("maximum");
+
+            let kept: Vec<u32> = planner_candidates(&mut connection, mask, max_height)
+                .await
+                .iter()
+                .flatten()
+                .map(|note| note.id)
+                .collect();
+            for (id, ..) in FIXTURE_NOTES {
+                if !kept.contains(&id) {
+                    delete_note(&mut connection, id).await;
+                }
+            }
+
+            let without_discarded = max_spendable_from_pools(&mut connection, ACCOUNT, mask, 0)
+                .await
+                .expect("maximum");
+
+            assert_eq!(without_discarded, advertised, "{name}");
+        }
+    }
 }
