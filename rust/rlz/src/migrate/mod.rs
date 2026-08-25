@@ -87,12 +87,81 @@ pub fn is_sd(value: u64) -> bool {
     value > SD_FEE_PAD && is_iw_sd(value - SD_FEE_PAD)
 }
 
-/// Whether the next migration action can split the currently known non-SD
-/// notes. This mirrors the input cap and ordering used by `step`.
-pub(crate) fn has_split_transaction(mut values: Vec<u64>) -> bool {
-    values.sort_unstable_by(|a, b| b.cmp(a));
-    values.truncate(MAX_SPLIT_INPUTS);
-    values.into_iter().sum::<u64>() >= MIN_SD
+/// A split action's planned outputs. `total` is carried so `step` can log it without
+/// re-summing the inputs the planner already summed.
+struct SplitPlan {
+    digits: Vec<(u64, u8)>,
+    remainder: u64,
+    total: u64,
+}
+
+/// The SD outputs a split action would actually produce for `values`, or `None` when it would
+/// produce none. `step` and `has_split_transaction` must never disagree, so both go through here.
+fn plan_split(values: &[u64]) -> Option<SplitPlan> {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    sorted.truncate(MAX_SPLIT_INPUTS);
+    let num_inputs = sorted.len() as u64;
+    let total: u64 = sorted.iter().sum();
+    if total < MIN_SD {
+        return None;
+    }
+
+    let (mut digits, mut remainder) = decompose_to_sd(total);
+
+    // If the natural remainder is too small to cover the transaction fee, carve out MIN_SD
+    // from the decomposable pool as a fee buffer.
+    if remainder < MIN_SD / 2 {
+        let (d, r) = decompose_to_sd(total.saturating_sub(MIN_SD));
+        digits = d;
+        remainder = r + MIN_SD;
+    }
+    let mut num_outputs: u64 = digits.iter().map(|&(_, c)| c as u64).sum();
+
+    // Mirror what plan_transaction will construct, including the change output, so the fee
+    // estimate is exact.
+    let mut fm = FeeManager {
+        migration: true,
+        ..FeeManager::default()
+    };
+    for _ in 0..num_inputs {
+        fm.add_input(2);
+    }
+    for _ in 0..num_outputs {
+        fm.add_output(2);
+    }
+    fm.add_output(2); // change output
+
+    // Trim the lowest denomination until the fee fits, or until nothing is left to send.
+    loop {
+        if fm.fee() <= remainder || num_outputs == 0 {
+            break;
+        }
+        if let Some((denom, count)) = digits.last_mut() {
+            *count -= 1;
+            remainder += *denom;
+            num_outputs -= 1;
+            fm.remove_output(2);
+            if *count == 0 {
+                digits.pop();
+            }
+        }
+    }
+
+    if num_outputs > 0 {
+        Some(SplitPlan {
+            digits,
+            remainder,
+            total,
+        })
+    } else {
+        None
+    }
+}
+
+/// Whether the next migration action can split the currently known non-SD notes.
+pub(crate) fn has_split_transaction(values: Vec<u64>) -> bool {
+    plan_split(&values).is_some()
 }
 
 /// Result of a migration step.
@@ -282,117 +351,64 @@ pub async fn step(
         sorted
     };
 
-    // Calculate total from capped non-SD notes.
-    let total: u64 = capped_non_sd.iter().map(|n| n.value).sum();
-
-    if total >= MIN_SD {
-        // Decompose into standard denomination counts (digits) and remainder.
-        let (mut digits, mut remainder) = decompose_to_sd(total);
-        info!("SD split: {:?}", digits,);
-
-        // If the natural remainder is too small to cover the transaction fee,
-        // carve out MIN_SD from the decomposable pool as a fee buffer.
-        if remainder < MIN_SD / 2 {
-            let (d, r) = decompose_to_sd(total.saturating_sub(MIN_SD));
-            digits = d;
-            remainder = r + MIN_SD;
-            info!("SD split (reserved {} for fees): {:?}", MIN_SD, digits,);
-        }
-
-        let mut num_outputs: u64 = digits.iter().map(|&(_, c)| c as u64).sum();
-        let num_inputs = capped_non_sd.len() as u64;
-
-        // Build a FeeManager matching what plan_transaction will construct,
-        // including the change output, so our fee estimate is exact.
-        let mut fm = FeeManager {
-            migration: true,
-            ..FeeManager::default()
-        };
-        for _ in 0..num_inputs {
-            fm.add_input(2);
-        }
-        for _ in 0..num_outputs {
-            fm.add_output(2);
-        }
-        fm.add_output(2); // change output
-
-        // Fee loop: if fee exceeds remainder, trim the lowest-denomination
-        // output to make room, then retry. Exit when fee fits or no outputs
-        // remain (fall through to migration).
-        loop {
-            let fee = fm.fee();
-
-            if fee <= remainder || num_outputs == 0 {
-                break;
-            }
-
-            // Remove one unit from the lowest denomination (last, since
-            // denominations are sorted largest-first).
-            if let Some((denom, count)) = digits.last_mut() {
-                *count -= 1;
-                remainder += *denom;
-                num_outputs -= 1;
-                fm.remove_output(2);
-                if *count == 0 {
-                    digits.pop();
-                }
+    let split_values: Vec<u64> = capped_non_sd.iter().map(|n| n.value).collect();
+    if let Some(SplitPlan {
+        digits,
+        remainder,
+        total,
+    }) = plan_split(&split_values)
+    {
+        // Build recipients from (denom, count) pairs.
+        let mut recipients: Vec<Recipient> = Vec::new();
+        for &(denom, count) in &digits {
+            for _ in 0..count {
+                recipients.push(Recipient {
+                    address: own_address.clone(),
+                    amount: denom,
+                    pools: Some(PoolMask::from_pool(2).0), // Orchard only
+                    ..Recipient::default()
+                });
             }
         }
 
-        if num_outputs > 0 {
-            // Build recipients from (denom, count) pairs.
-            let mut recipients: Vec<Recipient> = Vec::new();
-            for &(denom, count) in &digits {
-                for _ in 0..count {
-                    recipients.push(Recipient {
-                        address: own_address.clone(),
-                        amount: denom,
-                        pools: Some(PoolMask::from_pool(2).0), // Orchard only
-                        ..Recipient::default()
-                    });
-                }
-            }
+        info!(
+            "Migration split: {} non-SD notes (total {}) → {} SD outputs (remainder {})",
+            capped_non_sd.len(),
+            total,
+            recipients.len(),
+            remainder,
+        );
 
-            info!(
-                "Migration split: {} non-SD notes (total {}) → {} SD outputs (remainder {})",
-                capped_non_sd.len(),
-                total,
-                recipients.len(),
-                remainder,
-            );
+        let preselected: Vec<u32> = capped_non_sd.iter().map(|n| n.id).collect();
 
-            let preselected: Vec<u32> = capped_non_sd.iter().map(|n| n.id).collect();
+        let pczt = plan_transaction(
+            network,
+            &mut *connection,
+            client,
+            account,
+            PoolMask::from_pool(2).0, // Orchard source
+            &recipients,
+            false,
+            Some(crate::api::pay::DEFAULT_CONFIRMATIONS),
+            false,
+            None,
+            None,
+            true, // migration
+            Some(&preselected),
+            None, // anchor_height
+        )
+        .await?;
 
-            let pczt = plan_transaction(
-                network,
-                &mut *connection,
-                client,
-                account,
-                PoolMask::from_pool(2).0, // Orchard source
-                &recipients,
-                false,
-                Some(crate::api::pay::DEFAULT_CONFIRMATIONS),
-                false,
-                None,
-                None,
-                true, // migration
-                Some(&preselected),
-                None, // anchor_height
-            )
-            .await?;
+        let fee = crate::pay::TxPlan::from_package(network, &pczt)
+            .map(|p| p.fee)
+            .unwrap_or(0);
+        let pczt = sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
+        let tx_bytes = extract_transaction(&pczt).await?;
+        let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
 
-            let fee = crate::pay::TxPlan::from_package(network, &pczt)
-                .map(|p| p.fee)
-                .unwrap_or(0);
-            let pczt =
-                sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
-            let tx_bytes = extract_transaction(&pczt).await?;
-            let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
-
-            return Ok(MigrationEvent::SplitComplete { fee, txid });
-        }
-        // If no outputs after trimming, fall through to migration phase.
-    } // end if total >= MIN_SD
+        return Ok(MigrationEvent::SplitComplete { fee, txid });
+    }
+    // No outputs remained after the fee trim: fall through to the migration phase.
 
     if !sd_notes.is_empty() {
         /*
@@ -553,9 +569,26 @@ mod tests {
 
     #[test]
     fn test_has_split_transaction_applies_input_cap() {
-        assert!(has_split_transaction(vec![MIN_SD]));
         assert!(!has_split_transaction(vec![MIN_SD - 1]));
         assert!(!has_split_transaction(vec![MIN_SD / 100; 100]));
+    }
+
+    #[test]
+    fn test_plan_split_reserve_can_consume_every_output() {
+        assert!(plan_split(&[MIN_SD]).is_none());
+        assert_eq!(decompose_to_sd(MIN_SD), (vec![(120_000, 4)], 20_000));
+        assert_eq!(decompose_to_sd(0), (vec![], 0));
+    }
+
+    #[test]
+    fn test_has_split_transaction_matches_reserve_boundary() {
+        assert!(!has_split_transaction(vec![619_999]));
+        assert!(has_split_transaction(vec![620_000]));
+    }
+
+    #[test]
+    fn test_has_split_transaction_still_true_above_band() {
+        assert!(has_split_transaction(vec![1_000_000]));
     }
 
     #[test]
