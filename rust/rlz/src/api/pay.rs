@@ -5,6 +5,7 @@ use crate::{
     api::coin::Coin,
     pay::{
         plan::{plan_transaction, NO_SPENDING_KEY},
+        reserve::OwnInputs,
         Recipient, TxPlan,
     },
 };
@@ -156,7 +157,9 @@ pub fn unpack_transaction(bytes: &[u8]) -> Result<PcztPackage> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn broadcast_transaction(height: u32, tx_bytes: &[u8], c: &Coin) -> Result<String> {
-    Ok(broadcast(height, tx_bytes, c).await?.message)
+    Ok(broadcast(height, tx_bytes, c, OwnInputs::Required)
+        .await?
+        .message)
 }
 
 /// Broadcast keeping the node's verdict: a host that must tell "already in the chain"
@@ -165,6 +168,7 @@ pub async fn broadcast(
     height: u32,
     tx_bytes: &[u8],
     c: &Coin,
+    own_inputs: OwnInputs,
 ) -> Result<crate::net::BroadcastOutcome> {
     let mut connection = c.get_connection().await?;
     let mut client = c.client().await?;
@@ -174,14 +178,15 @@ pub async fn broadcast(
         c.account,
         height,
         tx_bytes,
+        own_inputs,
     )
     .await
 }
 
 #[cfg_attr(feature = "flutter", frb)]
-pub async fn reserve_for_broadcast(tx_bytes: &[u8], c: &Coin) -> Result<()> {
+pub async fn reserve_for_broadcast(tx_bytes: &[u8], c: &Coin, own_inputs: OwnInputs) -> Result<()> {
     let mut connection = c.get_connection().await?;
-    crate::pay::reserve::reserve_transaction(&mut connection, c.account, tx_bytes).await
+    crate::pay::reserve::reserve_transaction(&mut connection, c.account, tx_bytes, own_inputs).await
 }
 
 #[cfg_attr(feature = "flutter", frb(sync))]
@@ -191,7 +196,9 @@ pub fn to_plan(package: &PcztPackage, c: &Coin) -> Result<TxPlan> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn send(height: u32, data: &[u8], c: &Coin) -> Result<String> {
-    Ok(broadcast(height, data, c).await?.message)
+    Ok(broadcast(height, data, c, OwnInputs::Required)
+        .await?
+        .message)
 }
 
 #[cfg_attr(feature = "flutter", frb)]

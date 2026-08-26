@@ -36,6 +36,7 @@ use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sweep::discover_transparent_addresses;
 use rlz::api::sync::{balance_breakdown, cancel_sync, max_spendable_from_pools};
 use rlz::pay::pool::ALL_POOLS;
+use rlz::pay::reserve::OwnInputs;
 use rlz::pay::Recipient;
 use rlz::sync::synchronize_impl;
 use serde::Serialize;
@@ -783,7 +784,9 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_prepare<'local>(
         .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
             let recipients = parse_recipients(&recipients_json.try_to_string(env)?)?;
             if confirmations < 0 {
-                return Err(BridgeError("Confirmations must not be negative".to_string()));
+                return Err(BridgeError(
+                    "Confirmations must not be negative".to_string(),
+                ));
             }
             let coin = wallet_account(handle, account)?;
             let options = PaymentOptions {
@@ -893,6 +896,15 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_transactionId<'local>(
         .resolve::<ThrowNativeError>()
 }
 
+/// `false` means the caller cannot vouch for the transaction's origin, so unowned inputs are fine.
+fn own_inputs(require_own_inputs: jboolean) -> OwnInputs {
+    if require_own_inputs {
+        OwnInputs::Required
+    } else {
+        OwnInputs::Optional
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cash_p_zcash_ZcashJni_broadcastTransaction<'local>(
     mut unowned_env: EnvUnowned<'local>,
@@ -901,12 +913,18 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_broadcastTransaction<'local>(
     account: jint,
     height: jint,
     tx: JByteArray<'local>,
+    require_own_inputs: jboolean,
 ) -> JString<'local> {
     unowned_env
         .with_env(|env| -> Result<JString<'local>, BridgeError> {
             let raw = env.convert_byte_array(&tx)?;
             let coin = wallet_account(handle, account)?;
-            let outcome = runtime().block_on(broadcast(height as u32, &raw, &coin))?;
+            let outcome = runtime().block_on(broadcast(
+                height as u32,
+                &raw,
+                &coin,
+                own_inputs(require_own_inputs),
+            ))?;
             to_json(env, &BroadcastResultDto::from(outcome))
         })
         .resolve::<ThrowNativeError>()
@@ -919,12 +937,17 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_reserveForBroadcast<'local>(
     handle: jlong,
     account: jint,
     tx: JByteArray<'local>,
+    require_own_inputs: jboolean,
 ) {
     unowned_env
         .with_env(|env| -> Result<(), BridgeError> {
             let raw = env.convert_byte_array(&tx)?;
             let coin = wallet_account(handle, account)?;
-            runtime().block_on(reserve_for_broadcast(&raw, &coin))?;
+            runtime().block_on(reserve_for_broadcast(
+                &raw,
+                &coin,
+                own_inputs(require_own_inputs),
+            ))?;
             Ok(())
         })
         .resolve::<ThrowNativeError>()
@@ -981,6 +1004,12 @@ mod tests {
             3,
             2,
         )
+    }
+
+    #[test]
+    fn own_inputs_maps_the_bridge_flag() {
+        assert_eq!(OwnInputs::Required, own_inputs(true));
+        assert_eq!(OwnInputs::Optional, own_inputs(false));
     }
 
     #[test]

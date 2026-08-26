@@ -375,17 +375,29 @@ public class ZcashWallet private constructor(
     public suspend fun extract(transaction: PreparedTransaction): ByteArray =
         withNative { ZcashJni.extractTransaction(transaction.bytes) }
 
-    /** Reserves wallet-owned inputs before a caller starts network I/O. Idempotent for the same tx. */
-    public suspend fun reserveForBroadcast(account: Int, rawTransaction: ByteArray): Unit =
-        withNative { ZcashJni.reserveForBroadcast(handle, account, rawTransaction) }
+    /**
+     * Reserves wallet-owned inputs before a caller starts network I/O. Idempotent for the same tx.
+     * Pass `requireOwnInputs = false` for a transaction of unknown origin: it then reserves nothing
+     * instead of being refused for spending no input of this account.
+     */
+    public suspend fun reserveForBroadcast(
+        account: Int,
+        rawTransaction: ByteArray,
+        requireOwnInputs: Boolean = true,
+    ): Unit = withNative {
+        ZcashJni.reserveForBroadcast(handle, account, rawTransaction, requireOwnInputs)
+    }
 
     /** Hands [rawTransaction] to the node and reports its verdict without interpreting it. */
     public suspend fun broadcast(
         account: Int,
         rawTransaction: ByteArray,
         height: Int,
+        requireOwnInputs: Boolean = true,
     ): BroadcastResult = withNative {
-        parseBroadcastResult(ZcashJni.broadcastTransaction(handle, account, height, rawTransaction))
+        parseBroadcastResult(
+            ZcashJni.broadcastTransaction(handle, account, height, rawTransaction, requireOwnInputs),
+        )
     }
 
     /**

@@ -89,13 +89,22 @@ pub(crate) fn transaction_inputs(tx: &TransactionData<Authorized>) -> Vec<Vec<u8
     inputs
 }
 
+/// Whether the caller guarantees the transaction spends this account's notes.
+/// `Optional` is for a transaction of unknown origin — a foreign one reserves nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnInputs {
+    Required,
+    Optional,
+}
+
 pub async fn reserve_transaction(
     connection: &mut SqliteConnection,
     account: u32,
     raw: &[u8],
+    own_inputs: OwnInputs,
 ) -> Result<()> {
     let parsed = parse_transaction(raw)?;
-    reserve_parsed_transaction(connection, account, &parsed).await
+    reserve_parsed_transaction(connection, account, &parsed, own_inputs).await
 }
 
 pub async fn reserve_and_send(
@@ -104,8 +113,9 @@ pub async fn reserve_and_send(
     account: u32,
     height: u32,
     raw: &[u8],
+    own_inputs: OwnInputs,
 ) -> Result<BroadcastOutcome> {
-    reserve_transaction(connection, account, raw).await?;
+    reserve_transaction(connection, account, raw, own_inputs).await?;
     crate::pay::send(client, height, raw).await
 }
 
@@ -113,6 +123,7 @@ async fn reserve_parsed_transaction(
     connection: &mut SqliteConnection,
     account: u32,
     parsed: &ParsedTransaction,
+    own_inputs: OwnInputs,
 ) -> Result<()> {
     let scanned_height = get_sync_height(&mut *connection, account).await?;
     if let Some(height) = scanned_height {
@@ -125,6 +136,17 @@ async fn reserve_parsed_transaction(
 
     let mut transaction = connection.begin().await?;
     let owned_inputs = validate_owned_inputs(&mut transaction, account, parsed).await?;
+    if owned_inputs.is_empty() {
+        ensure!(
+            own_inputs == OwnInputs::Optional,
+            "Transaction does not spend an input owned by account {account}"
+        );
+        ensure!(
+            !reserved_by_another_transaction(&mut transaction, account, parsed).await?,
+            "Transaction input is reserved by another pending transaction"
+        );
+        return Ok(());
+    }
     claim_inputs(&mut transaction, account, parsed, owned_inputs).await?;
     record_pending_tx(&mut transaction, account, parsed, scanned_height).await?;
     transaction.commit().await?;
@@ -177,11 +199,30 @@ async fn validate_owned_inputs(
             }
         }
     }
-    ensure!(
-        !owned_inputs.is_empty(),
-        "Transaction does not spend an input owned by account {account}"
-    );
     Ok(owned_inputs)
+}
+
+/// A rewind can delete a note row while its reservation survives, leaving an input that
+/// [`validate_owned_inputs`] no longer recognizes yet another pending transaction still holds.
+async fn reserved_by_another_transaction(
+    transaction: &mut SqliteTransaction<'_, Sqlite>,
+    account: u32,
+    parsed: &ParsedTransaction,
+) -> Result<bool> {
+    for input in &parsed.inputs {
+        let owner: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT owner_txid FROM active_pending_spend_inputs
+            WHERE account = ?1 AND nullifier = ?2",
+        )
+        .bind(account)
+        .bind(input)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if owner.is_some_and(|txid| txid != parsed.txid) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn claim_inputs(
@@ -295,6 +336,30 @@ mod tests {
         .expect("note");
     }
 
+    /// What a rewind does to a reserved input: the note row goes, the reservation stays.
+    async fn rewind_notes(connection: &mut SqliteConnection, account: u32) {
+        sqlx::query("DELETE FROM notes WHERE account = ?1")
+            .bind(account)
+            .execute(connection)
+            .await
+            .expect("rewind");
+    }
+
+    async fn pending_row_counts(connection: &mut SqliteConnection, account: u32) -> (i64, i64) {
+        let inputs =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_spend_inputs WHERE account = ?1")
+                .bind(account)
+                .fetch_one(&mut *connection)
+                .await
+                .expect("pending_spend_inputs");
+        let txs = sqlx::query_scalar("SELECT COUNT(*) FROM pending_txs WHERE account = ?1")
+            .bind(account)
+            .fetch_one(&mut *connection)
+            .await
+            .expect("pending_txs");
+        (inputs, txs)
+    }
+
     fn parsed(txid: u8, expiry_height: u32) -> ParsedTransaction {
         ParsedTransaction {
             txid: vec![txid; 32],
@@ -364,7 +429,7 @@ mod tests {
         let (raw, input) = transparent_transaction();
         let parsed = parse_transaction(&raw).expect("parse");
         insert_note(&mut connection, ACCOUNT, &input, 50, 80).await;
-        reserve_transaction(&mut connection, ACCOUNT, &raw)
+        reserve_transaction(&mut connection, ACCOUNT, &raw, OwnInputs::Required)
             .await
             .expect("reserve");
         let mut display_txid = parsed.txid.clone();
@@ -496,9 +561,14 @@ mod tests {
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
 
-        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 120))
-            .await
-            .expect("reserve");
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect("reserve");
         let balance = calculate_balance_breakdown(&mut connection, ACCOUNT, 10)
             .await
             .expect("balance");
@@ -541,15 +611,30 @@ mod tests {
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
 
-        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 120))
-            .await
-            .expect("first reserve");
-        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 120))
-            .await
-            .expect("idempotent reserve");
-        let error = reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(2, 120))
-            .await
-            .expect_err("foreign owner must fail");
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect("first reserve");
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect("idempotent reserve");
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(2, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect_err("foreign owner must fail");
 
         assert!(error.to_string().contains("reserved by another"));
         let owner: Vec<u8> = sqlx::query_scalar(
@@ -568,9 +653,14 @@ mod tests {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
-        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 101))
-            .await
-            .expect("reserve");
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 101),
+            OwnInputs::Required,
+        )
+        .await
+        .expect("reserve");
 
         let before_expiry = calculate_balance_breakdown(&mut connection, ACCOUNT, 0)
             .await
@@ -594,9 +684,14 @@ mod tests {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
-        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 120))
-            .await
-            .expect("reserve");
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect("reserve");
         sqlx::query("DELETE FROM notes WHERE account = ?1")
             .bind(ACCOUNT)
             .execute(&mut connection)
@@ -617,7 +712,7 @@ mod tests {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
-        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 0))
+        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 0), OwnInputs::Required)
             .await
             .expect("reserve");
         set_sync_height(&mut connection, ACCOUNT, u32::MAX).await;
@@ -635,10 +730,261 @@ mod tests {
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         insert_note(&mut connection, ACCOUNT + 1, &NOTE, 50, 80).await;
 
-        let error = reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 120))
-            .await
-            .expect_err("wrong account must fail");
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect_err("wrong account must fail");
 
         assert!(error.to_string().contains("another account"));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_no_owned_inputs_reserves_nothing_and_succeeds() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        let (raw, _) = transparent_transaction();
+
+        reserve_transaction(&mut connection, ACCOUNT, &raw, OwnInputs::Optional)
+            .await
+            .expect("a transaction of unknown origin reserves nothing and succeeds");
+
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_no_owned_inputs_required_is_rejected() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        let (raw, _) = transparent_transaction();
+
+        let error = reserve_transaction(&mut connection, ACCOUNT, &raw, OwnInputs::Required)
+            .await
+            .expect_err("an own send must still spend an owned input");
+
+        assert!(error.to_string().contains("does not spend an input owned"));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_optional_other_account_input_is_rejected() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT + 1, &NOTE, 50, 80).await;
+
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect_err("another account's input must still fail");
+
+        assert!(error.to_string().contains("another account"));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_optional_locked_input_is_rejected() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+        sqlx::query("UPDATE notes SET locked = TRUE WHERE account = ?1")
+            .bind(ACCOUNT)
+            .execute(&mut connection)
+            .await
+            .expect("lock note");
+
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect_err("a locked input must still fail");
+
+        assert!(error.to_string().contains("manually locked"));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_optional_input_spent_by_another_transaction_is_rejected() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+        sqlx::query(
+            "INSERT INTO transactions(id_tx, txid, height, account) VALUES (1, ?1, 90, ?2)",
+        )
+        .bind(vec![9u8; 32])
+        .bind(ACCOUNT)
+        .execute(&mut connection)
+        .await
+        .expect("mined transaction");
+        sqlx::query(
+            "INSERT INTO spends(id_note, height, account, pool, tx, value)
+            SELECT id_note, 90, account, pool, 1, value FROM notes WHERE account = ?1",
+        )
+        .bind(ACCOUNT)
+        .execute(&mut connection)
+        .await
+        .expect("spend");
+
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect_err("an input spent by another transaction must still fail");
+
+        assert!(error.to_string().contains("already spent"));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_optional_input_reserved_by_another_pending_tx_is_rejected() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("first reserve");
+
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(2, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect_err("an input held by another pending transaction must still fail");
+
+        assert!(error.to_string().contains("reserved by another"));
+    }
+
+    /// `trim_sync_data` drops the note row on a rewind but keeps its reservation, so the
+    /// still-reserved input now looks unknown.
+    #[tokio::test]
+    async fn reserve_transaction_optional_orphaned_reservation_is_rejected() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("first reserve");
+        rewind_notes(&mut connection, ACCOUNT).await;
+
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(2, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect_err("a reservation must outlive the note row a rewind removed");
+
+        assert!(error.to_string().contains("reserved by another"));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_optional_orphaned_own_reservation_is_idempotent() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("first reserve");
+        rewind_notes(&mut connection, ACCOUNT).await;
+
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("rebroadcasting the very same transaction must stay idempotent");
+    }
+
+    /// The reservation expires at 90 while the account syncs past it, so it no longer holds
+    /// the input and must not refuse an unrelated transaction.
+    #[tokio::test]
+    async fn reserve_transaction_optional_expired_orphaned_reservation_does_not_block() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 50).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 40).await;
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 90),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("first reserve");
+        rewind_notes(&mut connection, ACCOUNT).await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(2, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("an expired reservation must not block a transaction of unknown origin");
+    }
+
+    /// No note is inserted: the expiry check sits above the ownership branch, so even a
+    /// transaction whose inputs are unknown is refused once it has expired.
+    #[tokio::test]
+    async fn reserve_transaction_optional_expired_transaction_is_rejected() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+
+        let error = reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 100),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect_err("an expired transaction must still fail");
+
+        assert!(error.to_string().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_optional_owned_input_reserves_and_records() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("an owned input reserves as usual");
+
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (1, 1));
     }
 }

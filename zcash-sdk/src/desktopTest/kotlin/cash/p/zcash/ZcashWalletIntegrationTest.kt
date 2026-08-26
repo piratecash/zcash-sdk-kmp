@@ -25,6 +25,17 @@ private const val TEST_PHRASE =
 
 private const val BIRTH_HEIGHT = 2_000_000
 
+/**
+ * A v6 transaction spending outpoint `01..01:0` — an input no wallet in this suite owns.
+ * Byte-for-byte the vector the Rust `transparent_transaction()` test helper builds.
+ */
+private const val FOREIGN_TRANSACTION_HEX =
+    "0600008098b684d85b16a537000000000000000001010101010101010101010101010101" +
+        "01010101010101010101010101010101010000000000ffffffff0000000000"
+
+private fun String.hexToBytes(): ByteArray =
+    chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
 /** BIP-39 passphrase, the "25th word": a different wallet from the very same phrase. */
 private const val TEST_PASSPHRASE = "pepper"
 
@@ -517,6 +528,76 @@ class ZcashWalletIntegrationTest {
         assertFailsWith<ZcashException> { openWallet(dbFile.absolutePathString()) }
     }
 
+    @Test
+    fun reserveForBroadcast_permissiveForeignTransaction_reservesNothingAndSucceeds() =
+        withWallet { wallet ->
+            val account =
+                wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            wallet.reserveForBroadcast(
+                account,
+                FOREIGN_TRANSACTION_HEX.hexToBytes(),
+                requireOwnInputs = false,
+            )
+        }
+
+    @Test
+    fun reserveForBroadcast_foreignTransactionByDefault_isRejected() = withWallet { wallet ->
+        val account =
+            wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        val failure = assertFailsWith<ZcashException> {
+            wallet.reserveForBroadcast(account, FOREIGN_TRANSACTION_HEX.hexToBytes())
+        }
+
+        assertTrue(
+            failure.message.orEmpty().contains("does not spend an input owned"),
+            failure.message,
+        )
+    }
+
+    /**
+     * Zebra assembles its client without dialing, so the reservation is the first thing that
+     * runs and the only thing that can stop the call before the network does.
+     */
+    @Test
+    fun broadcast_permissiveForeignTransaction_reachesTheNetwork() =
+        withWallet(ServerType.ZEBRA) { wallet ->
+            val account =
+                wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            val failure = assertFailsWith<ZcashException> {
+                wallet.broadcast(
+                    account,
+                    FOREIGN_TRANSACTION_HEX.hexToBytes(),
+                    BIRTH_HEIGHT,
+                    requireOwnInputs = false,
+                )
+            }
+
+            // The wording of a refused connection is not portable; the refusal it must NOT be is.
+            assertFalse(
+                failure.message.orEmpty().contains("does not spend an input owned"),
+                failure.message,
+            )
+        }
+
+    @Test
+    fun broadcast_foreignTransactionByDefault_neverReachesTheNetwork() =
+        withWallet(ServerType.ZEBRA) { wallet ->
+            val account =
+                wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            val failure = assertFailsWith<ZcashException> {
+                wallet.broadcast(account, FOREIGN_TRANSACTION_HEX.hexToBytes(), BIRTH_HEIGHT)
+            }
+
+            assertTrue(
+                failure.message.orEmpty().contains("does not spend an input owned"),
+                failure.message,
+            )
+        }
+
     private suspend fun writeEncryptedDatabase(directory: Path): Path {
         val dbFile = directory.resolve("wallet.db")
         val wallet = openWallet(dbFile.absolutePathString(), TEST_DB_KEY)
@@ -531,8 +612,12 @@ class ZcashWalletIntegrationTest {
     private fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
-    private fun withWallet(block: suspend (ZcashWallet) -> Unit) = withTempDir { directory ->
-        val wallet = openWallet(directory.resolve("wallet.db").absolutePathString())
+    private fun withWallet(
+        serverType: ServerType = ServerType.LIGHTWALLETD,
+        block: suspend (ZcashWallet) -> Unit,
+    ) = withTempDir { directory ->
+        val wallet =
+            openWallet(directory.resolve("wallet.db").absolutePathString(), serverType = serverType)
         try {
             block(wallet)
         } finally {
@@ -550,10 +635,14 @@ class ZcashWalletIntegrationTest {
         }
     }
 
-    private suspend fun openWallet(dbPath: String, dbKey: ByteArray? = null) = ZcashWallet.open(
+    private suspend fun openWallet(
+        dbPath: String,
+        dbKey: ByteArray? = null,
+        serverType: ServerType = ServerType.LIGHTWALLETD,
+    ) = ZcashWallet.open(
         dbPath = dbPath,
         network = ZcashNetwork.MAIN,
-        server = ServerConfig(url = "http://127.0.0.1:1"),
+        server = ServerConfig(url = "http://127.0.0.1:1", type = serverType),
         dbKey = dbKey,
     )
 }

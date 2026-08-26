@@ -133,9 +133,20 @@ internal object ZcashJni {
     /** Stateless: needs no open wallet. */
     external fun transactionId(tx: ByteArray): String
 
-    external fun reserveForBroadcast(handle: Long, account: Int, tx: ByteArray)
+    external fun reserveForBroadcast(
+        handle: Long,
+        account: Int,
+        tx: ByteArray,
+        requireOwnInputs: Boolean,
+    )
 
-    external fun broadcastTransaction(handle: Long, account: Int, height: Int, tx: ByteArray): String
+    external fun broadcastTransaction(
+        handle: Long,
+        account: Int,
+        height: Int,
+        tx: ByteArray,
+        requireOwnInputs: Boolean,
+    ): String
 
     external fun migrationStatus(handle: Long, account: Int): String
 

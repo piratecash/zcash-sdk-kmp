@@ -11,7 +11,7 @@ use crate::{
         fee::{FeeManager, COST_PER_ACTION},
         plan::{extract_transaction, plan_transaction, sign_transaction},
         pool::PoolMask,
-        reserve::reserve_and_send,
+        reserve::{reserve_and_send, OwnInputs},
         Recipient,
     },
     Client,
@@ -282,7 +282,9 @@ async fn broadcast(
     height: u32,
     tx: &[u8],
 ) -> Result<String> {
-    broadcast_txid(reserve_and_send(connection, client, account, height, tx).await?)
+    broadcast_txid(
+        reserve_and_send(connection, client, account, height, tx, OwnInputs::Required).await?,
+    )
 }
 
 /// Run one migration step. Fully idempotent — re-scans notes on every call.
