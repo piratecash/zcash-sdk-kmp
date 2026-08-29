@@ -1,4 +1,9 @@
-use std::{collections::HashMap, convert::Infallible, str::FromStr as _, sync::LazyLock};
+use std::{
+    collections::{BTreeMap, HashMap},
+    convert::Infallible,
+    str::FromStr as _,
+    sync::LazyLock,
+};
 
 use anyhow::{anyhow, Result};
 
@@ -6,7 +11,7 @@ use bip32::PrivateKey;
 use itertools::Itertools;
 use orchard::{
     circuit::ProvingKey,
-    keys::{FullViewingKey, Scope, SpendAuthorizingKey},
+    keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
     note::AssetBase,
     value::NoteValue,
     Address,
@@ -28,15 +33,13 @@ use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
 use tracing::{event, info, span, Level};
 use zcash_address::{unified::Receiver, ConversionError, TryFromAddress, ZcashAddress};
 use zcash_keys::{
-    address::UnifiedAddress,
-    encoding::AddressCodec as _,
-    keys::{Era, UnifiedSpendingKey},
+    address::UnifiedAddress, encoding::AddressCodec as _, keys::sapling::ExtendedSpendingKey,
 };
 use zcash_note_encryption::Domain;
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding},
-    TxVersion,
     fees::zip317::FeeRule,
+    TxVersion,
 };
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
@@ -49,6 +52,7 @@ use zcash_transparent::{
     address::TransparentAddress,
     builder::{SpendInfo, TransparentInputInfo},
     bundle::{OutPoint, TxOut},
+    keys::AccountPrivKey,
     pczt::Bip32Derivation,
 };
 use zip321::{Payment, TransactionRequest};
@@ -59,13 +63,14 @@ use crate::{
         get_orchard_note, get_orchard_vk, get_sapling_note, get_sapling_vk,
     },
     api::{coin::Network, issuance::IssuanceInfo, pay::PcztPackage},
-    db::{get_account_dindex, get_account_fingerprint, get_account_hw, select_account_transparent},
+    db::{get_account_can_sign, get_account_dindex, get_account_hw, select_account_transparent},
     keys::{sapling_pgk_for_scope, sapling_ssk_for_scope, SaplingFullViewingKey},
     pay::{
         error::Error,
         fee::COST_PER_ACTION,
         pool::{PoolMask, NUM_POOLS},
         prepare::to_zec,
+        signing_key::SigningKey,
         solve, DecomposedRecipient, InputNote, ReceiverOption, Recipient, RecipientState,
     },
     warp::hasher::{empty_roots, OrchardHasher, SaplingHasher},
@@ -235,11 +240,10 @@ fn decompose_address(
     anyhow::bail!("Unrecognized address pool");
 }
 
-/// The account derives from a seed the app owns: no spending key is kept in the DB.
+/// Whether the app can produce a spending key for this account: from a phrase it owns, or
+/// from an imported xprv/ESK. A viewing-key-only or Ledger account cannot.
 async fn account_can_sign(connection: &mut SqliteConnection, account: u32) -> Result<bool> {
-    Ok(get_account_fingerprint(connection, account)
-        .await?
-        .is_some())
+    get_account_can_sign(connection, account).await
 }
 
 /// The candidate set a plan may spend from: only the pools in `src_pools`, and within
@@ -1172,29 +1176,97 @@ fn encode_memo(recipient: &Recipient) -> Result<Option<MemoBytes>> {
 /// zkool-only paths keep no spending key: this fork cannot sign there.
 pub const NO_SPENDING_KEY: &[u8] = &[];
 
+/// The transparent private key a [`SigningKey`] carries, or `None` if it has no transparent
+/// component.
+fn signing_key_transparent(key: &SigningKey) -> Option<&AccountPrivKey> {
+    match key {
+        SigningKey::Unified(usk) => Some(usk.transparent()),
+        SigningKey::Transparent(tsk) => Some(tsk),
+        SigningKey::Sapling(_) => None,
+    }
+}
+
+/// The Sapling extended spending key a [`SigningKey`] carries, or `None` if it has no
+/// Sapling component.
+fn signing_key_sapling(key: &SigningKey) -> Option<&ExtendedSpendingKey> {
+    match key {
+        SigningKey::Unified(usk) => Some(usk.sapling()),
+        SigningKey::Sapling(esk) => Some(esk),
+        SigningKey::Transparent(_) => None,
+    }
+}
+
+/// The Orchard spending key a [`SigningKey`] carries, or `None` if it has no Orchard
+/// component. Only [`SigningKey::Unified`] does: there is no Orchard-only variant.
+fn signing_key_orchard(key: &SigningKey) -> Option<&SpendingKey> {
+    match key {
+        SigningKey::Unified(usk) => Some(usk.orchard()),
+        SigningKey::Transparent(_) | SigningKey::Sapling(_) => None,
+    }
+}
+
+fn signing_key_transparent_pubkey(key: &SigningKey) -> Option<Vec<u8>> {
+    signing_key_transparent(key).map(|tsk| tsk.to_account_pubkey().serialize().to_vec())
+}
+
+fn signing_key_sapling_dfvk(key: &SigningKey) -> Option<Vec<u8>> {
+    signing_key_sapling(key).map(|esk| esk.to_diversifiable_full_viewing_key().to_bytes().to_vec())
+}
+
+fn signing_key_orchard_fvk(key: &SigningKey) -> Option<Vec<u8>> {
+    signing_key_orchard(key).map(|osk| FullViewingKey::from(osk).to_bytes().to_vec())
+}
+
+/// [`signing_key_transparent`], failing with a message naming the missing pool.
+fn require_transparent_key(key: &SigningKey) -> Result<&AccountPrivKey> {
+    signing_key_transparent(key).ok_or_else(|| anyhow!("spending key has no transparent component"))
+}
+
+/// [`signing_key_sapling`], failing with a message naming the missing pool.
+fn require_sapling_key(key: &SigningKey) -> Result<&ExtendedSpendingKey> {
+    signing_key_sapling(key).ok_or_else(|| anyhow!("spending key has no sapling component"))
+}
+
+/// The Orchard spend-authorizing key a [`SigningKey`] can produce, failing with a message
+/// naming `pool` (`orchard` or `ironwood`: both spend with the same key).
+fn require_orchard_key(key: &SigningKey, pool: &str) -> Result<SpendAuthorizingKey> {
+    signing_key_orchard(key)
+        .map(SpendAuthorizingKey::from)
+        .ok_or_else(|| anyhow!("spending key has no {pool} component"))
+}
+
+/// Reads a 4-byte little-endian `u32` from a PCZT `proprietary` map, naming `pool` and
+/// `index` in the error if the field is missing or has the wrong length.
+fn read_proprietary_u32(
+    proprietary: &BTreeMap<String, Vec<u8>>,
+    field: &str,
+    pool: &str,
+    index: usize,
+) -> Result<u32> {
+    let bytes = proprietary
+        .get(field)
+        .ok_or_else(|| anyhow!("{pool} spend {index} is missing the '{field}' field"))?;
+    let bytes: [u8; 4] = bytes.clone().try_into().map_err(|bytes: Vec<u8>| {
+        anyhow!(
+            "{pool} spend {index} has a {}-byte '{field}' field, expected 4",
+            bytes.len()
+        )
+    })?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 /// The only guard against signing with a key that is not the account's own.
-/// A provisioned pool whose `xvk` is NULL or differs is a mismatch, never a skipped pool.
+/// A provisioned pool whose `xvk` is NULL, differs, or has no matching component in `key`
+/// is a mismatch, never a skipped pool.
 async fn verify_spending_key(
     connection: &mut SqliteConnection,
     account: u32,
-    usk: &UnifiedSpendingKey,
+    key: &SigningKey,
 ) -> Result<()> {
     let derived = [
-        (
-            "transparent_accounts",
-            usk.transparent().to_account_pubkey().serialize().to_vec(),
-        ),
-        (
-            "sapling_accounts",
-            usk.sapling()
-                .to_diversifiable_full_viewing_key()
-                .to_bytes()
-                .to_vec(),
-        ),
-        (
-            "orchard_accounts",
-            FullViewingKey::from(usk.orchard()).to_bytes().to_vec(),
-        ),
+        ("transparent_accounts", signing_key_transparent_pubkey(key)),
+        ("sapling_accounts", signing_key_sapling_dfvk(key)),
+        ("orchard_accounts", signing_key_orchard_fvk(key)),
     ];
 
     let mut compared = 0;
@@ -1207,7 +1279,7 @@ async fn verify_spending_key(
         match stored {
             // the pool is not provisioned for this account
             None => continue,
-            Some(Some(xvk)) if xvk == expected => compared += 1,
+            Some(Some(ref xvk)) if expected.as_deref() == Some(xvk.as_slice()) => compared += 1,
             _ => return Err(anyhow!("spending key does not match account {account}")),
         }
     }
@@ -1233,9 +1305,9 @@ pub async fn sign_transaction(
     let span = span!(Level::INFO, "transaction");
 
     // Cheap check before the expensive PCZT parse.
-    let usk = UnifiedSpendingKey::from_bytes(Era::Orchard, usk_bytes)
+    let key = SigningKey::decode(usk_bytes)
         .map_err(|error| anyhow!("failed to parse spending key: {error}"))?;
-    verify_spending_key(connection, account, &usk).await?;
+    verify_spending_key(connection, account, &key).await?;
 
     let PcztPackage {
         pczt,
@@ -1252,43 +1324,71 @@ pub async fn sign_transaction(
         .map_err(|error| anyhow!("failed to parse PCZT for signing: {error:?}"))?;
     let orchard_pk = get_orchard_pk(*pczt.global().consensus_branch_id())?;
 
-    let osak = SpendAuthorizingKey::from(usk.orchard());
+    // Bounds-check every sapling spend and read its scope before `pczt` is consumed by the
+    // updater: `update_sapling_with`'s closure can only return the pczt crate's own error
+    // type, not `anyhow::Error`, so out-of-range indices must be rejected here.
+    let sapling_bundle_len = pczt.sapling().spends().len();
+    let mut sapling_scopes = Vec::with_capacity(sapling_indices.len());
+    for bundle_index in sapling_indices {
+        let spend = pczt.sapling().spends().get(*bundle_index).ok_or_else(|| {
+            anyhow!(
+                "sapling spend index {bundle_index} is out of bounds for a bundle with {sapling_bundle_len} spends"
+            )
+        })?;
+        let scope = read_proprietary_u32(spend.proprietary(), "scope", "sapling", *bundle_index)?;
+        sapling_scopes.push((*bundle_index, scope));
+    }
 
     let updater = Updater::new(pczt);
-    let pgk = usk.sapling().expsk.proof_generation_key();
-    let internal_pgk = usk.sapling().derive_internal().expsk.proof_generation_key();
-    let updater = updater
-        .update_sapling_with(|mut u| {
-            for bundle_index in sapling_indices.iter() {
-                let spend = &u.bundle().spends()[*bundle_index];
-                let scope =
-                    u32::from_le_bytes(spend.proprietary()["scope"].clone().try_into().unwrap());
-                u.update_spend_with(*bundle_index, |mut u| {
-                    u.set_proof_generation_key(sapling_pgk_for_scope(
-                        scope,
-                        pgk.clone(),
-                        internal_pgk.clone(),
-                    ))
-                    .unwrap();
-
-                    Ok(())
-                })
-                .unwrap();
-            }
-            Ok(())
-        })
-        .unwrap();
+    let updater = if sapling_scopes.is_empty() {
+        updater
+    } else {
+        let esk = require_sapling_key(&key)?;
+        let pgk = esk.expsk.proof_generation_key();
+        let internal_pgk = esk.derive_internal().expsk.proof_generation_key();
+        updater
+            .update_sapling_with(|mut u| {
+                for (bundle_index, scope) in &sapling_scopes {
+                    u.update_spend_with(*bundle_index, |mut u| {
+                        u.set_proof_generation_key(sapling_pgk_for_scope(
+                            *scope,
+                            pgk.clone(),
+                            internal_pgk.clone(),
+                        ))
+                    })?;
+                }
+                Ok(())
+            })
+            .map_err(|error| anyhow!("failed to update sapling bundle: {error:?}"))?
+    };
     let pczt = updater.finish();
     info!("Updated");
 
     let mut signer = Signer::new(pczt.clone()).unwrap();
     let tbundle = pczt.transparent();
-    let sbundle = pczt.sapling();
+
+    let transparent_inputs_len = tbundle.inputs().len();
+    if n_spends[0] > transparent_inputs_len {
+        return Err(anyhow!(
+            "transparent spend count {} exceeds the bundle's {transparent_inputs_len} inputs",
+            n_spends[0]
+        ));
+    }
     for index in 0..n_spends[0] {
         info!("signing transparent {index}");
         let inp = &tbundle.inputs()[index];
-        let scope = u32::from_le_bytes(inp.proprietary()["scope"].clone().try_into().unwrap());
-        let dindex = u32::from_le_bytes(inp.proprietary()["dindex"].clone().try_into().unwrap());
+        let scope = read_proprietary_u32(inp.proprietary(), "scope", "transparent", index)?;
+        if scope > 1 {
+            return Err(anyhow!(
+                "transparent input {index} has an unknown scope {scope}, expected 0 or 1"
+            ));
+        }
+        let dindex = read_proprietary_u32(inp.proprietary(), "dindex", "transparent", index)?;
+        if dindex >= (1 << 31) {
+            return Err(anyhow!(
+                "transparent input {index} has a hardened dindex {dindex}, cannot derive a non-hardened key"
+            ));
+        }
         // Check if "uncompressed" flag exists in proprietary, default to false (compressed)
         let uncompressed_flag = if let Some(val) = inp.proprietary().get("uncompressed") {
             if !val.is_empty() {
@@ -1310,8 +1410,15 @@ pub async fn sign_transaction(
         );
 
         // Get the signing key from the derivation path
-        let sk = derive_transparent_sk(usk.transparent(), scope, dindex)?;
-        let sk = SecretKey::from_bytes(&sk.try_into().unwrap()).map_err(|_| Error::NoSigningKey)?;
+        let tsk = require_transparent_key(&key)?;
+        let sk = derive_transparent_sk(tsk, scope, dindex)?;
+        let sk: [u8; 32] = sk.try_into().map_err(|sk: Vec<u8>| {
+            anyhow!(
+                "transparent input {index} derived a {}-byte key, expected 32",
+                sk.len()
+            )
+        })?;
+        let sk = SecretKey::from_bytes(&sk).map_err(|_| Error::NoSigningKey)?;
 
         // Derive pubkey from secret key to check
         let secp = secp256k1::Secp256k1::new();
@@ -1332,33 +1439,45 @@ pub async fn sign_transaction(
         );
 
         // Get the sighash and sign manually
-        let sighash = signer.transparent_sighash(index).unwrap();
+        let sighash = signer.transparent_sighash(index).map_err(|e| {
+            anyhow!("failed to compute sighash for transparent input {index}: {e:?}")
+        })?;
         let msg = secp256k1::Message::from_digest(sighash);
         let sig = secp.sign_ecdsa(&msg, &sk);
 
         // Append the signature - the pubkey will be retrieved from hash160_preimages
         info!("Appending signature for input {}", index);
-        match signer.append_transparent_signature(index, sig) {
-            Ok(_) => info!("Successfully appended signature"),
-            Err(e) => info!("Failed to append signature: {:?}", e),
-        }
+        signer
+            .append_transparent_signature(index, sig)
+            .map_err(|e| {
+                anyhow!("failed to append signature for transparent input {index}: {e:?}")
+            })?;
     }
-    for (index, bundle_index) in sapling_indices.iter().enumerate() {
+    for (index, (bundle_index, scope)) in sapling_scopes.iter().enumerate() {
         info!("signing sapling {index}");
-        let spend = &sbundle.spends()[*bundle_index];
-        let scope = u32::from_le_bytes(spend.proprietary()["scope"].clone().try_into().unwrap());
-        let ssk = sapling_ssk_for_scope(scope, usk.sapling());
-        signer.sign_sapling(*bundle_index, &ssk.expsk.ask).unwrap();
+        let esk = require_sapling_key(&key)?;
+        let ssk = sapling_ssk_for_scope(*scope, esk);
+        signer
+            .sign_sapling(*bundle_index, &ssk.expsk.ask)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to sign sapling spend {bundle_index} (selected spend {index}): {e:?}"
+                )
+            })?;
     }
     for (index, bundle_index) in orchard_indices.iter().enumerate() {
         info!("signing orchard {index}");
+        let osak = require_orchard_key(&key, "orchard")?;
         signer.sign_orchard(*bundle_index, &osak).map_err(|e| {
             anyhow!("failed to sign Orchard action {bundle_index} (selected spend {index}): {e:?}")
         })?;
     }
     for (index, bundle_index) in ironwood_indices.iter().enumerate() {
         info!("signing ironwood {index}");
-        signer.sign_ironwood(*bundle_index, &osak).unwrap();
+        let osak = require_orchard_key(&key, "ironwood")?;
+        signer.sign_ironwood(*bundle_index, &osak).map_err(|e| {
+            anyhow!("failed to sign Ironwood action {bundle_index} (selected spend {index}): {e:?}")
+        })?;
     }
     let pczt = signer.finish();
 
@@ -1410,11 +1529,10 @@ pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
         info!("Extracting Tx");
     });
 
-    let pczt = Pczt::parse(&package.pczt)
-        .map_err(|error| anyhow!("failed to parse PCZT: {error:?}"))?;
+    let pczt =
+        Pczt::parse(&package.pczt).map_err(|error| anyhow!("failed to parse PCZT: {error:?}"))?;
 
-    let needs_sapling =
-        !pczt.sapling().spends().is_empty() || !pczt.sapling().outputs().is_empty();
+    let needs_sapling = !pczt.sapling().spends().is_empty() || !pczt.sapling().outputs().is_empty();
     let keys = if needs_sapling {
         Some(get_sapling_prover().await?.verifying_keys())
     } else {
@@ -1609,7 +1727,8 @@ pub async fn get_sapling_prover() -> Result<&'static LocalTxProver> {
             }
             #[cfg(not(feature = "bundled-sapling-params"))]
             {
-                let (spend_path, output_path) = crate::api::sapling::ensure_sapling_params().await?;
+                let (spend_path, output_path) =
+                    crate::api::sapling::ensure_sapling_params().await?;
                 Ok(LocalTxProver::new(&spend_path, &output_path))
             }
         })
@@ -1651,20 +1770,278 @@ pub(crate) fn get_orchard_pk(consensus_branch_id: u32) -> Result<&'static Provin
 #[cfg(test)]
 mod tests {
     use super::{
-        account_can_sign, sign_transaction, verify_spending_key, PcztPackage, NO_SPENDING_KEY,
+        account_can_sign, require_orchard_key, require_sapling_key, require_transparent_key,
+        sign_transaction, verify_spending_key, PcztPackage, NO_SPENDING_KEY,
     };
-    use super::{orchard_proving_key_kind, BranchId, OrchardProvingKeyKind};
-    use crate::account::derive_spending_key;
+    use super::{orchard_proving_key_kind, BranchId, Creator, OrchardProvingKeyKind};
+    use super::{
+        AssetBase, BlockHeight, BuildConfig, Builder, BundlePadding, FeeRule, IoFinalizer,
+        OutPoint, SpendInfo, TransparentAddress, TransparentInputInfo, TxOut, Updater, Zatoshis,
+    };
     use crate::account::tests::{restore, test_usk, watch_only_keys, TEST_PHRASE};
+    use crate::account::{derive_spending_key, derive_transparent_sk};
     use crate::api::coin::Network;
     use crate::db::tests::memory_db;
-    use zcash_keys::keys::{Era, UnifiedSpendingKey};
+    use crate::keys::SaplingFullViewingKey as _;
+    use crate::pay::signing_key::{self, SigningKey};
+    use bip32::{ExtendedPrivateKey, Prefix};
+    use incrementalmerkletree::{Hashable, Level, Position};
+    use ripemd::Ripemd160;
+    use sapling_crypto::{
+        value::NoteValue, Anchor, MerklePath, Node, Note, Rseed, NOTE_COMMITMENT_TREE_DEPTH,
+    };
+    use secp256k1::{PublicKey, SecretKey};
+    use sha2::{Digest as _, Sha256};
+    use std::convert::Infallible;
+    use std::str::FromStr as _;
+    use zcash_keys::encoding::encode_extended_spending_key;
+    use zcash_keys::keys::{sapling::ExtendedSpendingKey, Era, UnifiedSpendingKey};
+    use zcash_protocol::consensus::NetworkConstants as _;
+    use zcash_transparent::{keys::AccountPrivKey, pczt::Bip32Derivation};
 
     /// A second seed, built from entropy rather than a literal so it cannot rot.
     fn other_phrase() -> String {
         bip39::Mnemonic::from_entropy(&[1u8; 32])
             .expect("entropy")
             .to_string()
+    }
+
+    /// The encoded transparent-only envelope for `phrase`'s account 0 (as `sign_transaction`
+    /// receives it: raw bytes, not a decoded [`SigningKey`]).
+    fn transparent_key_bytes_of(phrase: &str) -> Vec<u8> {
+        let seed = bip39::Mnemonic::from_str(phrase)
+            .expect("phrase")
+            .to_seed("");
+        let xprv = ExtendedPrivateKey::<SecretKey>::new(seed)
+            .expect("xprv")
+            .to_string(Prefix::XPRV)
+            .to_string();
+        signing_key::encode_transparent(&xprv).expect("encode")
+    }
+
+    /// The account's transparent-only component, as a genuinely partial [`SigningKey`]
+    /// (not a [`SigningKey::Unified`] wrapping every pool).
+    fn transparent_key_of(phrase: &str) -> SigningKey {
+        SigningKey::decode(&transparent_key_bytes_of(phrase)).expect("decode")
+    }
+
+    /// The encoded sapling-only envelope for `phrase`'s account `aindex`.
+    fn sapling_key_bytes_of(phrase: &str, aindex: u32) -> Vec<u8> {
+        let usk = usk_of(phrase, aindex);
+        let esk = encode_extended_spending_key(
+            Network::Main.hrp_sapling_extended_spending_key(),
+            usk.sapling(),
+        );
+        signing_key::encode_sapling(&esk, &Network::Main).expect("encode")
+    }
+
+    /// The account's sapling-only component, as a genuinely partial [`SigningKey`].
+    fn sapling_key_of(phrase: &str, aindex: u32) -> SigningKey {
+        SigningKey::decode(&sapling_key_bytes_of(phrase, aindex)).expect("decode")
+    }
+
+    /// A structurally valid, empty PCZT (no spends, outputs, or actions in any pool) for
+    /// `BranchId::Nu5`, built entirely offline via the `Creator` role.
+    fn empty_pczt_bytes() -> Vec<u8> {
+        Creator::new(u32::from(BranchId::Nu5), 100, 133, None, None)
+            .expect("creator")
+            .build()
+            .expect("build")
+            .serialize()
+            .expect("serialize")
+    }
+
+    /// The account-level transparent key `sign_transaction` sees for `TEST_PHRASE`'s
+    /// account when it is `restore`d from a raw `tprv`: `new_account` stores this exact
+    /// `AccountPrivKey`'s pubkey as `transparent_accounts.xvk`, matching `watch_only_keys`'s
+    /// own "tprv" fixture in `account.rs`.
+    fn transparent_only_tprv() -> String {
+        let seed = bip39::Mnemonic::from_str(TEST_PHRASE)
+            .expect("phrase")
+            .to_seed("");
+        ExtendedPrivateKey::<SecretKey>::new(seed)
+            .expect("xprv")
+            .to_string(Prefix::XPRV)
+            .to_string()
+    }
+
+    /// The bytes a well-formed `u32` proprietary field carries.
+    fn le_bytes(value: u32) -> Option<Vec<u8>> {
+        Some(value.to_le_bytes().to_vec())
+    }
+
+    /// A structurally valid PCZT with a single transparent input at `(scope, dindex)`,
+    /// spendable by `tsk`, and no other pool activity. The input's value equals ZIP-317's
+    /// grace-action fee, so the transaction balances with zero outputs.
+    ///
+    /// `scope_field` and `dindex_field` are the raw bytes written to those proprietary fields
+    /// (`None` omits the field), kept separate from the `scope`/`dindex` the key is derived at
+    /// so tests can plant values - wrong-valued or wrong-length - that derivation never
+    /// produces. `set_hash160_preimage` controls that field.
+    fn transparent_pczt_bytes_custom(
+        tsk: &AccountPrivKey,
+        scope: u32,
+        dindex: u32,
+        scope_field: Option<Vec<u8>>,
+        dindex_field: Option<Vec<u8>>,
+        set_hash160_preimage: bool,
+    ) -> Vec<u8> {
+        let sk_bytes = derive_transparent_sk(tsk, scope, dindex).expect("derive sk");
+        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+
+        let build_config = BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: None,
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        };
+        let mut builder = Builder::new(
+            &Network::Main,
+            BlockHeight::from_u32(1_700_000),
+            build_config,
+        );
+
+        let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
+        let addr = TransparentAddress::PublicKeyHash(pkh);
+        // 20,000 in, 10,000 out, 10,000 ZIP-317 grace-action fee: balances to zero.
+        let coin = TxOut::new(Zatoshis::const_from_u64(20_000), addr.script().into());
+        let utxo = OutPoint::new([7u8; 32], 0);
+        builder.add_transparent_input(
+            TransparentInputInfo::from_parts(utxo, coin, SpendInfo::P2pkh { pubkey })
+                .expect("input"),
+        );
+        builder
+            .add_transparent_output(&addr, Zatoshis::const_from_u64(10_000))
+            .expect("output");
+
+        let r = builder
+            .build_for_pczt(
+                rand_core::OsRng,
+                &FeeRule::standard(),
+                |_asset: &AssetBase| false,
+            )
+            .expect("build_for_pczt");
+        let pczt = Creator::build_from_parts(r.pczt_parts).expect("creator");
+
+        let pczt = Updater::new(pczt)
+            .update_transparent_with(|mut u| {
+                u.update_input_with(0, |mut u| {
+                    let path = Bip32Derivation::parse([0u8; 32], vec![scope, dindex])
+                        .expect("derivation path");
+                    u.set_bip32_derivation(pubkey.serialize(), path);
+                    if let Some(bytes) = scope_field.clone() {
+                        u.set_proprietary("scope".to_string(), bytes);
+                    }
+                    if let Some(bytes) = dindex_field.clone() {
+                        u.set_proprietary("dindex".to_string(), bytes);
+                    }
+                    u.set_proprietary("address".to_string(), b"t1fixture".to_vec());
+                    u.set_proprietary("uncompressed".to_string(), vec![0u8]);
+                    if set_hash160_preimage {
+                        u.set_hash160_preimage(pubkey.serialize().to_vec());
+                    }
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .expect("update transparent")
+            .finish();
+
+        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        pczt.serialize().expect("serialize")
+    }
+
+    fn transparent_pczt_bytes(tsk: &AccountPrivKey, scope: u32, dindex: u32) -> Vec<u8> {
+        transparent_pczt_bytes_custom(tsk, scope, dindex, le_bytes(scope), le_bytes(dindex), true)
+    }
+
+    /// A sapling spending key built directly from raw seed bytes, unrelated to any
+    /// mnemonic-derived account: a genuinely "imported" ESK.
+    fn sapling_only_esk() -> ExtendedSpendingKey {
+        ExtendedSpendingKey::master(b"phase2b sapling fixture seed 32")
+    }
+
+    /// A structurally valid PCZT with a single sapling spend from `esk`'s default address
+    /// and a single transparent output, balanced against the ZIP-317 fee. Neither the
+    /// spend's note nor its Merkle path is chain-validated - they only need to be
+    /// internally consistent, since the PCZT never leaves this offline fixture.
+    ///
+    /// `scope` builds the note against `esk`'s real (external/internal) key; `scope_field` is
+    /// the raw bytes recorded in the spend's "scope" proprietary field (`None` omits it).
+    /// Callers wanting a consistent fixture pass `le_bytes(scope)`; anything else simulates
+    /// untrusted scope bookkeeping.
+    fn sapling_pczt_bytes_custom(
+        esk: &ExtendedSpendingKey,
+        scope: u32,
+        scope_field: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let dfvk = esk.to_diversifiable_full_viewing_key();
+        let fvk = dfvk.to_fvk(scope);
+        let (_, recipient) = esk.default_address();
+        // A lone sapling spend is padded to 2 outputs (1 real transparent + 1 dummy sapling),
+        // so ZIP-317 charges 3 logical actions: 15,000 fee against a 10,000 transparent output.
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(25_000),
+            Rseed::AfterZip212([7u8; 32]),
+        );
+
+        let path_elems: Vec<Node> = (0..NOTE_COMMITMENT_TREE_DEPTH)
+            .map(|level| Node::empty_root(Level::from(level)))
+            .collect();
+        let merkle_path =
+            MerklePath::from_parts(path_elems, Position::from(0u64)).expect("merkle path");
+        let anchor = Anchor::from(merkle_path.root(Node::from_cmu(&note.cmu())));
+
+        let build_config = BuildConfig::Standard {
+            sapling_anchor: Some(anchor),
+            orchard_anchor: None,
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        };
+        let mut builder = Builder::new(
+            &Network::Main,
+            BlockHeight::from_u32(1_700_000),
+            build_config,
+        );
+        builder
+            .add_sapling_spend::<Infallible>(fvk, note, merkle_path)
+            .expect("spend");
+        // 25,000 in via the sapling spend, 10,000 out, 15,000 fee (see the note above).
+        builder
+            .add_transparent_output(
+                &TransparentAddress::PublicKeyHash([9u8; 20]),
+                Zatoshis::const_from_u64(10_000),
+            )
+            .expect("output");
+
+        let r = builder
+            .build_for_pczt(
+                rand_core::OsRng,
+                &FeeRule::standard(),
+                |_asset: &AssetBase| false,
+            )
+            .expect("build_for_pczt");
+        let pczt = Creator::build_from_parts(r.pczt_parts).expect("creator");
+
+        let pczt = Updater::new(pczt)
+            .update_sapling_with(|mut u| {
+                u.update_spend_with(0, |mut u| {
+                    if let Some(bytes) = scope_field.clone() {
+                        u.set_proprietary("scope".to_string(), bytes);
+                    }
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .expect("update sapling")
+            .finish();
+
+        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        pczt.serialize().expect("serialize")
     }
 
     fn empty_package() -> PcztPackage {
@@ -1694,9 +2071,13 @@ mod tests {
             .await
             .expect("restore");
 
-        verify_spending_key(&mut connection, account, &usk_of(TEST_PHRASE, 0))
-            .await
-            .expect("the account's own key must be accepted");
+        verify_spending_key(
+            &mut connection,
+            account,
+            &SigningKey::Unified(usk_of(TEST_PHRASE, 0)),
+        )
+        .await
+        .expect("the account's own key must be accepted");
     }
 
     #[tokio::test]
@@ -1711,7 +2092,7 @@ mod tests {
             ("other seed", usk_of(&other_phrase(), 0)),
         ] {
             assert!(
-                verify_spending_key(&mut connection, account, &usk)
+                verify_spending_key(&mut connection, account, &SigningKey::Unified(usk))
                     .await
                     .is_err(),
                 "{label}"
@@ -1731,7 +2112,7 @@ mod tests {
             .expect("restore");
 
         assert!(
-            verify_spending_key(&mut connection, account, &test_usk(0))
+            verify_spending_key(&mut connection, account, &SigningKey::Unified(test_usk(0)))
                 .await
                 .is_err(),
             "a NULL xvk in a provisioned pool must never count as a skipped pool"
@@ -1746,9 +2127,13 @@ mod tests {
             .expect("restore");
 
         assert!(
-            verify_spending_key(&mut connection, account + 1, &test_usk(0))
-                .await
-                .is_err(),
+            verify_spending_key(
+                &mut connection,
+                account + 1,
+                &SigningKey::Unified(test_usk(0))
+            )
+            .await
+            .is_err(),
             "an unknown account must never be signable"
         );
     }
@@ -1760,13 +2145,71 @@ mod tests {
             .await
             .expect("restore");
 
-        verify_spending_key(&mut connection, account, &usk_of(TEST_PHRASE, 0))
-            .await
-            .expect("a sapling-only account must accept its own key");
+        // Old contract (pre-G2): compared only the intersection of pools present in
+        // both the key and the account, so a full USK against this sapling-only
+        // account only ever compared the sapling pool and always passed - the same
+        // outcome as today, because a full key trivially covers a partial account.
+        verify_spending_key(
+            &mut connection,
+            account,
+            &SigningKey::Unified(usk_of(TEST_PHRASE, 0)),
+        )
+        .await
+        .expect("a sapling-only account must accept its own USK");
+
+        // New contract (G2): the key must cover every pool the account has a viewing
+        // key for. A transparent-only key cannot be expressed as a partial
+        // `UnifiedSpendingKey` at all, so this rejection only became reachable once
+        // `verify_spending_key` started taking `&SigningKey`.
+        match verify_spending_key(&mut connection, account, &transparent_key_of(TEST_PHRASE)).await
+        {
+            Err(_) => {}
+            Ok(()) => panic!(
+                "a transparent-only key must not satisfy an account whose only \
+                 viewing key is sapling"
+            ),
+        }
     }
 
     #[tokio::test]
-    async fn account_can_sign_is_true_only_for_a_mnemonic_account() {
+    async fn verify_spending_key_rejects_a_partial_key_for_an_account_with_three_viewing_keys() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        // The sapling component itself matches the account's own sapling viewing key -
+        // only the missing transparent/orchard coverage must cause the rejection.
+        match verify_spending_key(&mut connection, account, &sapling_key_of(TEST_PHRASE, 0)).await {
+            Err(_) => {}
+            Ok(()) => panic!(
+                "a sapling-only key must not satisfy an account with transparent and \
+                 orchard viewing keys too"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_spending_key_rejects_an_esk_from_a_different_seed_for_a_sapling_only_account() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, Some(2))
+            .await
+            .expect("restore");
+
+        match verify_spending_key(
+            &mut connection,
+            account,
+            &sapling_key_of(&other_phrase(), 0),
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(()) => panic!("an ESK from a different seed must not be accepted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn account_can_sign_is_true_for_mnemonic_and_imported_spending_keys() {
         let mut connection = memory_db().await;
         let account = restore(&mut connection, TEST_PHRASE, 0, None)
             .await
@@ -1775,7 +2218,30 @@ mod tests {
             .await
             .expect("can sign"));
 
-        for key in watch_only_keys() {
+        for label in ["tprv", "sapling xsk"] {
+            let key = watch_only_keys()
+                .into_iter()
+                .find(|k| k.label == label)
+                .unwrap_or_else(|| panic!("no fixture for {label}"));
+            let mut connection = memory_db().await;
+            let account = restore(&mut connection, &key.key, 0, None)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", key.label));
+
+            assert!(
+                account_can_sign(&mut connection, account)
+                    .await
+                    .expect("can sign"),
+                "{}",
+                key.label
+            );
+        }
+
+        for label in ["ufvk", "wif"] {
+            let key = watch_only_keys()
+                .into_iter()
+                .find(|k| k.label == label)
+                .unwrap_or_else(|| panic!("no fixture for {label}"));
             let mut connection = memory_db().await;
             let account = restore(&mut connection, &key.key, 0, None)
                 .await
@@ -1812,6 +2278,519 @@ mod tests {
         };
 
         assert!(error.contains("spending key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_a_pczt_needing_orchard_with_a_sapling_only_key() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, Some(2))
+            .await
+            .expect("restore");
+
+        let mut package = empty_package();
+        package.pczt = empty_pczt_bytes();
+        package.orchard_indices = vec![0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &sapling_key_bytes_of(TEST_PHRASE, 0),
+        )
+        .await;
+        let error = match signed {
+            Ok(_) => panic!("a sapling-only key must not sign an orchard spend"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("no orchard component"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_signs_a_transparent_only_account_with_an_imported_xprv() {
+        let mut connection = memory_db().await;
+        let tprv = transparent_only_tprv();
+        let account = restore(&mut connection, &tprv, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_transparent(&tprv).expect("encode");
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+
+        let mut package = empty_package();
+        package.pczt = transparent_pczt_bytes(&tsk, 0, 0);
+        package.n_spends = [1, 0, 0, 0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        match signed {
+            Ok(_) => {}
+            Err(error) => panic!("a transparent-only key must sign its own input: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_a_transparent_input_missing_its_scope_field() {
+        let mut connection = memory_db().await;
+        let tprv = transparent_only_tprv();
+        let account = restore(&mut connection, &tprv, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_transparent(&tprv).expect("encode");
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+
+        let mut package = empty_package();
+        package.pczt = transparent_pczt_bytes_custom(&tsk, 0, 0, None, le_bytes(0), true);
+        package.n_spends = [1, 0, 0, 0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        let error = match signed {
+            Ok(_) => panic!("a transparent input missing its scope field must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("scope"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_a_transparent_scope_outside_external_and_internal() {
+        let mut connection = memory_db().await;
+        let tprv = transparent_only_tprv();
+        let account = restore(&mut connection, &tprv, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_transparent(&tprv).expect("encode");
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+
+        let mut package = empty_package();
+        // The key is derived at scope 0; only the PCZT's advertised scope is out of range,
+        // which is exactly what an attacker-supplied PCZT can do.
+        package.pczt = transparent_pczt_bytes_custom(&tsk, 0, 0, le_bytes(2), le_bytes(0), true);
+        package.n_spends = [1, 0, 0, 0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        let error = match signed {
+            Ok(_) => panic!("a transparent input with an unknown scope must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("scope"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_transparent_metadata_that_is_absent_or_the_wrong_length() {
+        let tprv = transparent_only_tprv();
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+
+        for (label, scope_field, dindex_field) in [
+            ("absent dindex", le_bytes(0), None),
+            ("two-byte scope", Some(vec![0, 0]), le_bytes(0)),
+            ("one-byte dindex", le_bytes(0), Some(vec![0])),
+        ] {
+            let mut connection = memory_db().await;
+            let account = restore(&mut connection, &tprv, 0, None)
+                .await
+                .expect("restore");
+            let usk_bytes = signing_key::encode_transparent(&tprv).expect("encode");
+
+            let mut package = empty_package();
+            package.pczt =
+                transparent_pczt_bytes_custom(&tsk, 0, 0, scope_field, dindex_field, true);
+            package.n_spends = [1, 0, 0, 0];
+
+            let signed = sign_transaction(
+                &mut connection,
+                account,
+                &Network::Main,
+                &package,
+                &usk_bytes,
+            )
+            .await;
+
+            let error = match signed {
+                Ok(_) => panic!("{label} must be rejected"),
+                Err(error) => error.to_string(),
+            };
+            let field = if label.contains("scope") {
+                "scope"
+            } else {
+                "dindex"
+            };
+            assert!(
+                error.contains(field),
+                "{label}: expected an error naming '{field}', got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_propagates_a_failed_transparent_signature_append_as_an_error() {
+        let mut connection = memory_db().await;
+        let tprv = transparent_only_tprv();
+        let account = restore(&mut connection, &tprv, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_transparent(&tprv).expect("encode");
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+
+        let mut package = empty_package();
+        // No hash160 preimage recorded: the pczt signer cannot verify a signature against the
+        // input's script, so `append_transparent_signature` fails and must not be swallowed.
+        package.pczt = transparent_pczt_bytes_custom(&tsk, 0, 0, le_bytes(0), le_bytes(0), false);
+        package.n_spends = [1, 0, 0, 0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        match signed {
+            Ok(_) => panic!("an under-signed transparent input must not yield Ok"),
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_an_out_of_bounds_sapling_spend_index() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = derive_spending_key(&Network::Main, TEST_PHRASE, None, 0).expect("derive");
+
+        let mut package = empty_package();
+        package.pczt = empty_pczt_bytes();
+        package.sapling_indices = vec![0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+        let error = match signed {
+            Ok(_) => panic!("an out-of-bounds sapling spend index must be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("out of bounds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_signs_a_sapling_only_account_with_an_imported_esk() {
+        let mut connection = memory_db().await;
+        let esk = sapling_only_esk();
+        let key_str =
+            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let account = restore(&mut connection, &key_str, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_sapling(&key_str, &Network::Main).expect("encode");
+
+        let mut package = empty_package();
+        package.pczt = sapling_pczt_bytes_custom(&esk, 0, le_bytes(0));
+        package.sapling_indices = vec![0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        match signed {
+            Ok(_) => {}
+            Err(error) => panic!("a sapling-only key must sign its own spend: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_signs_a_phrase_account_with_its_full_unified_key() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = derive_spending_key(&Network::Main, TEST_PHRASE, None, 0).expect("derive");
+        let usk = usk_of(TEST_PHRASE, 0);
+
+        let mut transparent = empty_package();
+        transparent.pczt = transparent_pczt_bytes(usk.transparent(), 0, 0);
+        transparent.n_spends = [1, 0, 0, 0];
+
+        let mut sapling = empty_package();
+        sapling.pczt = sapling_pczt_bytes_custom(usk.sapling(), 0, le_bytes(0));
+        sapling.sapling_indices = vec![0];
+
+        for (pool, package) in [("transparent", transparent), ("sapling", sapling)] {
+            if let Err(error) = sign_transaction(
+                &mut connection,
+                account,
+                &Network::Main,
+                &package,
+                &usk_bytes,
+            )
+            .await
+            {
+                panic!("a full unified key must sign its account's {pool} spend: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn require_pool_keys_accept_a_unified_key_and_name_the_pool_a_partial_key_lacks() {
+        let unified = SigningKey::Unified(usk_of(TEST_PHRASE, 0));
+        assert!(require_transparent_key(&unified).is_ok());
+        assert!(require_sapling_key(&unified).is_ok());
+        assert!(require_orchard_key(&unified, "orchard").is_ok());
+        assert!(require_orchard_key(&unified, "ironwood").is_ok());
+
+        let transparent = transparent_key_of(TEST_PHRASE);
+        assert!(require_transparent_key(&transparent).is_ok());
+        for (pool, error) in [
+            ("sapling", require_sapling_key(&transparent).unwrap_err()),
+            (
+                "orchard",
+                require_orchard_key(&transparent, "orchard").unwrap_err(),
+            ),
+            (
+                "ironwood",
+                require_orchard_key(&transparent, "ironwood").unwrap_err(),
+            ),
+        ] {
+            let error = error.to_string();
+            assert!(error.contains(pool), "expected '{pool}' in: {error}");
+        }
+
+        let sapling = sapling_key_of(TEST_PHRASE, 0);
+        assert!(require_sapling_key(&sapling).is_ok());
+        assert!(require_transparent_key(&sapling)
+            .unwrap_err()
+            .to_string()
+            .contains("transparent"));
+        assert!(require_orchard_key(&sapling, "orchard")
+            .unwrap_err()
+            .to_string()
+            .contains("orchard"));
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_a_sapling_spend_missing_its_scope_field() {
+        let mut connection = memory_db().await;
+        let esk = sapling_only_esk();
+        let key_str =
+            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let account = restore(&mut connection, &key_str, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_sapling(&key_str, &Network::Main).expect("encode");
+
+        let mut package = empty_package();
+        package.pczt = sapling_pczt_bytes_custom(&esk, 0, None);
+        package.sapling_indices = vec![0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+        let error = match signed {
+            Ok(_) => panic!("a sapling spend missing its scope field must be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("scope"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_a_sapling_scope_field_of_the_wrong_length() {
+        let mut connection = memory_db().await;
+        let esk = sapling_only_esk();
+        let key_str =
+            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let account = restore(&mut connection, &key_str, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_sapling(&key_str, &Network::Main).expect("encode");
+
+        let mut package = empty_package();
+        package.pczt = sapling_pczt_bytes_custom(&esk, 0, Some(vec![0, 0]));
+        package.sapling_indices = vec![0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        let error = match signed {
+            Ok(_) => panic!("a two-byte sapling scope field must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("scope"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_propagates_a_failed_sapling_signature_as_an_error() {
+        let mut connection = memory_db().await;
+        let esk = sapling_only_esk();
+        let key_str =
+            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let account = restore(&mut connection, &key_str, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = signing_key::encode_sapling(&key_str, &Network::Main).expect("encode");
+
+        // The note is built and spent with the account's own external key (scope 0), but the
+        // PCZT's "scope" field - untrusted bookkeeping the caller controls, not derived from
+        // the key - falsely claims scope 1 (internal). Signing then derives the internal ask,
+        // which does not match the note's real proof_generation_key: the pczt crate's own
+        // nullifier check catches this inside `sign_sapling`, which must surface as an `Err`,
+        // not a panic. The account's own key still passes `verify_spending_key`, so this
+        // failure is reached only via `sign_sapling`, not the earlier key-coverage check.
+        let mut package = empty_package();
+        package.pczt = sapling_pczt_bytes_custom(&esk, 0, le_bytes(1));
+        package.sapling_indices = vec![0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        match signed {
+            Ok(_) => panic!("a spend signed under the wrong scope must be rejected"),
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_propagates_an_out_of_bounds_orchard_action_index_as_an_error() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = derive_spending_key(&Network::Main, TEST_PHRASE, None, 0).expect("derive");
+
+        let mut package = empty_package();
+        package.pczt = empty_pczt_bytes();
+        package.orchard_indices = vec![0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        match signed {
+            Ok(_) => panic!("an out-of-bounds orchard action index must be rejected"),
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_propagates_an_out_of_bounds_ironwood_action_index_as_an_error() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = derive_spending_key(&Network::Main, TEST_PHRASE, None, 0).expect("derive");
+
+        let mut package = empty_package();
+        package.pczt = empty_pczt_bytes();
+        package.ironwood_indices = vec![99];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+
+        match signed {
+            Ok(_) => panic!("an out-of-bounds ironwood action index must be rejected"),
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_rejects_a_transparent_spend_count_beyond_the_bundle() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let usk_bytes = derive_spending_key(&Network::Main, TEST_PHRASE, None, 0).expect("derive");
+
+        let mut package = empty_package();
+        package.pczt = empty_pczt_bytes();
+        package.n_spends = [1, 0, 0, 0];
+
+        let signed = sign_transaction(
+            &mut connection,
+            account,
+            &Network::Main,
+            &package,
+            &usk_bytes,
+        )
+        .await;
+        let error = match signed {
+            Ok(_) => panic!("a transparent spend count beyond the bundle must be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("exceeds"), "{error}");
     }
 
     #[test]

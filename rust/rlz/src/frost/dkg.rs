@@ -808,7 +808,8 @@ pub async fn do_dkg_impl(
         .fetch_one(&mut *connection)
         .await?;
     let frost_account =
-        store_account_metadata(connection, &name, &None, &None, height, false, false).await?;
+        store_account_metadata(connection, &name, &None, &None, height, false, false, false)
+            .await?;
     init_account_orchard(network, connection, frost_account, height).await?;
     store_account_orchard_vk(connection, frost_account, &shared_fvk).await?;
 

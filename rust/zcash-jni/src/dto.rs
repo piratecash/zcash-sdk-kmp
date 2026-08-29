@@ -4,7 +4,7 @@
 //! account icon, none of which the Kotlin API needs and the first two of which must never leave
 //! the native side at all.
 
-use rlz::api::account::{Account, Receivers, Tx};
+use rlz::api::account::{Account, Addresses, Receivers, Tx};
 use rlz::api::mempool::{MempoolAmount, MempoolMsg, MempoolNote};
 use rlz::api::migrate::{MigrationEvent, MigrationStatus};
 use rlz::net::BroadcastOutcome;
@@ -68,6 +68,18 @@ impl AddressesDto {
             orchard: receivers.oaddr,
             transparent: receivers.taddr,
             diversifier_index,
+        }
+    }
+}
+
+impl From<Addresses> for AddressesDto {
+    fn from(addresses: Addresses) -> Self {
+        AddressesDto {
+            unified: addresses.ua,
+            sapling: addresses.saddr,
+            orchard: addresses.oaddr,
+            transparent: addresses.taddr,
+            diversifier_index: addresses.diversifier_index,
         }
     }
 }

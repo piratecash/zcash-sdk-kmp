@@ -72,6 +72,37 @@ private const val TEST_UFVK =
         "90px0rhvmqtwvttuy6d7degly023lqvskclk6mezyt69dwu6c4tfzrjgq4uuh5xa9m5dclgatykgtrrw268qe" +
         "5pldfkx73f2kd5yyy2tjpjql92pa6tsk2nh2h88q23nee9z379het4akl6haqmuwf9d0nl0susg4tnxyk"
 
+/** Account-level (m/44'/133'/0') transparent extended private key of [TEST_PHRASE] — spends. */
+private const val TEST_XPRV =
+    "xprv9yMAh5zLARRVxiM7BXEzJ2t6WbW7dbm8G765ctzqhjYqW9GAtei2NjQyYmDsoVoWxTdfY5D1uDAm58bcTb35GH" +
+        "TxKRCVzpv42SfuxTfPTCm"
+
+/** Account-level transparent extended public key of [TEST_PHRASE] — watch-only. */
+private const val TEST_XPUB =
+    "xpub6DXuQW17LykdVpnmb4Vu3mocrZtUdokvLqTNZXDUDLvMVutc92kNKTJUpr7QzurmRGgdDfVSx6RgYCEi4C1M" +
+        "NmZfwvXaVDn5R6noWao5gzw"
+
+/** Account-level Sapling extended spending key of [TEST_PHRASE] — spends the shielded pool. */
+private const val TEST_SAPLING_ESK =
+    "secret-extended-key-main1q00pkhghqqqqpqpjr7aphsx37860r2y85wfgq66meql6jw69ls69aztxjhq8cmn" +
+        "jdhc9v7jnk3utf4g66ddp6cll6fw0vqthr9vnczdjqkxyelkjxgtq2a5g5w6ngqj4rnewvnf3ehh7fzftv4jpkgz" +
+        "rtv4jqjej6zdge4gr0se3lftqty8gvymk3097nzt4mdy34ftxea0yfwg84tgmyjckvpngs4zkwfleqwvd9n870zk" +
+        "jgt5d5s4uxyqcwsh8t298lgl5vf95g9qdtz6vv"
+
+/** Account-level Sapling extended full viewing key of [TEST_PHRASE] — watch-only. */
+private const val TEST_SAPLING_EFVK =
+    "zxviews1q00pkhghqqqqpqpjr7aphsx37860r2y85wfgq66meql6jw69ls69aztxjhq8cmnjd5k8kq2gx555yanx" +
+        "7mv0hsgyw8nn4dmsl44afssw5whnkfqxrgcs343rpv59a97w4320fa3m6jderp4y8rhywd3edkvqetmt9wtde7yx" +
+        "0se3lftqty8gvymk3097nzt4mdy34ftxea0yfwg84tgmyjckvpngs4zkwfleqwvd9n870zkjgt5d5s4uxyqcwsh8" +
+        "t298lgl5vf95g9qw2wx7h"
+
+/** A Sapling spending key of the wrong network: well-formed, only its HRP differs. */
+private const val TEST_FOREIGN_SAPLING_ESK =
+    "secret-extended-key-test1q00pkhghqqqqpqpjr7aphsx37860r2y85wfgq66meql6jw69ls69aztxjhq8cmn" +
+        "jdhc9v7jnk3utf4g66ddp6cll6fw0vqthr9vnczdjqkxyelkjxgtq2a5g5w6ngqj4rnewvnf3ehh7fzftv4jpkgz" +
+        "rtv4jqjej6zdge4gr0se3lftqty8gvymk3097nzt4mdy34ftxea0yfwg84tgmyjckvpngs4zkwfleqwvd9n870zk" +
+        "jgt5d5s4uxyqcwsh8t298lgl5vf95g9qxhxc5v"
+
 private val TEST_DB_KEY = ByteArray(32) { it.toByte() }
 
 /** Header of every unencrypted SQLite file; SQLCipher stores random salt there instead. */
@@ -418,6 +449,135 @@ class ZcashWalletIntegrationTest {
     fun deriveAddressesFromViewingKey_invalidKey_failsWithAZcashException() = runBlocking {
         assertFailsWith<ZcashException> {
             ZcashSdk.deriveAddressesFromViewingKey("not a viewing key", ZcashNetwork.MAIN)
+        }
+        Unit
+    }
+
+    @Test
+    fun keyPools_phraseAndUnifiedFullViewingKey_encodeTransparentSaplingAndOrchard() {
+        val expected = PoolSet.of(Pool.TRANSPARENT, Pool.SAPLING, Pool.ORCHARD)
+
+        assertEquals(expected, ZcashSdk.keyPools(TEST_PHRASE, ZcashNetwork.MAIN))
+        assertEquals(expected, ZcashSdk.keyPools(TEST_UFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun keyPools_importedTransparentExtendedKey_encodesTransparentOnly() {
+        val expected = PoolSet.of(Pool.TRANSPARENT)
+
+        assertEquals(expected, ZcashSdk.keyPools(TEST_XPRV, ZcashNetwork.MAIN))
+        assertEquals(expected, ZcashSdk.keyPools(TEST_XPUB, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun keyPools_importedSaplingKeys_encodeSaplingOnly() {
+        val expected = PoolSet.of(Pool.SAPLING)
+
+        assertEquals(expected, ZcashSdk.keyPools(TEST_SAPLING_ESK, ZcashNetwork.MAIN))
+        assertEquals(expected, ZcashSdk.keyPools(TEST_SAPLING_EFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun keyPools_receiverAddressAndGarbage_areEmpty() {
+        assertEquals(PoolSet.NONE, ZcashSdk.keyPools(ECC_TRANSPARENT_RECEIVER, ZcashNetwork.MAIN))
+        assertEquals(PoolSet.NONE, ZcashSdk.keyPools("not a key", ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun isValidKey_phraseAndUnifiedFullViewingKey_areTrue() {
+        assertTrue(ZcashSdk.isValidKey(TEST_PHRASE, ZcashNetwork.MAIN))
+        assertTrue(ZcashSdk.isValidKey(TEST_UFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun isValidKey_receiverAddressAndGarbage_areFalse() {
+        assertFalse(ZcashSdk.isValidKey(ECC_TRANSPARENT_RECEIVER, ZcashNetwork.MAIN))
+        assertFalse(ZcashSdk.isValidKey("not a key", ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun isSpendingKey_importedTransparentExtendedKey_isTrue() {
+        assertTrue(ZcashSdk.isSpendingKey(TEST_XPRV, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun isSpendingKey_importedSaplingExtendedSpendingKey_isTrue() {
+        assertTrue(ZcashSdk.isSpendingKey(TEST_SAPLING_ESK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun isSpendingKey_viewingKeys_areFalse() {
+        assertFalse(ZcashSdk.isSpendingKey(TEST_XPUB, ZcashNetwork.MAIN))
+        assertFalse(ZcashSdk.isSpendingKey(TEST_SAPLING_EFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun isSpendingKey_phraseAndUnifiedFullViewingKey_areFalse() {
+        // A phrase spends too, but through restoreAccount/deriveSpendingKey — not this predicate.
+        assertFalse(ZcashSdk.isSpendingKey(TEST_PHRASE, ZcashNetwork.MAIN))
+        assertFalse(ZcashSdk.isSpendingKey(TEST_UFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun importSpendingKey_spendingKeys_areDeterministicAndDistinctPerPool() {
+        val transparent = ZcashSdk.importSpendingKey(TEST_XPRV, ZcashNetwork.MAIN)
+        val sapling = ZcashSdk.importSpendingKey(TEST_SAPLING_ESK, ZcashNetwork.MAIN)
+
+        assertTrue(transparent.isNotEmpty())
+        assertTrue(sapling.isNotEmpty())
+        assertFalse(transparent.contentEquals(sapling))
+        assertContentEquals(transparent, ZcashSdk.importSpendingKey(TEST_XPRV, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun importSpendingKey_everythingIsSpendingKeyRejects_failsNamingWhyItCannotSpend() {
+        for ((key, reason) in listOf(
+            TEST_XPUB to "viewing key",
+            TEST_SAPLING_EFVK to "viewing key",
+            TEST_UFVK to "viewing key",
+            TEST_PHRASE to "restoreAccount",
+            TEST_FOREIGN_SAPLING_ESK to "another network",
+            "not a key" to "not a recognized",
+        )) {
+            assertFalse(ZcashSdk.isSpendingKey(key, ZcashNetwork.MAIN), key)
+            val error = assertFailsWith<ZcashException>(key) {
+                ZcashSdk.importSpendingKey(key, ZcashNetwork.MAIN)
+            }
+            assertTrue(error.message?.contains(reason) == true, "$key: ${error.message}")
+        }
+    }
+
+    @Test
+    fun deriveAddressesFromKey_phrase_withoutOpeningAWallet_matchesTheRestoredAccountUnifiedAddress() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+            val expected = wallet.addresses(id)
+
+            // A phrase carries all three pools, so each of them gets its own address.
+            val actual = ZcashSdk.deriveAddressesFromKey(TEST_PHRASE, ZcashNetwork.MAIN)
+            assertEquals(expected.unified, actual.unified)
+            assertEquals(expected.transparent, actual.transparent)
+            assertEquals(expected.sapling, actual.sapling)
+            assertEquals(expected.orchard, actual.orchard)
+        }
+
+    @Test
+    fun deriveAddressesFromKey_importedTransparentExtendedKey_matchesThePhraseAccountTransparentAddress() =
+        withWallet { wallet ->
+            // restoreAccount must accept the key; its own addresses() cannot be read back for a
+            // transparent-only account (pre-existing gap, unrelated to this phase — see report).
+            wallet.restoreAccount(name = "xprv", key = TEST_XPRV, birthHeight = BIRTH_HEIGHT)
+
+            assertEquals(
+                ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN).transparent,
+                ZcashSdk.deriveAddressesFromKey(TEST_XPRV, ZcashNetwork.MAIN).transparent,
+            )
+        }
+
+    @Test
+    fun deriveAddressesFromKey_invalidKey_failsWithAZcashException() = runBlocking {
+        assertFailsWith<ZcashException> {
+            ZcashSdk.deriveAddressesFromKey("not a key", ZcashNetwork.MAIN)
         }
         Unit
     }

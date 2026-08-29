@@ -3,7 +3,9 @@ use std::str::FromStr as _;
 use crate::{api::coin::Network, db::get_account_dindex};
 use anyhow::Result;
 use bech32::Hrp;
-use bip32::{ChildNumber, ExtendedKeyAttrs, ExtendedPrivateKey, ExtendedPublicKey, Prefix};
+use bip32::{
+    ChildNumber, ExtendedKey, ExtendedKeyAttrs, ExtendedPrivateKey, ExtendedPublicKey, Prefix,
+};
 use bip39::Mnemonic;
 use secp256k1::{PublicKey, SecretKey};
 use sqlx::SqliteConnection;
@@ -90,16 +92,54 @@ pub fn is_valid_phrase(phrase: &str) -> bool {
     mnemonic.is_ok()
 }
 
-pub fn is_valid_transparent_key(key: &str) -> bool {
+/// The BIP-32 versions a Zcash transparent extended key carries on `network`: private, public.
+fn transparent_prefixes(network: &Network) -> (Prefix, Prefix) {
+    match network {
+        Network::Main => (Prefix::XPRV, Prefix::XPUB),
+        _ => (Prefix::TPRV, Prefix::TPUB),
+    }
+}
+
+/// `bip32` validates only that a prefix is four ASCII letters, never the version bytes, so
+/// without this another coin's account key (`Ltpv`, `yprv`, `dgpv`) parses as ours.
+fn has_prefix(key: &str, expected: Prefix) -> bool {
+    ExtendedKey::from_str(key).is_ok_and(|k| k.prefix.version() == expected.version())
+}
+
+/// A transparent extended private key (`xprv` on mainnet, `tprv` elsewhere). Any depth parses;
+/// callers treat it as the account node, so rejecting a root key is the embedding application's
+/// job. A Bitcoin `xprv` stays indistinguishable: Zcash reuses its version bytes.
+pub fn is_account_xprv(network: &Network, key: &str) -> bool {
+    has_prefix(key, transparent_prefixes(network).0)
+        && ExtendedPrivateKey::<SecretKey>::from_str(key).is_ok()
+}
+
+/// A transparent extended public key, with the same caveats as [`is_account_xprv`].
+pub fn is_account_xpub(network: &Network, key: &str) -> bool {
+    has_prefix(key, transparent_prefixes(network).1)
+        && ExtendedPublicKey::<PublicKey>::from_str(key).is_ok()
+}
+
+/// A Sapling extended spending key (`secret-extended-key-main` on mainnet).
+pub fn is_sapling_esk(network: &Network, key: &str) -> bool {
+    decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), key).is_ok()
+}
+
+/// A Sapling extended full viewing key.
+pub fn is_sapling_efvk(network: &Network, key: &str) -> bool {
+    decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), key).is_ok()
+}
+
+pub fn is_valid_transparent_key(network: &Network, key: &str) -> bool {
     if bip38::import_tsk(key).is_ok() {
         return true;
     }
 
-    if ExtendedPrivateKey::<SecretKey>::from_str(key).is_ok() {
+    if is_account_xprv(network, key) {
         return true;
     }
 
-    if ExtendedPublicKey::<PublicKey>::from_str(key).is_ok() {
+    if is_account_xpub(network, key) {
         return true;
     }
 
@@ -113,17 +153,7 @@ pub fn is_valid_transparent_key(key: &str) -> bool {
 }
 
 pub fn is_valid_sapling_key(network: &Network, key: &str) -> bool {
-    if decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), key).is_ok() {
-        return true;
-    }
-
-    if decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), key)
-        .is_ok()
-    {
-        return true;
-    }
-
-    false
+    is_sapling_esk(network, key) || is_sapling_efvk(network, key)
 }
 
 pub fn is_valid_ufvk(network: &Network, key: &str) -> bool {

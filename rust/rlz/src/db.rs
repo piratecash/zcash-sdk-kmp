@@ -32,7 +32,7 @@ use crate::{api::account::TxNote, tiu};
 /// Schema version. Bump only when the export format changes (IOAccount or any
 /// embedded struct gains/removes/changes a field). Do NOT bump for runtime-only
 /// changes (queries, PoolBalance, solve mode, etc.).
-pub const DB_VERSION: u16 = 9;
+pub const DB_VERSION: u16 = 10;
 
 pub async fn create_schema(connection: &mut SqliteConnection) -> Result<()> {
     sqlx::query(
@@ -60,11 +60,18 @@ pub async fn create_schema(connection: &mut SqliteConnection) -> Result<()> {
         hidden BOOL NOT NULL,
         saved BOOL NOT NULL,
         enabled BOOL NOT NULL DEFAULT TRUE,
-        internal BOOL NOT NULL DEFAULT FALSE
+        internal BOOL NOT NULL DEFAULT FALSE,
+        can_sign INTEGER NOT NULL DEFAULT(0)
         )",
     )
     .execute(&mut *connection)
     .await?;
+
+    // `create_schema` runs on every open (api/coin.rs), so a swallowed error here would
+    // silently leave existing databases without the column and `can_sign` permanently false.
+    if !has_can_sign_column(&mut *connection).await? {
+        migrate_can_sign(connection).await?;
+    }
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS transparent_accounts(
@@ -619,6 +626,36 @@ pub async fn create_schema(connection: &mut SqliteConnection) -> Result<()> {
     Ok(())
 }
 
+async fn has_can_sign_column(connection: &mut SqliteConnection) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'can_sign'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(count > 0)
+}
+
+/// One transaction: a column added without its backfill would leave every phrase account unable
+/// to spend, and the existence check in [`create_schema`] would never retry it.
+async fn migrate_can_sign(connection: &mut SqliteConnection) -> Result<()> {
+    // `BEGIN IMMEDIATE` serializes concurrent openers; the loser then sees the winner's column
+    // and skips an `ALTER TABLE` that would fail an otherwise valid wallet open.
+    let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+    if has_can_sign_column(&mut tx).await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE accounts ADD COLUMN can_sign INTEGER NOT NULL DEFAULT(0)")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE accounts SET can_sign = 1 WHERE seed_fingerprint IS NOT NULL")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(())
+}
+
 pub async fn migrate_sapling_addresses(
     network: &Network,
     connection: &mut SqliteConnection,
@@ -810,6 +847,7 @@ pub async fn store_account_metadata(
     birth: u32,
     use_internal: bool,
     internal: bool,
+    can_sign: bool,
 ) -> Result<u32> {
     let (last_position,): (u32,) = sqlx::query_as("SELECT MAX(position) FROM accounts")
         .fetch_optional(&mut *connection)
@@ -818,8 +856,8 @@ pub async fn store_account_metadata(
 
     let (id,): (u32,) = sqlx::query_as(
         "INSERT INTO accounts(name, icon, seed_fingerprint, birth,
-        aindex, dindex, def_dindex, position, use_internal, saved, hidden, internal)
-        VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, FALSE, FALSE, ?)
+        aindex, dindex, def_dindex, position, use_internal, saved, hidden, internal, can_sign)
+        VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, FALSE, FALSE, ?, ?)
         ON CONFLICT(id_account) DO UPDATE SET
             name = excluded.name
         RETURNING id_account",
@@ -831,6 +869,7 @@ pub async fn store_account_metadata(
     .bind(last_position + 1)
     .bind(use_internal)
     .bind(internal)
+    .bind(can_sign)
     .fetch_one(&mut *connection)
     .await?;
 
@@ -1240,6 +1279,15 @@ pub async fn get_account_fingerprint(
             .await?;
 
     Ok(fingerprint)
+}
+
+pub async fn get_account_can_sign(connection: &mut SqliteConnection, account: u32) -> Result<bool> {
+    let (can_sign,): (bool,) = sqlx::query_as("SELECT can_sign FROM accounts WHERE id_account = ?")
+        .bind(account)
+        .fetch_one(&mut *connection)
+        .await?;
+
+    Ok(can_sign)
 }
 
 pub async fn delete_account(connection: &mut SqliteConnection, account: u32) -> Result<()> {
@@ -2489,12 +2537,11 @@ pub(crate) mod tests {
 
         create_schema(&mut connection).await.expect("upgrade");
 
-        let row: (Vec<u8>, u32, f64, u32, Option<u32>) = sqlx::query_as(
-            "SELECT txid, height, price, category, expiry_height FROM pending_txs",
-        )
-        .fetch_one(&mut connection)
-        .await
-        .expect("preserved row");
+        let row: (Vec<u8>, u32, f64, u32, Option<u32>) =
+            sqlx::query_as("SELECT txid, height, price, category, expiry_height FROM pending_txs")
+                .fetch_one(&mut connection)
+                .await
+                .expect("preserved row");
         assert_eq!(row, (vec![1, 2], 100, 2.5, 7, None));
         let columns: u32 =
             sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('pending_spend_inputs')")
@@ -2502,6 +2549,148 @@ pub(crate) mod tests {
                 .await
                 .expect("reservation table");
         assert_eq!(columns, 4);
+    }
+
+    /// An `accounts` table as it existed before the `can_sign` column, so migration tests
+    /// exercise the real `ALTER TABLE` path instead of the fresh-database `CREATE TABLE`.
+    pub(crate) async fn pre_can_sign_migration_db() -> SqliteConnection {
+        let mut connection = SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("database");
+        sqlx::query(
+            "CREATE TABLE accounts(
+                id_account INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                seed TEXT,
+                passphrase TEXT NOT NULL DEFAULT '',
+                seed_fingerprint BLOB,
+                aindex INTEGER NOT NULL,
+                dindex INTEGER NOT NULL,
+                def_dindex INTEGER NOT NULL,
+                icon BLOB,
+                birth INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                use_internal BOOL NOT NULL,
+                hidden BOOL NOT NULL,
+                saved BOOL NOT NULL,
+                enabled BOOL NOT NULL DEFAULT TRUE,
+                internal BOOL NOT NULL DEFAULT FALSE
+            )",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("legacy accounts table (pre can_sign)");
+
+        connection
+    }
+
+    #[tokio::test]
+    async fn create_schema_migrates_existing_accounts_can_sign_from_seed_fingerprint() {
+        let mut connection = pre_can_sign_migration_db().await;
+
+        sqlx::query(
+            "INSERT INTO accounts(id_account, name, seed_fingerprint, aindex, dindex, def_dindex, birth, position, use_internal, hidden, saved)
+            VALUES (1, 'phrase', x'0102', 0, 0, 0, 100, 0, TRUE, FALSE, TRUE)",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("phrase account");
+
+        sqlx::query(
+            "INSERT INTO accounts(id_account, name, seed_fingerprint, aindex, dindex, def_dindex, birth, position, use_internal, hidden, saved)
+            VALUES (2, 'ufvk', NULL, 0, 0, 0, 100, 1, TRUE, FALSE, TRUE)",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("ufvk account");
+
+        create_schema(&mut connection).await.expect("migration");
+
+        assert!(get_account_can_sign(&mut connection, 1)
+            .await
+            .expect("phrase can_sign"));
+        assert!(!get_account_can_sign(&mut connection, 2)
+            .await
+            .expect("ufvk can_sign"));
+    }
+
+    #[tokio::test]
+    async fn create_schema_can_sign_backfill_failure_leaves_no_half_migrated_column() {
+        let mut connection = pre_can_sign_migration_db().await;
+        sqlx::query(
+            "INSERT INTO accounts(id_account, name, seed_fingerprint, aindex, dindex, def_dindex, birth, position, use_internal, hidden, saved)
+            VALUES (1, 'phrase', x'0102', 0, 0, 0, 100, 0, TRUE, FALSE, TRUE)",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("phrase account");
+        // Stands in for losing the process between the ALTER TABLE and the backfill.
+        sqlx::query(
+            "CREATE TRIGGER fail_backfill BEFORE UPDATE ON accounts
+            BEGIN SELECT RAISE(ABORT, 'interrupted'); END",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("trigger");
+
+        assert!(create_schema(&mut connection).await.is_err());
+
+        let has_can_sign: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'can_sign'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("column count");
+        assert_eq!(
+            0, has_can_sign,
+            "the column must not outlive the backfill that fills it"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_can_sign_after_a_concurrent_opener_migrated_succeeds() {
+        let mut connection = pre_can_sign_migration_db().await;
+        create_schema(&mut connection)
+            .await
+            .expect("winning opener");
+
+        // The losing opener read the schema before the winner committed, so it still believes
+        // the column is missing; its migration must find the column and give up quietly.
+        migrate_can_sign(&mut connection)
+            .await
+            .expect("a losing opener must not fail the wallet open");
+    }
+
+    #[tokio::test]
+    async fn create_schema_migration_is_idempotent() {
+        let mut connection = pre_can_sign_migration_db().await;
+        create_schema(&mut connection).await.expect("first open");
+        // Re-opening an already-migrated database must not error (duplicate ALTER TABLE).
+        create_schema(&mut connection).await.expect("second open");
+    }
+
+    #[tokio::test]
+    async fn store_account_metadata_records_can_sign_false_for_dkg_accounts() {
+        // Mirrors frost/dkg.rs's call shape (no fingerprint, no hw, can_sign: false) — a DKG
+        // account cannot sign outside the multi-party ceremony that created it.
+        let mut connection = memory_db().await;
+
+        let account = store_account_metadata(
+            &mut connection,
+            "dkg",
+            &None,
+            &None,
+            100,
+            false,
+            false,
+            false,
+        )
+        .await
+        .expect("dkg account");
+
+        assert!(!get_account_can_sign(&mut connection, account)
+            .await
+            .expect("can sign"));
     }
 
     #[tokio::test]

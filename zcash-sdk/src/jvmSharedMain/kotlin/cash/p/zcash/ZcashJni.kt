@@ -128,6 +128,18 @@ internal object ZcashJni {
     /** Stateless: needs no open wallet. Returns `"invalid"` rather than throwing. */
     external fun addressKind(coin: Byte, address: String): String
 
+    /** Stateless: needs no open wallet. The component mask `key` encodes, not spendable pools. */
+    external fun keyPools(coin: Byte, key: String): Int
+
+    /** Stateless: needs no open wallet and no account, unlike [addressesFromViewingKey]. */
+    external fun addressesFromKey(coin: Byte, key: String): String
+
+    /** Stateless: needs no open wallet. Whether `newAccount` would import [key] as a spending key. */
+    external fun isSpendingKey(coin: Byte, key: String): Boolean
+
+    /** Stateless: needs no open wallet. The signing envelope for a standalone spending [key]. */
+    external fun importSpendingKey(coin: Byte, key: String): ByteArray
+
     external fun extractTransaction(pkg: ByteArray): ByteArray
 
     /** Stateless: needs no open wallet. */

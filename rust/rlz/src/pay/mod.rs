@@ -21,6 +21,7 @@ pub mod pool;
 pub mod prepare;
 pub mod reserve;
 pub mod select;
+pub mod signing_key;
 pub mod solve;
 
 #[derive(Clone, Default, Debug)]

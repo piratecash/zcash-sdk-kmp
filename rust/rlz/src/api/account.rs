@@ -4,11 +4,13 @@ use std::str::FromStr;
 use crate::keys::{SaplingAddressDerivation, ScopeExt};
 use crate::pay::pool::PoolMask;
 use anyhow::{anyhow, Result};
+use bip32::{ExtendedPrivateKey, ExtendedPublicKey};
 use bip39::Mnemonic;
 use csv_async::AsyncWriter;
 #[cfg(feature = "flutter")]
 use flutter_rust_bridge::frb;
 use sapling_crypto::{zip32::sapling_derive_internal_fvk, PaymentAddress};
+use secp256k1::{PublicKey, SecretKey};
 use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
 use zcash_address::{
     unified::{Container, Encoding},
@@ -16,11 +18,14 @@ use zcash_address::{
 };
 use zcash_keys::{
     address::{Address, UnifiedAddress},
-    encoding::AddressCodec,
+    encoding::{decode_extended_full_viewing_key, decode_extended_spending_key, AddressCodec},
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
 };
-use zcash_protocol::consensus::Parameters as ZkParams;
-use zcash_transparent::address::TransparentAddress;
+use zcash_protocol::consensus::{NetworkConstants, Parameters as ZkParams};
+use zcash_transparent::{
+    address::TransparentAddress,
+    keys::{AccountPrivKey, AccountPubKey},
+};
 use zip32::AccountId;
 
 #[cfg(feature = "flutter")]
@@ -480,6 +485,109 @@ pub struct Addresses {
     pub oaddr: Option<String>,
     pub ua: Option<String>,
     pub diversifier_index: u32,
+}
+
+/// Best-effort derivation directly from a key string, with no account and no database: only the
+/// pools `key` itself carries are populated, the rest of [`Addresses`] stays `None`.
+#[cfg_attr(feature = "flutter", frb(sync))]
+pub fn addresses_from_key(coin: u8, key: &str) -> Result<Addresses> {
+    let network = network_from_coin(coin);
+
+    if crate::key::is_valid_phrase(key) {
+        let (ua, diversifier_index) = derive_unified_address(coin, key, None, 0)?;
+        return unified_addresses(coin, ua, diversifier_index);
+    }
+
+    if crate::key::is_account_xprv(&network, key) {
+        let xsk =
+            ExtendedPrivateKey::<SecretKey>::from_str(key).map_err(|_| anyhow!("Invalid Key"))?;
+        let xvk = AccountPrivKey::from_extended_privkey(xsk).to_account_pubkey();
+        let (_, address) = crate::account::derive_transparent_address(&xvk, 0, 0, false)?;
+        return Ok(Addresses {
+            taddr: Some(address.encode(&network)),
+            saddr: None,
+            oaddr: None,
+            ua: None,
+            diversifier_index: 0,
+        });
+    }
+
+    if crate::key::is_account_xpub(&network, key) {
+        let xvk =
+            ExtendedPublicKey::<PublicKey>::from_str(key).map_err(|_| anyhow!("Invalid Key"))?;
+        // No AccountPubKey::from_extended_pubkey, we need to use the bytes.
+        let mut buf = xvk.attrs().chain_code.to_vec();
+        buf.extend_from_slice(&xvk.to_bytes());
+        let buf: [u8; 65] = buf.try_into().map_err(|_| anyhow!("Invalid Key"))?;
+        let xvk = AccountPubKey::deserialize(&buf).map_err(|_| anyhow!("Invalid Key"))?;
+        let (_, address) = crate::account::derive_transparent_address(&xvk, 0, 0, false)?;
+        return Ok(Addresses {
+            taddr: Some(address.encode(&network)),
+            saddr: None,
+            oaddr: None,
+            ua: None,
+            diversifier_index: 0,
+        });
+    }
+
+    if crate::key::is_sapling_esk(&network, key) {
+        let xsk = decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), key)
+            .map_err(|_| anyhow!("Invalid Key"))?;
+        let dfvk = xsk.to_diversifiable_full_viewing_key();
+        let (di, _) = dfvk.default_address();
+        let diversifier_index: u32 = di.try_into()?;
+        return Ok(Addresses {
+            taddr: None,
+            saddr: Some(crate::account::derive_sapling_address(
+                &network,
+                &dfvk,
+                diversifier_index,
+            )),
+            oaddr: None,
+            ua: None,
+            diversifier_index,
+        });
+    }
+
+    if crate::key::is_sapling_efvk(&network, key) {
+        let xvk =
+            decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), key)
+                .map_err(|_| anyhow!("Invalid Key"))?;
+        let dfvk = xvk.to_diversifiable_full_viewing_key();
+        let (di, _) = dfvk.default_address();
+        let diversifier_index: u32 = di.try_into()?;
+        return Ok(Addresses {
+            taddr: None,
+            saddr: Some(crate::account::derive_sapling_address(
+                &network,
+                &dfvk,
+                diversifier_index,
+            )),
+            oaddr: None,
+            ua: None,
+            diversifier_index,
+        });
+    }
+
+    if crate::key::is_valid_ufvk(&network, key) {
+        let (ua, diversifier_index) = unified_address(coin, key, None)?;
+        return unified_addresses(coin, ua, diversifier_index);
+    }
+
+    Err(anyhow!("Unsupported key"))
+}
+
+/// Splits a unified address back into its per-pool receivers, so a key covering several pools
+/// reports an address for each of them.
+fn unified_addresses(coin: u8, ua: String, diversifier_index: u32) -> Result<Addresses> {
+    let receivers = receivers_of(coin, &ua)?;
+    Ok(Addresses {
+        taddr: receivers.taddr,
+        saddr: receivers.saddr,
+        oaddr: receivers.oaddr,
+        ua: Some(ua),
+        diversifier_index,
+    })
 }
 
 #[cfg_attr(feature = "flutter", frb)]
@@ -1034,11 +1142,23 @@ pub fn dummy_export(_a: SigningEvent) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::tests::TEST_PHRASE;
+    use crate::account::tests::{
+        account_efvk, account_xpub, restore, watch_only_keys, TEST_PHRASE,
+    };
+    use crate::api::coin::Network;
+    use crate::db::tests::memory_db;
     use zcash_address::ToAddress;
 
     const MAIN: u8 = 0;
     const TEST: u8 = 1;
+
+    fn watch_only_key(label: &str) -> String {
+        watch_only_keys()
+            .into_iter()
+            .find(|k| k.label == label)
+            .unwrap_or_else(|| panic!("no fixture for {label}"))
+            .key
+    }
 
     fn main_addresses() -> (String, Receivers) {
         let (ua, _) = derive_unified_address(MAIN, TEST_PHRASE, None, 0).expect("derive");
@@ -1103,5 +1223,113 @@ mod tests {
     fn address_kind_rejects_text_that_is_not_an_address() {
         assert_eq!(None, address_kind(MAIN, ""));
         assert_eq!(None, address_kind(MAIN, TEST_PHRASE));
+    }
+
+    #[tokio::test]
+    async fn addresses_from_key_phrase_matches_the_restored_account_ua() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let expected = crate::account::get_addresses(&Network::Main, &mut connection, account, 7)
+            .await
+            .expect("get_addresses");
+
+        let actual = addresses_from_key(MAIN, TEST_PHRASE).expect("addresses_from_key");
+
+        assert_eq!(actual.ua, expected.ua);
+        assert_eq!(actual.taddr, expected.taddr);
+        assert_eq!(actual.saddr, expected.saddr);
+        assert_eq!(actual.oaddr, expected.oaddr);
+        assert_eq!(actual.diversifier_index, expected.diversifier_index);
+    }
+
+    #[tokio::test]
+    async fn addresses_from_key_account_xprv_matches_the_restored_account_taddr() {
+        let key = watch_only_key("tprv");
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, &key, 0, None)
+            .await
+            .expect("restore");
+        let expected = crate::account::get_addresses(&Network::Main, &mut connection, account, 7)
+            .await
+            .expect("get_addresses");
+
+        let actual = addresses_from_key(MAIN, &key).expect("addresses_from_key");
+
+        assert_eq!(actual.taddr, expected.taddr);
+    }
+
+    #[tokio::test]
+    async fn addresses_from_key_account_xpub_matches_the_restored_account_taddr() {
+        let key = account_xpub();
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, &key, 0, None)
+            .await
+            .expect("restore");
+        let expected = crate::account::get_addresses(&Network::Main, &mut connection, account, 7)
+            .await
+            .expect("get_addresses");
+
+        let actual = addresses_from_key(MAIN, &key).expect("addresses_from_key");
+
+        assert_eq!(actual.taddr, expected.taddr);
+    }
+
+    #[tokio::test]
+    async fn addresses_from_key_sapling_esk_matches_the_restored_account_saddr() {
+        let key = watch_only_key("sapling xsk");
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, &key, 0, None)
+            .await
+            .expect("restore");
+        let expected = crate::account::get_addresses(&Network::Main, &mut connection, account, 7)
+            .await
+            .expect("get_addresses");
+
+        let actual = addresses_from_key(MAIN, &key).expect("addresses_from_key");
+
+        assert_eq!(actual.saddr, expected.saddr);
+    }
+
+    #[tokio::test]
+    async fn addresses_from_key_sapling_efvk_matches_the_restored_account_saddr() {
+        let key = account_efvk();
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, &key, 0, None)
+            .await
+            .expect("restore");
+        let expected = crate::account::get_addresses(&Network::Main, &mut connection, account, 7)
+            .await
+            .expect("get_addresses");
+
+        let actual = addresses_from_key(MAIN, &key).expect("addresses_from_key");
+
+        assert_eq!(actual.saddr, expected.saddr);
+    }
+
+    #[tokio::test]
+    async fn addresses_from_key_ufvk_matches_the_restored_account_ua() {
+        let key = watch_only_key("ufvk");
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, &key, 0, None)
+            .await
+            .expect("restore");
+        let expected = crate::account::get_addresses(&Network::Main, &mut connection, account, 7)
+            .await
+            .expect("get_addresses");
+
+        let actual = addresses_from_key(MAIN, &key).expect("addresses_from_key");
+
+        assert_eq!(actual.ua, expected.ua);
+        assert_eq!(actual.taddr, expected.taddr);
+        assert_eq!(actual.saddr, expected.saddr);
+        assert_eq!(actual.oaddr, expected.oaddr);
+        assert_eq!(actual.diversifier_index, expected.diversifier_index);
+    }
+
+    #[test]
+    fn addresses_from_key_rejects_garbage() {
+        assert!(addresses_from_key(MAIN, "not a key").is_err());
     }
 }

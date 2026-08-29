@@ -11,7 +11,10 @@ use crate::{
         store_account_orchard_vk, store_account_sapling_vk, store_account_seed_fingerprint,
         store_account_transparent_addr, store_account_transparent_vk, update_dindex,
     },
-    key::{is_valid_phrase, is_valid_sapling_key, is_valid_transparent_key, is_valid_ufvk},
+    key::{
+        is_account_xprv, is_sapling_esk, is_valid_phrase, is_valid_sapling_key,
+        is_valid_transparent_key, is_valid_ufvk,
+    },
     keys::{sapling_dfvk_to_fvk, ScopeExt},
     tiu,
 };
@@ -60,7 +63,7 @@ use crate::{
     warp::{AuthPath, Witness, MERKLE_DEPTH},
 };
 
-/// Mnemonic -> USK, plus the seed fingerprint `account_can_sign` keys on.
+/// Mnemonic -> USK, plus the seed fingerprint used to identify the account.
 /// `aindex` is already range-checked by the caller.
 fn usk_from_phrase(
     network: &Network,
@@ -117,6 +120,14 @@ pub async fn new_account(
             .into()
     });
 
+    // A phrase (including one about to be generated below) and an imported spending-format
+    // key (xprv/ESK) leave the account able to sign; a viewing key or a Ledger account do not.
+    let can_sign = !na.ledger
+        && (na.key.is_empty()
+            || is_valid_phrase(&na.key)
+            || is_account_xprv(network, &na.key)
+            || is_sapling_esk(network, &na.key));
+
     let account = store_account_metadata(
         &mut db_tx,
         &na.name,
@@ -125,6 +136,7 @@ pub async fn new_account(
         birth,
         na.use_internal,
         na.internal,
+        can_sign,
     )
     .await?;
 
@@ -248,7 +260,7 @@ pub async fn new_account(
         }
 
         update_dindex(&mut db_tx, account, dindex, true).await?;
-    } else if is_valid_transparent_key(&key) {
+    } else if is_valid_transparent_key(network, &key) {
         init_account_transparent(&mut db_tx, account, birth).await?;
         if let Ok(xsk) = ExtendedPrivateKey::<SecretKey>::from_str(&key) {
             let xsk = AccountPrivKey::from_extended_privkey(xsk);
@@ -1378,7 +1390,7 @@ pub async fn has_pool(connection: &mut SqliteConnection, account: u32, pool: u8)
     Ok(has_pool)
 }
 
-fn derive_sapling_address(
+pub(crate) fn derive_sapling_address(
     network: &Network,
     sxvk: &DiversifiableFullViewingKey,
     dindex: u32,
@@ -1390,10 +1402,13 @@ fn derive_sapling_address(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::db::tests::{blob, memory_db, non_null_rows, SECRET_COLUMNS, VIEWING_COLUMNS};
-    use bip32::Prefix;
+    use crate::db::tests::{
+        blob, memory_db, non_null_rows, pre_can_sign_migration_db, SECRET_COLUMNS, VIEWING_COLUMNS,
+    };
+    use crate::db::{create_schema, get_account_can_sign};
+    use bip32::{ChildNumber, ExtendedKeyAttrs, Prefix};
     use sha2::{Digest, Sha256};
-    use zcash_keys::encoding::encode_extended_spending_key;
+    use zcash_keys::encoding::{encode_extended_full_viewing_key, encode_extended_spending_key};
 
     /// Published BIP-39 vector (all-zero entropy) — never holds funds.
     pub(crate) const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1435,6 +1450,35 @@ pub(crate) mod tests {
         usk_from_phrase(&Network::Main, TEST_PHRASE, "", aindex)
             .expect("usk")
             .0
+    }
+
+    /// Account-level transparent `xpub` for `test_usk(0)` — the viewing-only counterpart
+    /// `watch_only_keys` does not carry, since it only exercises what `new_account` stores.
+    pub(crate) fn account_xpub() -> String {
+        let data = test_usk(0).transparent().to_account_pubkey().serialize();
+        let chain_code: [u8; 32] = data[..32].try_into().expect("chain code");
+        let public_key = PublicKey::from_slice(&data[32..]).expect("pubkey");
+        let xpub = ExtendedPublicKey::new(
+            public_key,
+            ExtendedKeyAttrs {
+                depth: 3,
+                parent_fingerprint: [0xff, 0xff, 0xff, 0xff],
+                child_number: ChildNumber::new(0, true).expect("child"),
+                chain_code,
+            },
+        );
+        xpub.to_extended_key(Prefix::XPUB).to_string()
+    }
+
+    /// Account-level Sapling EFVK for `test_usk(0)` — the viewing-only counterpart
+    /// `watch_only_keys` does not carry.
+    #[allow(deprecated)]
+    pub(crate) fn account_efvk() -> String {
+        let efvk = test_usk(0).sapling().to_extended_full_viewing_key();
+        encode_extended_full_viewing_key(
+            Network::Main.hrp_sapling_extended_full_viewing_key(),
+            &efvk,
+        )
     }
 
     /// The same seed in every non-mnemonic form `new_account` accepts.
@@ -1500,6 +1544,20 @@ pub(crate) mod tests {
                 "{table}.{column}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn new_phrase_account_can_sign_after_can_sign_column_migration() {
+        let mut connection = pre_can_sign_migration_db().await;
+        create_schema(&mut connection).await.expect("migration");
+
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        assert!(get_account_can_sign(&mut connection, account)
+            .await
+            .expect("can sign"));
     }
 
     #[tokio::test]
@@ -1747,5 +1805,198 @@ pub(crate) mod tests {
             .expect("generate");
 
         assert!(address.is_none());
+    }
+    /// Account-level transparent key (m/44'/133'/0') — the form an external wallet exports.
+    pub(crate) fn account_xprv() -> String {
+        account_key().to_string(Prefix::XPRV).to_string()
+    }
+
+    fn account_key() -> ExtendedPrivateKey<SecretKey> {
+        let seed = bip39::Mnemonic::from_str(TEST_PHRASE)
+            .expect("phrase")
+            .to_seed("");
+        let mut key = ExtendedPrivateKey::<SecretKey>::new(seed).expect("master");
+        for index in [44u32, 133, 0] {
+            key = key
+                .derive_child(ChildNumber::new(index, true).expect("child number"))
+                .expect("derive");
+        }
+        key
+    }
+
+    /// [`account_xprv`]'s node re-serialized under another coin's or network's version bytes:
+    /// same key material, foreign prefix.
+    pub(crate) fn foreign_extended_keys() -> Vec<(&'static str, String)> {
+        const LTPV: Prefix = Prefix::from_parts_unchecked("Ltpv", 0x019d9cfe);
+        const LTUB: Prefix = Prefix::from_parts_unchecked("Ltub", 0x019da462);
+
+        let key = account_key();
+        let private = |prefix| key.to_string(prefix).to_string();
+        let public = |prefix| key.public_key().to_extended_key(prefix).to_string();
+
+        vec![
+            ("zcash testnet tprv", private(Prefix::TPRV)),
+            ("zcash testnet tpub", public(Prefix::TPUB)),
+            ("litecoin Ltpv", private(LTPV)),
+            ("litecoin Ltub", public(LTUB)),
+            ("bip49 yprv", private(Prefix::YPRV)),
+            ("bip84 zpub", public(Prefix::ZPUB)),
+        ]
+    }
+
+    async fn taddress_at_dindex(
+        connection: &mut SqliteConnection,
+        account: u32,
+        dindex: u32,
+    ) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT address FROM transparent_address_accounts
+            WHERE account = ? AND scope = 0 AND dindex = ?",
+        )
+        .bind(account)
+        .bind(dindex)
+        .fetch_optional(&mut *connection)
+        .await
+        .expect("transparent address")
+    }
+
+    async fn account_zaddress(connection: &mut SqliteConnection, account: u32) -> String {
+        sqlx::query_scalar("SELECT address FROM sapling_accounts WHERE account = ?")
+            .bind(account)
+            .fetch_one(&mut *connection)
+            .await
+            .expect("sapling address")
+    }
+
+    #[tokio::test]
+    async fn new_account_from_account_level_xprv_matches_the_phrase_taddress() {
+        let mut from_phrase = memory_db().await;
+        let phrase_account = restore(&mut from_phrase, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore phrase");
+        let expected = taddress_at_dindex(&mut from_phrase, phrase_account, 0)
+            .await
+            .expect("phrase address");
+
+        let mut from_xprv = memory_db().await;
+        let xprv_account = restore(&mut from_xprv, &account_xprv(), 0, None)
+            .await
+            .expect("restore xprv");
+        let actual = taddress_at_dindex(&mut from_xprv, xprv_account, 0)
+            .await
+            .expect("xprv address");
+
+        assert_eq!(actual, expected);
+    }
+
+    /// Published by hd-wallet-kit's own TaprootTest: account-level (depth 3) m/86'/0'/0'.
+    const HD_WALLET_KIT_ACCOUNT_XPRV: &str = "xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk";
+    const HD_WALLET_KIT_ACCOUNT_XPUB: &str = "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ";
+
+    #[test]
+    fn is_valid_transparent_key_accepts_hd_wallet_kit_serializations() {
+        assert!(ExtendedPrivateKey::<SecretKey>::from_str(HD_WALLET_KIT_ACCOUNT_XPRV).is_ok());
+        assert!(ExtendedPublicKey::<PublicKey>::from_str(HD_WALLET_KIT_ACCOUNT_XPUB).is_ok());
+        assert!(is_valid_transparent_key(
+            &Network::Main,
+            HD_WALLET_KIT_ACCOUNT_XPRV
+        ));
+        assert!(is_valid_transparent_key(
+            &Network::Main,
+            HD_WALLET_KIT_ACCOUNT_XPUB
+        ));
+    }
+
+    #[test]
+    fn account_xprv_and_xpub_predicates_reject_each_others_serializations() {
+        assert!(is_account_xprv(&Network::Main, HD_WALLET_KIT_ACCOUNT_XPRV));
+        assert!(!is_account_xprv(&Network::Main, HD_WALLET_KIT_ACCOUNT_XPUB));
+        assert!(crate::key::is_account_xpub(
+            &Network::Main,
+            HD_WALLET_KIT_ACCOUNT_XPUB
+        ));
+        assert!(!crate::key::is_account_xpub(
+            &Network::Main,
+            HD_WALLET_KIT_ACCOUNT_XPRV
+        ));
+    }
+
+    /// BIP-32 test vector 1, the master node of seed `000102…0f`.
+    const BIP32_MASTER_XPRV: &str = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+    const BIP32_MASTER_XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+
+    /// A root key is accepted and then used as the account node, which addresses a different
+    /// wallet than the one the user exported it from. Depth is not part of what these predicates
+    /// check, so the embedding application must filter root keys before offering Zcash.
+    #[test]
+    fn account_predicates_do_not_check_depth() {
+        assert!(is_account_xprv(&Network::Main, BIP32_MASTER_XPRV));
+        assert!(crate::key::is_account_xpub(
+            &Network::Main,
+            BIP32_MASTER_XPUB
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_account_rejects_an_extended_key_of_another_coin_or_network() {
+        for (label, key) in foreign_extended_keys() {
+            let mut connection = memory_db().await;
+            assert!(
+                restore(&mut connection, &key, 0, None).await.is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_account_from_sapling_esk_matches_the_phrase_zaddress() {
+        let esk = watch_only_keys()
+            .into_iter()
+            .find(|k| k.label == "sapling xsk")
+            .expect("sapling vector")
+            .key;
+
+        let mut from_phrase = memory_db().await;
+        let phrase_account = restore(&mut from_phrase, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore phrase");
+        let expected = account_zaddress(&mut from_phrase, phrase_account).await;
+
+        let mut from_esk = memory_db().await;
+        let esk_account = restore(&mut from_esk, &esk, 0, None)
+            .await
+            .expect("restore esk");
+        let actual = account_zaddress(&mut from_esk, esk_account).await;
+
+        assert_eq!(actual, expected);
+    }
+
+    /// The phrase path takes the sapling diversifier from the unified address
+    /// (`account.rs` mnemonic branch), the imported-ESK path from the DFVK's own
+    /// default — sapling is the constraining receiver, so the two never disagree.
+    #[test]
+    fn sapling_default_diversifier_matches_the_unified_default_across_account_indices() {
+        let mut non_zero = 0;
+
+        for aindex in 0u32..64 {
+            let usk = test_usk(aindex);
+            let (_, di) = usk
+                .to_unified_full_viewing_key()
+                .default_address(UnifiedAddressRequest::AllAvailableKeys)
+                .expect("unified address");
+            let unified_di: u32 = di.try_into().expect("unified diversifier");
+            let (di, _) = usk
+                .sapling()
+                .to_diversifiable_full_viewing_key()
+                .default_address();
+            let sapling_di: u32 = di.try_into().expect("sapling diversifier");
+
+            assert_eq!(sapling_di, unified_di, "account index {aindex}");
+            if unified_di != 0 {
+                non_zero += 1;
+            }
+        }
+
+        assert!(non_zero > 0, "the sweep must cover non-zero diversifiers");
     }
 }

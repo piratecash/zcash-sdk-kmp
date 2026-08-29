@@ -240,9 +240,10 @@ public class ZcashWallet private constructor(
      * [key] is a seed phrase, a unified full viewing key, or a Sapling or transparent
      * extended key — never blank. A unified spending key is not accepted.
      *
-     * Only a seed phrase yields a spendable account: its spending key is derived on demand
-     * with [ZcashSdk.deriveSpendingKey]. Every other key restores watch-only, and such an
-     * account reports `canSign = false`.
+     * A seed phrase or an imported spending-format key (`xprv`, a Sapling extended spending key)
+     * yields a spending account, reported as `canSign = true`; every other key restores
+     * watch-only (`canSign = false`). Only a seed phrase's spending key can currently be
+     * derived on demand, with [ZcashSdk.deriveSpendingKey].
      *
      * [passphrase] is the BIP-39 passphrase (the "25th word") and applies to a seed phrase
      * only; the same passphrase must be passed to [ZcashSdk.deriveSpendingKey], otherwise
@@ -357,9 +358,10 @@ public class ZcashWallet private constructor(
     /**
      * Signs [transaction] on behalf of [account].
      *
-     * [spendingKey] must belong to [account]: a key derived from another seed or another
-     * account index is rejected, never silently ignored. The SDK stores no spending key, so
-     * holding, passing and wiping these bytes is the caller's job.
+     * [transaction] must be the one [plan] was called on, built for [account] and for the same
+     * set of pools: the signer checks each pool separately and rejects a bundle whose spends the
+     * key does not cover. [spendingKey] must belong to [account]; see [send] for the
+     * key-handling contract.
      */
     public suspend fun sign(
         account: Int,
@@ -404,9 +406,10 @@ public class ZcashWallet private constructor(
      * The full send path: prepare, plan (for its height), sign, extract, broadcast. Returns
      * the txid.
      *
-     * [spendingKey] must belong to [account]: a key derived from another seed or another
-     * account index is rejected, never silently ignored. The SDK stores no spending key, so
-     * holding, passing and wiping these bytes is the caller's job.
+     * [spendingKey] must cover every pool [account] holds a viewing key for: a key from
+     * another seed or account index, and a partial key missing one of the account's pools,
+     * are both rejected rather than signing part of the transaction. The SDK stores no
+     * spending key, so holding, passing and wiping these bytes is the caller's job.
      */
     public suspend fun send(
         account: Int,

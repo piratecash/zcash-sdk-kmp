@@ -102,6 +102,67 @@ public suspend fun ZcashSdk.deriveAddressesFromViewingKey(
 }
 
 /**
+ * The component mask [key] encodes on [network] — transparent, Sapling, Orchard — as a
+ * bitwise-OR of [Pool] bits. This reflects what the key *contains*, not what it can spend from:
+ * a transparent receiver address contains no key material at all and yields [PoolSet.NONE], and
+ * so does anything [ZcashSdk] does not recognize. [Pool.IRONWOOD] never appears in the result:
+ * authority over Ironwood follows Orchard, so a key carrying Orchard carries Ironwood too.
+ *
+ * The very first call blocks while the native library loads, unless [ZcashSdk.initialize] or any
+ * other SDK call already did it.
+ */
+public fun ZcashSdk.keyPools(key: String, network: ZcashNetwork): PoolSet {
+    NativeLibrary.ensureLoadedBlocking()
+    return mapNativeError { PoolSet(ZcashJni.keyPools(network.coin, key)) }
+}
+
+/**
+ * Whether [keyPools] classifies [key] on [network]. Narrower than what
+ * [ZcashWallet.restoreAccount] parses: a single-address transparent secret (WIF, `zpk`) restores
+ * but is not classified here, and neither is a receiver address.
+ */
+public fun ZcashSdk.isValidKey(key: String, network: ZcashNetwork): Boolean =
+    keyPools(key, network) != PoolSet.NONE
+
+/**
+ * [deriveAddresses] and [deriveAddressesFromViewingKey] generalized to every key format
+ * [keyPools] classifies. Only the pools [key] itself carries are populated; every other field of
+ * [Addresses] is `null`. Throws on anything else, so gate the call on [isValidKey].
+ */
+public suspend fun ZcashSdk.deriveAddressesFromKey(key: String, network: ZcashNetwork): Addresses {
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError { parseAddresses(ZcashJni.addressesFromKey(network.coin, key)) }
+    }
+}
+
+/**
+ * Whether [ZcashWallet.restoreAccount] would import [key] as a spending key rather than
+ * watch-only.
+ *
+ * A mnemonic phrase also spends, but through [ZcashWallet.restoreAccount] itself and
+ * [ZcashSdk.deriveSpendingKey] — this predicate names a narrower thing, the set of standalone
+ * key formats accepted as spending material — so it returns `false` for a phrase.
+ */
+public fun ZcashSdk.isSpendingKey(key: String, network: ZcashNetwork): Boolean {
+    NativeLibrary.ensureLoadedBlocking()
+    return mapNativeError { ZcashJni.isSpendingKey(network.coin, key) }
+}
+
+/**
+ * The signing envelope for a standalone spending [key], in the form [ZcashWallet.sign]
+ * takes.
+ *
+ * Accepts exactly the formats [isSpendingKey] reports and throws on anything else, so gate the
+ * call on that predicate. Needs no [ZcashSdk.initialize] and no open wallet, and stores nothing —
+ * the returned bytes are the caller's to hold and to clear.
+ */
+public fun ZcashSdk.importSpendingKey(key: String, network: ZcashNetwork): ByteArray {
+    NativeLibrary.ensureLoadedBlocking()
+    return mapNativeError { ZcashJni.importSpendingKey(network.coin, key) }
+}
+
+/**
  * The kind of [address] on [network], or `null` when it is not a valid address there.
  *
  * Decoding checks the checksum and the network prefix, reads no database and makes no network

@@ -16,11 +16,15 @@ use zstd::DEFAULT_COMPRESSION_LEVEL;
 
 use crate::db::DB_VERSION;
 
+/// First schema version whose backups carry `can_sign`; older ones must re-derive it.
+const CAN_SIGN_DB_VERSION: u16 = 10;
+
 pub async fn export_account(connection: &mut SqliteConnection, account: u32) -> Result<Vec<u8>> {
     info!("Exporting account {}", account);
     let mut io_account = sqlx::query(
         "SELECT id_account, a.name, seed, passphrase, seed_fingerprint, aindex, dindex, def_dindex, icon, birth, position, use_internal, hidden, saved, enabled, internal,
         hw,
+        can_sign,
         f.name
         FROM accounts a
         LEFT JOIN folders f ON a.folder = f.id_folder
@@ -44,7 +48,8 @@ pub async fn export_account(connection: &mut SqliteConnection, account: u32) -> 
             let enabled: bool = row.get(14);
             let internal: bool = row.get(15);
             let hw: u8 = row.get(16);
-            let folder_name: Option<String> = row.get(17);
+            let can_sign: bool = row.get(17);
+            let folder_name: Option<String> = row.get(18);
 
             IOAccount {
                 version: DB_VERSION,
@@ -65,6 +70,7 @@ pub async fn export_account(connection: &mut SqliteConnection, account: u32) -> 
                 enabled,
                 internal,
                 hw,
+                can_sign,
                 folder: folder_name.unwrap_or_default(),
                 ..Default::default()
             }
@@ -546,9 +552,14 @@ pub async fn import_account(connection: &mut SqliteConnection, data: &[u8]) -> R
     }
 
     // Insert the account into the database
+    // A pre-v10 backup has no `can_sign` field (deserialized as `false` via `serde(default)`), so
+    // a phrase account's real value is re-derived from `seed_fingerprint`. From v10 on the stored
+    // flag is authoritative: a watch-only account may carry a fingerprint yet still not spend.
+    let can_sign = io_account.can_sign
+        || (io_account.version < CAN_SIGN_DB_VERSION && io_account.seed_fingerprint.is_some());
     let r = sqlx::query("INSERT INTO accounts
-        (name, seed, passphrase, seed_fingerprint, aindex, dindex, def_dindex, icon, birth, folder, position, use_internal, hidden, saved, enabled, internal, hw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+        (name, seed, passphrase, seed_fingerprint, aindex, dindex, def_dindex, icon, birth, folder, position, use_internal, hidden, saved, enabled, internal, hw, can_sign)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&io_account.name)
         .bind(&io_account.seed)
         .bind(&io_account.passphrase)
@@ -565,6 +576,7 @@ pub async fn import_account(connection: &mut SqliteConnection, data: &[u8]) -> R
         .bind(io_account.enabled)
         .bind(io_account.internal)
         .bind(io_account.hw)
+        .bind(can_sign)
         .execute(&mut *tx)
         .await?;
     let new_id_account = r.last_insert_rowid() as u32;
@@ -869,6 +881,11 @@ pub struct IOAccount {
     pub enabled: bool,
     pub internal: bool,
     pub hw: u8,
+    /// Missing from backups made before this field existed; a v9 backup deserializes it as
+    /// `false`, so `import_account` re-derives the real value from `seed_fingerprint` instead
+    /// of trusting this field alone.
+    #[serde(default)]
+    pub can_sign: bool,
     pub tkeys: Option<IOKeys>,
     pub skeys: Option<IOKeys>,
     pub okeys: Option<IOKeys>,
@@ -1086,5 +1103,135 @@ impl<'r> Decode<'r, Sqlite> for HexBytes {
 impl Type<Sqlite> for HexBytes {
     fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
         <Vec<u8> as Type<Sqlite>>::type_info()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        account::tests::{restore, watch_only_keys},
+        db::{get_account_can_sign, tests::memory_db},
+    };
+
+    fn compress(json: &str) -> Vec<u8> {
+        let mut encoder =
+            zstd::Encoder::new(Vec::new(), DEFAULT_COMPRESSION_LEVEL).expect("encoder");
+        encoder.write_all(json.as_bytes()).expect("write");
+        encoder.finish().expect("finish")
+    }
+
+    /// A backup as produced before `can_sign` existed: the real serializer's output, with the
+    /// field it doesn't know about yet stripped back out.
+    fn v9_backup_json(seed_fingerprint: Option<Vec<u8>>) -> String {
+        let io_account = IOAccount {
+            version: 9,
+            name: "v9".to_string(),
+            seed_fingerprint: seed_fingerprint.map(HexBytes),
+            ..Default::default()
+        };
+        let mut value = serde_json::to_value(&io_account).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("can_sign")
+            .expect("v9 fixture must not already contain can_sign");
+        serde_json::to_string(&value).expect("json")
+    }
+
+    #[tokio::test]
+    async fn export_import_account_round_trip_preserves_can_sign() {
+        // An imported xprv has no seed_fingerprint, so this proves `can_sign` itself
+        // round-trips rather than `import_account`'s seed_fingerprint fallback masking it.
+        let tprv = watch_only_keys()
+            .into_iter()
+            .find(|k| k.label == "tprv")
+            .expect("tprv vector");
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, &tprv.key, 0, None)
+            .await
+            .expect("restore");
+
+        let data = export_account(&mut connection, account)
+            .await
+            .expect("export");
+
+        let mut target = memory_db().await;
+        import_account(&mut target, &data).await.expect("import");
+        let imported_account: u32 = sqlx::query_scalar("SELECT id_account FROM accounts")
+            .fetch_one(&mut target)
+            .await
+            .expect("imported account");
+
+        assert!(get_account_can_sign(&mut target, imported_account)
+            .await
+            .expect("can sign"));
+    }
+
+    #[tokio::test]
+    async fn import_account_v9_backup_derives_can_sign_from_seed_fingerprint() {
+        for (seed_fingerprint, expected) in [(Some(vec![1u8, 2]), true), (None, false)] {
+            let mut connection = memory_db().await;
+            let json = v9_backup_json(seed_fingerprint);
+
+            import_account(&mut connection, &compress(&json))
+                .await
+                .expect("import v9 backup");
+
+            let account: u32 = sqlx::query_scalar("SELECT id_account FROM accounts")
+                .fetch_one(&mut connection)
+                .await
+                .expect("account");
+            assert_eq!(
+                get_account_can_sign(&mut connection, account)
+                    .await
+                    .expect("can sign"),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_account_v10_backup_trusts_can_sign_over_seed_fingerprint() {
+        // A watch-only account restored from a viewing key of a known seed keeps its fingerprint;
+        // from v10 on the stored flag decides, so it must not regain the ability to spend.
+        let io_account = IOAccount {
+            version: DB_VERSION,
+            name: "v10".to_string(),
+            seed_fingerprint: Some(HexBytes(vec![1u8, 2])),
+            can_sign: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&io_account).expect("json");
+        let mut connection = memory_db().await;
+
+        import_account(&mut connection, &compress(&json))
+            .await
+            .expect("import v10 backup");
+
+        let account: u32 = sqlx::query_scalar("SELECT id_account FROM accounts")
+            .fetch_one(&mut connection)
+            .await
+            .expect("account");
+        assert!(!get_account_can_sign(&mut connection, account)
+            .await
+            .expect("can sign"));
+    }
+
+    #[tokio::test]
+    async fn import_account_rejects_a_backup_from_a_newer_app_version() {
+        let mut connection = memory_db().await;
+        let io_account = IOAccount {
+            version: DB_VERSION + 1,
+            name: "future".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&io_account).expect("json");
+
+        let error = import_account(&mut connection, &compress(&json))
+            .await
+            .expect_err("newer backup must be rejected");
+
+        assert!(error.to_string().contains("Please update"), "{error}");
     }
 }
