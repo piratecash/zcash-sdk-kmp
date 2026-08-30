@@ -1085,6 +1085,12 @@ mod tests {
         assert!(account("key", 100).use_internal);
     }
 
+    /// Pins the guard that keeps `rlz::recover::recover_ledger_seed` off every bridge path.
+    #[test]
+    fn build_new_account_never_requests_ledger() {
+        assert!(!account("key", 100).ledger);
+    }
+
     #[test]
     fn build_new_account_maps_the_bridge_arguments() {
         let account = account("key", 100);

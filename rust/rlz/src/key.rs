@@ -6,7 +6,7 @@ use bech32::Hrp;
 use bip32::{
     ChildNumber, ExtendedKey, ExtendedKeyAttrs, ExtendedPrivateKey, ExtendedPublicKey, Prefix,
 };
-use bip39::Mnemonic;
+use bip39::{Language, Mnemonic};
 use secp256k1::{PublicKey, SecretKey};
 use sqlx::SqliteConnection;
 use zcash_address::unified::{Encoding as _, Fvk, Ufvk};
@@ -87,9 +87,22 @@ pub async fn get_account_ufvk(
     Ok(ufvk.encode(network))
 }
 
+/// Auto-detection rejects a phrase whose every word exists in two wordlists
+/// (EN/FR share 100 words, the two Chinese lists 1275), so try each language in
+/// turn, English first, instead of `Mnemonic::parse`.
+/// Never call `to_entropy()` on the result: it panics on an ambiguous phrase.
+pub(crate) fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, bip39::Error> {
+    match Mnemonic::parse_in(Language::English, phrase) {
+        Ok(mnemonic) => Ok(mnemonic),
+        Err(english_error) => Language::ALL
+            .iter()
+            .find_map(|&language| Mnemonic::parse_in(language, phrase).ok())
+            .ok_or(english_error),
+    }
+}
+
 pub fn is_valid_phrase(phrase: &str) -> bool {
-    let mnemonic = Mnemonic::parse(phrase);
-    mnemonic.is_ok()
+    parse_mnemonic(phrase).is_ok()
 }
 
 /// The BIP-32 versions a Zcash transparent extended key carries on `network`: private, public.
@@ -162,4 +175,89 @@ pub fn is_valid_ufvk(network: &Network, key: &str) -> bool {
 
 pub fn is_valid_transparent_address(network: &Network, address: &str) -> bool {
     TransparentAddress::decode(network, address).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Identical word sequence in both Chinese lists: the 1275 shared words sit at
+    /// identical indices, so the derived key cannot depend on which list won.
+    const CHINESE_ZERO_ENTROPY: &str = "的 的 的 的 的 的 的 的 的 的 的 在";
+
+    /// The canonical all-zero-entropy 12-word phrase of every enabled wordlist,
+    /// generated once from the vendored lists.
+    const ZERO_ENTROPY_PHRASES: [(&str, &str); 10] = [
+        ("english", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"),
+        ("chinese_simplified", CHINESE_ZERO_ENTROPY),
+        ("chinese_traditional", CHINESE_ZERO_ENTROPY),
+        ("czech", "abdikace abdikace abdikace abdikace abdikace abdikace abdikace abdikace abdikace abdikace abdikace agrese"),
+        ("french", "abaisser abaisser abaisser abaisser abaisser abaisser abaisser abaisser abaisser abaisser abaisser abeille"),
+        ("italian", "abaco abaco abaco abaco abaco abaco abaco abaco abaco abaco abaco abete"),
+        ("japanese", "あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あおぞら"),
+        ("korean", "가격 가격 가격 가격 가격 가격 가격 가격 가격 가격 가격 가능"),
+        ("portuguese", "abacate abacate abacate abacate abacate abacate abacate abacate abacate abacate abacate abater"),
+        ("spanish", "ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco abierto"),
+    ];
+
+    const ENGLISH_ZERO_ENTROPY: &str = ZERO_ENTROPY_PHRASES[0].1;
+
+    /// Every word lies in the 100-word English ∩ French intersection and the English
+    /// checksum closes, so auto-detection cannot resolve it.
+    const SHARED_WITH_FRENCH: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon angle";
+
+    #[test]
+    fn parse_mnemonic_every_enabled_language_is_accepted() {
+        for (language, phrase) in ZERO_ENTROPY_PHRASES {
+            assert!(
+                parse_mnemonic(phrase).is_ok(),
+                "{language}: {:?}",
+                parse_mnemonic(phrase).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn is_valid_phrase_every_enabled_language_is_true() {
+        for (language, phrase) in ZERO_ENTROPY_PHRASES {
+            assert!(is_valid_phrase(phrase), "{language}");
+        }
+    }
+
+    #[test]
+    fn parse_mnemonic_chinese_shared_words_phrase_derives_the_canonical_seed() {
+        let mnemonic = parse_mnemonic(CHINESE_ZERO_ENTROPY).expect("chinese phrase");
+
+        assert_eq!(
+            mnemonic.words().collect::<Vec<_>>(),
+            CHINESE_ZERO_ENTROPY.split(' ').collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hex::encode(mnemonic.to_seed("")),
+            "c015b86e4b208402bb0bdd0febb746708b869bb6e433cb227fd66d444f3ccdc3\
+             60fee9ca9271014c2a684df380fcc40bd80a37eaa41a8061a52a18d319cdd899"
+        );
+    }
+
+    #[test]
+    fn parse_mnemonic_words_shared_with_french_resolves_as_english() {
+        let mnemonic = parse_mnemonic(SHARED_WITH_FRENCH).expect("shared phrase");
+
+        assert_eq!(
+            hex::encode(mnemonic.to_seed("")),
+            "363fa97e18a32da4b42d81131f4c82eda56a7bd484df6a5f004a35decc52d6c6\
+             d21a45e377a7e698959bf48d73107ae389aeda70273dbfb15a04968c50093862"
+        );
+    }
+
+    #[test]
+    fn is_valid_phrase_english_phrase_is_true() {
+        assert!(is_valid_phrase(ENGLISH_ZERO_ENTROPY));
+    }
+
+    #[test]
+    fn is_valid_phrase_garbage_is_false() {
+        assert!(!is_valid_phrase("not a mnemonic at all"));
+    }
 }

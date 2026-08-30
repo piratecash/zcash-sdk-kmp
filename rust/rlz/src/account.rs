@@ -71,7 +71,7 @@ fn usk_from_phrase(
     passphrase: &str,
     aindex: AccountId,
 ) -> Result<(UnifiedSpendingKey, SeedFingerprint)> {
-    let seed = bip39::Mnemonic::from_str(phrase)?.to_seed(passphrase);
+    let seed = crate::key::parse_mnemonic(phrase)?.to_seed(passphrase);
     let usk = UnifiedSpendingKey::from_seed(network, &seed, aindex)?;
     let fingerprint =
         SeedFingerprint::from_seed(&seed).ok_or_else(|| anyhow!("invalid seed length"))?;
@@ -1678,6 +1678,49 @@ pub(crate) mod tests {
     #[test]
     fn derive_spending_key_account_index_out_of_range_errors() {
         assert!(derive_spending_key(&Network::Main, TEST_PHRASE, None, 0x8000_0000).is_err());
+    }
+
+    /// Zero-entropy vectors from the Spanish and both Chinese wordlists, generated once
+    /// from the lists themselves. The Chinese one is the ambiguous class: its twelve words
+    /// exist in both Chinese lists, at identical indices.
+    const SPANISH_TEST_PHRASE: &str =
+        "ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco ábaco abierto";
+    const CHINESE_TEST_PHRASE: &str = "的 的 的 的 的 的 的 的 的 的 的 在";
+
+    /// Computed outside this crate from the published BIP-39 vector.
+    const TEST_PHRASE_SEED: &str =
+        "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1\
+         9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
+    const TEST_PHRASE_SEED_FINGERPRINT: &str =
+        "21ed3d7882c7e37fe012b54a6408048048cb09782d4b2938617da793ccd27815";
+
+    fn usk_and_fingerprint(phrase: &str) -> Result<(UnifiedSpendingKey, SeedFingerprint)> {
+        let aindex = AccountId::try_from(0u32).expect("account index");
+        usk_from_phrase(&Network::Main, phrase, "", aindex)
+    }
+
+    #[test]
+    fn usk_from_phrase_spanish_phrase_derives_a_key() {
+        assert!(usk_and_fingerprint(SPANISH_TEST_PHRASE).is_ok());
+    }
+
+    #[test]
+    fn usk_from_phrase_chinese_shared_words_phrase_derives_a_key() {
+        assert!(usk_and_fingerprint(CHINESE_TEST_PHRASE).is_ok());
+    }
+
+    #[test]
+    fn usk_from_phrase_english_phrase_pins_seed_and_fingerprint() {
+        let seed = crate::key::parse_mnemonic(TEST_PHRASE)
+            .expect("english phrase")
+            .to_seed("");
+        let (_, fingerprint) = usk_and_fingerprint(TEST_PHRASE).expect("usk");
+
+        assert_eq!(hex::encode(seed), TEST_PHRASE_SEED);
+        assert_eq!(
+            hex::encode(fingerprint.to_bytes()),
+            TEST_PHRASE_SEED_FINGERPRINT
+        );
     }
 
     #[tokio::test]
