@@ -29,6 +29,15 @@ pub fn derive_spending_key(
     account::derive_spending_key(&network_from_coin(coin), phrase, passphrase, aindex)
 }
 
+/// Hosts that export the transparent account key (m/44'/<coin>'/0') derive it here.
+pub fn derive_transparent_account_key(
+    coin: u8,
+    phrase: &str,
+    passphrase: Option<&str>,
+) -> Result<String> {
+    account::derive_transparent_account_key(&network_from_coin(coin), phrase, passphrase)
+}
+
 #[cfg_attr(feature = "flutter", frb(sync))]
 pub fn is_valid_phrase(phrase: &str) -> bool {
     crate::key::is_valid_phrase(phrase)

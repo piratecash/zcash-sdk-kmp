@@ -106,7 +106,7 @@ pub fn is_valid_phrase(phrase: &str) -> bool {
 }
 
 /// The BIP-32 versions a Zcash transparent extended key carries on `network`: private, public.
-fn transparent_prefixes(network: &Network) -> (Prefix, Prefix) {
+pub(crate) fn transparent_prefixes(network: &Network) -> (Prefix, Prefix) {
     match network {
         Network::Main => (Prefix::XPRV, Prefix::XPUB),
         _ => (Prefix::TPRV, Prefix::TPUB),

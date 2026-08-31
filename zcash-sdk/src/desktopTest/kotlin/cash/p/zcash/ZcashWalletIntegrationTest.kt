@@ -345,6 +345,33 @@ class ZcashWalletIntegrationTest {
         }
 
     @Test
+    fun deriveTransparentAccountKey_withoutOpeningAWallet_isTheKnownAccountXprv() = runBlocking {
+        assertEquals(TEST_XPRV, ZcashSdk.deriveTransparentAccountKey(TEST_PHRASE, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun deriveTransparentAccountKey_bip39Passphrase_yieldsADifferentKeyThanWithoutOne() =
+        runBlocking {
+            val peppered =
+                ZcashSdk.deriveTransparentAccountKey(
+                    TEST_PHRASE,
+                    ZcashNetwork.MAIN,
+                    passphrase = TEST_PASSPHRASE,
+                )
+
+            assertNotEquals(TEST_XPRV, peppered)
+            assertTrue(ZcashSdk.isSpendingKey(peppered, ZcashNetwork.MAIN))
+        }
+
+    @Test
+    fun deriveTransparentAccountKey_blankPhrase_failsBeforeTheNativeCall() = runBlocking {
+        assertFailsWith<IllegalArgumentException> {
+            ZcashSdk.deriveTransparentAccountKey("   ", ZcashNetwork.MAIN)
+        }
+        Unit
+    }
+
+    @Test
     fun deriveSpendingKey_invalidPhrase_failsWithAZcashException() = runBlocking {
         assertFailsWith<ZcashException> {
             ZcashSdk.deriveSpendingKey("not a seed phrase", ZcashNetwork.MAIN)

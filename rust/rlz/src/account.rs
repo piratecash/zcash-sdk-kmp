@@ -92,6 +92,27 @@ pub(crate) fn derive_spending_key(
     Ok(usk.to_bytes(Era::Orchard))
 }
 
+/// Account-level transparent key (m/44'/<coin>'/0') — the form an external wallet imports.
+/// Derived outside the database: the SDK never stores it.
+pub(crate) fn derive_transparent_account_key(
+    network: &Network,
+    phrase: &str,
+    passphrase: Option<&str>,
+) -> Result<String> {
+    let (usk, _) = usk_from_phrase(
+        network,
+        phrase,
+        passphrase.unwrap_or_default(),
+        AccountId::ZERO,
+    )?;
+
+    let (xprv_prefix, _) = crate::key::transparent_prefixes(network);
+    let mut bytes = xprv_prefix.to_bytes().to_vec();
+    bytes.extend_from_slice(&usk.transparent().to_bytes());
+
+    Ok(bs58::encode(bytes).with_check().into_string())
+}
+
 /// Derives the account's unified full viewing key outside the database — the address it
 /// yields is the one the account reports once it is restored from the same phrase.
 pub(crate) fn derive_ufvk(
@@ -1680,6 +1701,79 @@ pub(crate) mod tests {
         assert!(derive_spending_key(&Network::Main, TEST_PHRASE, None, 0x8000_0000).is_err());
     }
 
+    /// The external address at dindex 0 that a transparent account key controls.
+    fn account_key_taddr(tvk: &AccountPubKey) -> String {
+        let (_, address) = derive_transparent_address(tvk, 0, 0, false).expect("address");
+        address.encode(&Network::Main)
+    }
+
+    /// The same address, reached through the import path an external wallet would use.
+    fn imported_taddr(xprv: &str) -> String {
+        let xsk = ExtendedPrivateKey::<SecretKey>::from_str(xprv).expect("xprv");
+        account_key_taddr(&AccountPrivKey::from_extended_privkey(xsk).to_account_pubkey())
+    }
+
+    fn exported_account_key(phrase: &str, passphrase: Option<&str>) -> String {
+        derive_transparent_account_key(&Network::Main, phrase, passphrase).expect("derive")
+    }
+
+    #[test]
+    fn derive_transparent_account_key_controls_the_accounts_own_transparent_address() {
+        let exported = exported_account_key(TEST_PHRASE, None);
+
+        assert_eq!(
+            imported_taddr(&exported),
+            account_key_taddr(&test_usk(0).transparent().to_account_pubkey())
+        );
+    }
+
+    #[test]
+    fn derive_transparent_account_key_matches_the_hand_derived_bip44_node() {
+        assert_eq!(exported_account_key(TEST_PHRASE, None), account_xprv());
+    }
+
+    #[test]
+    fn derive_transparent_account_key_is_importable_as_an_account_xprv() {
+        assert!(is_account_xprv(
+            &Network::Main,
+            &exported_account_key(TEST_PHRASE, None)
+        ));
+    }
+
+    #[test]
+    fn derive_transparent_account_key_non_english_phrase_controls_its_own_address() {
+        for phrase in [SPANISH_TEST_PHRASE, CHINESE_TEST_PHRASE] {
+            let (usk, _) = usk_and_fingerprint(phrase).expect("usk");
+
+            assert_eq!(
+                imported_taddr(&exported_account_key(phrase, None)),
+                account_key_taddr(&usk.transparent().to_account_pubkey()),
+                "{phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_transparent_account_key_testnet_uses_coin_type_1_and_the_testnet_prefix() {
+        let exported =
+            derive_transparent_account_key(&Network::Test, TEST_PHRASE, None).expect("derive");
+
+        assert_eq!(exported, account_key(1).to_string(Prefix::TPRV).to_string());
+    }
+
+    #[test]
+    fn derive_transparent_account_key_passphrase_controls_the_passphrased_address() {
+        let peppered = exported_account_key(TEST_PHRASE, Some("pepper"));
+        let (usk, _) =
+            usk_from_phrase(&Network::Main, TEST_PHRASE, "pepper", AccountId::ZERO).expect("usk");
+
+        assert_ne!(peppered, exported_account_key(TEST_PHRASE, None));
+        assert_eq!(
+            imported_taddr(&peppered),
+            account_key_taddr(&usk.transparent().to_account_pubkey())
+        );
+    }
+
     /// Zero-entropy vectors from the Spanish and both Chinese wordlists, generated once
     /// from the lists themselves. The Chinese one is the ambiguous class: its twelve words
     /// exist in both Chinese lists, at identical indices.
@@ -1851,15 +1945,15 @@ pub(crate) mod tests {
     }
     /// Account-level transparent key (m/44'/133'/0') — the form an external wallet exports.
     pub(crate) fn account_xprv() -> String {
-        account_key().to_string(Prefix::XPRV).to_string()
+        account_key(133).to_string(Prefix::XPRV).to_string()
     }
 
-    fn account_key() -> ExtendedPrivateKey<SecretKey> {
+    fn account_key(coin: u32) -> ExtendedPrivateKey<SecretKey> {
         let seed = bip39::Mnemonic::from_str(TEST_PHRASE)
             .expect("phrase")
             .to_seed("");
         let mut key = ExtendedPrivateKey::<SecretKey>::new(seed).expect("master");
-        for index in [44u32, 133, 0] {
+        for index in [44u32, coin, 0] {
             key = key
                 .derive_child(ChildNumber::new(index, true).expect("child number"))
                 .expect("derive");
@@ -1873,7 +1967,7 @@ pub(crate) mod tests {
         const LTPV: Prefix = Prefix::from_parts_unchecked("Ltpv", 0x019d9cfe);
         const LTUB: Prefix = Prefix::from_parts_unchecked("Ltub", 0x019da462);
 
-        let key = account_key();
+        let key = account_key(133);
         let private = |prefix| key.to_string(prefix).to_string();
         let public = |prefix| key.public_key().to_extended_key(prefix).to_string();
 

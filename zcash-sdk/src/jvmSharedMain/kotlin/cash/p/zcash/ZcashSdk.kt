@@ -64,6 +64,29 @@ public suspend fun ZcashSdk.deriveSpendingKey(
 }
 
 /**
+ * Derives the account-level transparent extended private key (`m/44'/<coin>'/0'`) of the wallet
+ * [phrase] describes — the one key that covers every transparent address of the account, in the
+ * form another wallet imports.
+ *
+ * Needs no [ZcashSdk.initialize] and no open wallet: nothing is read from or written to a
+ * database. The key is returned to the caller and never kept by the SDK.
+ *
+ * [passphrase] is the BIP-39 passphrase (the "25th word") and must match the one the account
+ * was restored with, otherwise the key belongs to a different wallet.
+ */
+public suspend fun ZcashSdk.deriveTransparentAccountKey(
+    phrase: String,
+    network: ZcashNetwork,
+    passphrase: String? = null,
+): String {
+    require(phrase.isNotBlank()) { "Phrase must not be blank" }
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError { ZcashJni.deriveTransparentAccountKey(network.coin, phrase, passphrase) }
+    }
+}
+
+/**
  * Every address of [accountIndex] for the wallet [phrase] describes.
  *
  * Needs no [ZcashSdk.initialize] and no open wallet, so a receive screen can show an address

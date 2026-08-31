@@ -112,6 +112,13 @@ internal object ZcashJni {
     ): ByteArray
 
     /** Stateless: needs no open wallet. */
+    external fun deriveTransparentAccountKey(
+        coin: Byte,
+        phrase: String,
+        passphrase: String?,
+    ): String
+
+    /** Stateless: needs no open wallet. */
     external fun generateSeedPhrase(): String
 
     /** Stateless: needs no open wallet. */
