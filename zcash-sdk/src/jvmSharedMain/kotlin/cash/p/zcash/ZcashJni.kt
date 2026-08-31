@@ -119,6 +119,9 @@ internal object ZcashJni {
     ): String
 
     /** Stateless: needs no open wallet. */
+    external fun deriveSaplingViewingKey(coin: Byte, key: String): String?
+
+    /** Stateless: needs no open wallet. */
     external fun generateSeedPhrase(): String
 
     /** Stateless: needs no open wallet. */

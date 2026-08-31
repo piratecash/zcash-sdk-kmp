@@ -7,7 +7,7 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use crate::{
     account,
     api::coin::{network_from_coin, Coin, Network},
-    key::{is_valid_sapling_key, is_valid_transparent_key},
+    key::{is_valid_sapling_key, is_valid_transparent_key, sapling_viewing_key},
     pay::signing_key::{encode_sapling, encode_transparent},
 };
 
@@ -36,6 +36,12 @@ pub fn derive_transparent_account_key(
     passphrase: Option<&str>,
 ) -> Result<String> {
     account::derive_transparent_account_key(&network_from_coin(coin), phrase, passphrase)
+}
+
+/// Hosts that hold only a Sapling spending key derive its viewing counterpart here. `None` means
+/// only "not a Sapling extended spending key of this network" — every coin byte is a valid input.
+pub fn derive_sapling_viewing_key(coin: u8, key: &str) -> Option<String> {
+    sapling_viewing_key(&network_from_coin(coin), key)
 }
 
 #[cfg_attr(feature = "flutter", frb(sync))]

@@ -11,7 +11,10 @@ use secp256k1::{PublicKey, SecretKey};
 use sqlx::SqliteConnection;
 use zcash_address::unified::{Encoding as _, Fvk, Ufvk};
 use zcash_keys::{
-    encoding::{decode_extended_full_viewing_key, decode_extended_spending_key, AddressCodec as _},
+    encoding::{
+        decode_extended_full_viewing_key, decode_extended_spending_key,
+        encode_extended_full_viewing_key, AddressCodec as _,
+    },
     keys::UnifiedFullViewingKey,
 };
 use zcash_protocol::consensus::NetworkConstants as _;
@@ -143,6 +146,20 @@ pub fn is_sapling_efvk(network: &Network, key: &str) -> bool {
     decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), key).is_ok()
 }
 
+/// The Sapling extended full viewing key for a Sapling extended spending key on `network`, or
+/// `None` when `key` does not decode as one.
+pub fn sapling_viewing_key(network: &Network, key: &str) -> Option<String> {
+    let esk =
+        decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), key).ok()?;
+    // The zxviews encoding needs the extended form; a DFVK drops depth/tag/child index/chain code.
+    #[allow(deprecated)]
+    let efvk = esk.to_extended_full_viewing_key();
+    Some(encode_extended_full_viewing_key(
+        network.hrp_sapling_extended_full_viewing_key(),
+        &efvk,
+    ))
+}
+
 pub fn is_valid_transparent_key(network: &Network, key: &str) -> bool {
     if bip38::import_tsk(key).is_ok() {
         return true;
@@ -259,5 +276,53 @@ mod tests {
     #[test]
     fn is_valid_phrase_garbage_is_false() {
         assert!(!is_valid_phrase("not a mnemonic at all"));
+    }
+
+    fn account_esk(network: &Network) -> String {
+        use zcash_keys::encoding::encode_extended_spending_key;
+
+        encode_extended_spending_key(
+            network.hrp_sapling_extended_spending_key(),
+            crate::account::tests::test_usk(0).sapling(),
+        )
+    }
+
+    #[test]
+    fn sapling_viewing_key_published_test_vector_derives_the_expected_efvk() {
+        let network = Network::Main;
+
+        let efvk = sapling_viewing_key(&network, &account_esk(&network)).expect("derives");
+
+        assert_eq!(efvk, crate::account::tests::account_efvk());
+    }
+
+    #[test]
+    fn sapling_viewing_key_result_is_a_valid_sapling_efvk() {
+        let network = Network::Main;
+
+        let efvk = sapling_viewing_key(&network, &account_esk(&network)).expect("derives");
+
+        assert!(is_sapling_efvk(&network, &efvk));
+    }
+
+    #[test]
+    fn sapling_viewing_key_non_esk_inputs_return_none() {
+        let network = Network::Main;
+        let efvk = crate::account::tests::account_efvk();
+        let xprv = crate::account::tests::watch_only_keys()
+            .into_iter()
+            .find(|k| k.label == "tprv")
+            .expect("xprv fixture")
+            .key;
+
+        for (label, key) in [
+            ("testnet esk on mainnet", account_esk(&Network::Test)),
+            ("efvk", efvk),
+            ("xprv", xprv),
+            ("empty", String::new()),
+            ("garbage", "not a key".to_string()),
+        ] {
+            assert!(sapling_viewing_key(&network, &key).is_none(), "{label}");
+        }
     }
 }

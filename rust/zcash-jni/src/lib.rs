@@ -25,8 +25,8 @@ use rlz::api::account::{
 };
 use rlz::api::coin::{init_datadir, Coin};
 use rlz::api::key::{
-    derive_spending_key, derive_transparent_account_key, generate_seed, get_key_pools,
-    import_spending_key, is_spending_key,
+    derive_sapling_viewing_key, derive_spending_key, derive_transparent_account_key, generate_seed,
+    get_key_pools, import_spending_key, is_spending_key,
 };
 use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::get_current_height;
@@ -956,6 +956,25 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_deriveTransparentAccountKey<'l
                 passphrase.as_deref(),
             )?);
             Ok(env.new_string(key.as_str())?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: needs no open wallet.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_deriveSaplingViewingKey<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    key: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let key = Zeroizing::new(key.try_to_string(env)?);
+            match derive_sapling_viewing_key(coin as u8, &key) {
+                Some(viewing_key) => Ok(env.new_string(viewing_key)?),
+                None => Ok(JString::default()),
+            }
         })
         .resolve::<ThrowNativeError>()
 }

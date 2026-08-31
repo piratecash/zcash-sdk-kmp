@@ -610,6 +610,30 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun deriveSaplingViewingKey_publishedTestVector_derivesTheExpectedEfvk() = runBlocking {
+        assertEquals(
+            TEST_SAPLING_EFVK,
+            ZcashSdk.deriveSaplingViewingKey(TEST_SAPLING_ESK, ZcashNetwork.MAIN),
+        )
+    }
+
+    @Test
+    fun deriveSaplingViewingKey_derivedKey_yieldsTheSameSaplingAddressAsTheSpendingKey() = runBlocking {
+        val viewingKey = assertNotNull(ZcashSdk.deriveSaplingViewingKey(TEST_SAPLING_ESK, ZcashNetwork.MAIN))
+
+        val fromSpendingKey = ZcashSdk.deriveAddressesFromKey(TEST_SAPLING_ESK, ZcashNetwork.MAIN)
+        val fromViewingKey = ZcashSdk.deriveAddressesFromKey(viewingKey, ZcashNetwork.MAIN)
+
+        assertEquals(fromSpendingKey.sapling, fromViewingKey.sapling)
+    }
+
+    @Test
+    fun deriveSaplingViewingKey_blankOrViewingKeyInput_isNull() = runBlocking {
+        assertNull(ZcashSdk.deriveSaplingViewingKey("", ZcashNetwork.MAIN))
+        assertNull(ZcashSdk.deriveSaplingViewingKey(TEST_SAPLING_EFVK, ZcashNetwork.MAIN))
+    }
+
+    @Test
     fun addressKind_validAddresses_areClassifiedWithoutAWalletOrACoroutine() {
         assertEquals(
             ZcashAddressKind.TRANSPARENT,

@@ -87,6 +87,24 @@ public suspend fun ZcashSdk.deriveTransparentAccountKey(
 }
 
 /**
+ * The Sapling viewing key for [spendingKey] on [network], or `null` when it is not a Sapling
+ * extended spending key there.
+ *
+ * Needs no [ZcashSdk.initialize] and no open wallet: the derivation is offline and stateless,
+ * nothing is read from or written to a database.
+ */
+public suspend fun ZcashSdk.deriveSaplingViewingKey(
+    spendingKey: String,
+    network: ZcashNetwork,
+): String? {
+    if (spendingKey.isBlank()) return null
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError { ZcashJni.deriveSaplingViewingKey(network.coin, spendingKey) }
+    }
+}
+
+/**
  * Every address of [accountIndex] for the wallet [phrase] describes.
  *
  * Needs no [ZcashSdk.initialize] and no open wallet, so a receive screen can show an address
