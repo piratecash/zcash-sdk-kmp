@@ -119,6 +119,13 @@ internal object ZcashJni {
     ): String
 
     /** Stateless: needs no open wallet. */
+    external fun deriveUfvk(
+        coin: Byte,
+        phrase: String,
+        passphrase: String?,
+    ): String
+
+    /** Stateless: needs no open wallet. */
     external fun deriveSaplingViewingKey(coin: Byte, key: String): String?
 
     /** Stateless: needs no open wallet. */

@@ -372,6 +372,30 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun deriveUfvk_withoutOpeningAWallet_matchesTheUfvkOfTheAccountRestoredFromTheSamePhrase() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            assertEquals(wallet.viewingKey(id), ZcashSdk.deriveUfvk(TEST_PHRASE, ZcashNetwork.MAIN))
+        }
+
+    @Test
+    fun deriveUfvk_bip39Passphrase_yieldsADifferentKeyThanWithoutOne() = runBlocking {
+        val plain = ZcashSdk.deriveUfvk(TEST_PHRASE, ZcashNetwork.MAIN)
+
+        assertNotEquals(
+            plain,
+            ZcashSdk.deriveUfvk(TEST_PHRASE, ZcashNetwork.MAIN, passphrase = TEST_PASSPHRASE),
+        )
+    }
+
+    @Test
+    fun deriveUfvk_blankPhrase_failsBeforeTheNativeCall() = runBlocking {
+        assertFailsWith<IllegalArgumentException> { ZcashSdk.deriveUfvk("   ", ZcashNetwork.MAIN) }
+        Unit
+    }
+
+    @Test
     fun deriveSpendingKey_invalidPhrase_failsWithAZcashException() = runBlocking {
         assertFailsWith<ZcashException> {
             ZcashSdk.deriveSpendingKey("not a seed phrase", ZcashNetwork.MAIN)

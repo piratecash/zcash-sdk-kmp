@@ -25,8 +25,8 @@ use rlz::api::account::{
 };
 use rlz::api::coin::{init_datadir, Coin};
 use rlz::api::key::{
-    derive_sapling_viewing_key, derive_spending_key, derive_transparent_account_key, generate_seed,
-    get_key_pools, import_spending_key, is_spending_key,
+    derive_sapling_viewing_key, derive_spending_key, derive_transparent_account_key, derive_ufvk,
+    generate_seed, get_key_pools, import_spending_key, is_spending_key,
 };
 use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::get_current_height;
@@ -955,6 +955,25 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_deriveTransparentAccountKey<'l
                 &phrase,
                 passphrase.as_deref(),
             )?);
+            Ok(env.new_string(key.as_str())?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: no database is opened, nothing is stored. The caller owns the key.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_deriveUfvk<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    phrase: JString<'local>,
+    passphrase: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let phrase = Zeroizing::new(phrase.try_to_string(env)?);
+            let passphrase = Zeroizing::new(optional_string(&passphrase, env)?);
+            let key = Zeroizing::new(derive_ufvk(coin as u8, &phrase, passphrase.as_deref())?);
             Ok(env.new_string(key.as_str())?)
         })
         .resolve::<ThrowNativeError>()

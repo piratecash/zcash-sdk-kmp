@@ -87,6 +87,28 @@ public suspend fun ZcashSdk.deriveTransparentAccountKey(
 }
 
 /**
+ * Derives the unified full viewing key of account 0 of the wallet [phrase] describes — the
+ * watch-only key that sees every pool of the account and holds no spending material.
+ *
+ * Needs no [ZcashSdk.initialize] and no open wallet: nothing is read from or written to a
+ * database. The key is returned to the caller and never kept by the SDK.
+ *
+ * [passphrase] is the BIP-39 passphrase (the "25th word") and must match the one the account
+ * was restored with, otherwise the key belongs to a different wallet.
+ */
+public suspend fun ZcashSdk.deriveUfvk(
+    phrase: String,
+    network: ZcashNetwork,
+    passphrase: String? = null,
+): String {
+    require(phrase.isNotBlank()) { "Phrase must not be blank" }
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError { ZcashJni.deriveUfvk(network.coin, phrase, passphrase) }
+    }
+}
+
+/**
  * The Sapling viewing key for [spendingKey] on [network], or `null` when it is not a Sapling
  * extended spending key there.
  *

@@ -38,6 +38,11 @@ pub fn derive_transparent_account_key(
     account::derive_transparent_account_key(&network_from_coin(coin), phrase, passphrase)
 }
 
+/// Hosts that show a watch-only key for a phrase-backed account derive it here.
+pub fn derive_ufvk(coin: u8, phrase: &str, passphrase: Option<&str>) -> Result<String> {
+    account::derive_ufvk(&network_from_coin(coin), phrase, passphrase, 0)
+}
+
 /// Hosts that hold only a Sapling spending key derive its viewing counterpart here. `None` means
 /// only "not a Sapling extended spending key of this network" — every coin byte is a valid input.
 pub fn derive_sapling_viewing_key(coin: u8, key: &str) -> Option<String> {
@@ -384,5 +389,13 @@ mod tests {
             SigningKey::decode(&sapling).ok(),
             Some(SigningKey::Sapling(_))
         ));
+    }
+
+    #[test]
+    fn derive_ufvk_at_the_api_layer_matches_the_account_layer_at_index_zero() {
+        assert_eq!(
+            derive_ufvk(MAIN, TEST_PHRASE, None).expect("api"),
+            account::derive_ufvk(&Network::Main, TEST_PHRASE, None, 0).expect("account")
+        );
     }
 }
