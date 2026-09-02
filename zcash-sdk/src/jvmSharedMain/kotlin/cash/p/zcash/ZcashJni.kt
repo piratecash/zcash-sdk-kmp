@@ -92,9 +92,20 @@ internal object ZcashJni {
         recipientPaysFee: Boolean,
         smartTransparent: Boolean,
         confirmations: Int,
+        hardwareSigning: Boolean,
     ): ByteArray
 
     external fun transactionPlan(handle: Long, pkg: ByteArray): String
+
+    /** Stateless: needs no open wallet. The JSON payload an external signer (e.g. Trezor) reviews and signs. */
+    external fun transparentSigningRequest(coin: Byte, pkg: ByteArray): String
+
+    /** Stateless: needs no open wallet. Applies device-produced signatures and finalizes the transparent bundle. */
+    external fun applyTransparentSignatures(
+        pkg: ByteArray,
+        indices: IntArray,
+        sigs: Array<ByteArray>,
+    ): ByteArray
 
     external fun signTransaction(
         handle: Long,
@@ -144,6 +155,9 @@ internal object ZcashJni {
 
     /** Stateless: needs no open wallet. Returns `"invalid"` rather than throwing. */
     external fun addressKind(coin: Byte, address: String): String
+
+    /** Stateless: needs no open wallet. Which receiver kinds [address] carries. */
+    external fun addressReceivers(coin: Byte, address: String): String
 
     /** Stateless: needs no open wallet. The component mask `key` encodes, not spendable pools. */
     external fun keyPools(coin: Byte, key: String): Int

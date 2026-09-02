@@ -36,6 +36,27 @@ private const val FOREIGN_TRANSACTION_HEX =
 private fun String.hexToBytes(): ByteArray =
     chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
+/**
+ * A transparent-only PCZT package: one recipient output and one change output (scope 1,
+ * dindex 3). Byte-for-byte the vector the Rust `labeled_transparent_pczt_bytes()` test helper
+ * builds, packed with `pack_transaction`.
+ */
+private const val TRANSPARENT_SIGNING_FIXTURE_HEX =
+    "4f0200000000000050435a5401000000058ace9cb502b4a1db960c0100c8e16785010000010102030405060708090a0b" +
+        "0c0d0e0f101112131415161718191a1b1c1d1e1f200000000000b0ea011976a9141dca7033f3ce0b62f794ef26b4ca24" +
+        "52f7b715cf88ac00000101027fa517bb858426db1571d0a63ebb792d9bfae95d7647d63b59c1dabbdc489e6200000000" +
+        "000000000000000000000000000000000000000000000000000000000200000000011dca7033f3ce0b62f794ef26b4ca" +
+        "2452f7b715cf21027fa517bb858426db1571d0a63ebb792d9bfae95d7647d63b59c1dabbdc489e6200020664696e6465" +
+        "7804000000000573636f7065040000000002904e1976a914090909090909090909090909090909090909090988ac0000" +
+        "012374314a684e7571797054505a75357664636a737647487a62544372546439587774727500904e1976a914c226cc64" +
+        "61fa07c7e4e4a56e1a09049335f00d9d88ac000103905ed35a5990c9bdb8aeedfdc956bb3ff0bc931c9d7600b48e1ab0" +
+        "30683f89f400000000000000000000000000000000000000000000000000000000000000000201030003076164647265" +
+        "7373237431626142614b3146786f3247704667453534736a645a56724d7036473665676b43770664696e646578040300" +
+        "00000573636f706504010000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "010000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000" +
+        "000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000"
+
 /** BIP-39 passphrase, the "25th word": a different wallet from the very same phrase. */
 private const val TEST_PASSPHRASE = "pepper"
 
@@ -706,6 +727,129 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun addressReceivers_blankAddress_isRejectedBeforeTheNativeCall() {
+        assertFailsWith<IllegalArgumentException> { ZcashSdk.addressReceivers(" ", ZcashNetwork.MAIN) }
+    }
+
+    @Test
+    fun addressReceivers_unifiedAddressWithATransparentReceiver_reportsTrue() = runBlocking {
+        val unified = assertNotNull(ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN).unified)
+
+        assertTrue(ZcashSdk.addressReceivers(unified, ZcashNetwork.MAIN).hasTransparent)
+    }
+
+    @Test
+    fun addressReceivers_plainTransparentAddress_failsWithAZcashExceptionRatherThanFalse() {
+        assertFailsWith<ZcashException> {
+            ZcashSdk.addressReceivers(ECC_TRANSPARENT_RECEIVER, ZcashNetwork.MAIN)
+        }
+    }
+
+    @Test
+    fun addressReceivers_unifiedAddressOfAnotherNetwork_failsWithAZcashExceptionRatherThanFalse() =
+        runBlocking {
+            val unified = assertNotNull(ZcashSdk.deriveAddresses(TEST_PHRASE, ZcashNetwork.MAIN).unified)
+
+            assertFailsWith<ZcashException> { ZcashSdk.addressReceivers(unified, ZcashNetwork.TEST) }
+            Unit
+        }
+
+    @Test
+    fun applyTransparentSignatures_mismatchedIndicesAndSigsLengths_isRejectedBeforeTheNativeCall() =
+        withWallet { wallet ->
+            assertFailsWith<IllegalArgumentException> {
+                wallet.applyTransparentSignatures(
+                    PreparedTransaction(ByteArray(0)),
+                    indices = intArrayOf(0, 1),
+                    sigs = arrayOf(byteArrayOf(1)),
+                )
+            }
+        }
+
+    @Test
+    fun applyTransparentSignatures_negativeIndex_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        assertFailsWith<IllegalArgumentException> {
+            wallet.applyTransparentSignatures(
+                PreparedTransaction(ByteArray(0)),
+                indices = intArrayOf(-1),
+                sigs = arrayOf(byteArrayOf(1)),
+            )
+        }
+    }
+
+    @Test
+    fun applyTransparentSignatures_duplicateIndex_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        assertFailsWith<IllegalArgumentException> {
+            wallet.applyTransparentSignatures(
+                PreparedTransaction(ByteArray(0)),
+                indices = intArrayOf(0, 0),
+                sigs = arrayOf(byteArrayOf(1), byteArrayOf(2)),
+            )
+        }
+    }
+
+    @Test
+    fun applyTransparentSignatures_emptySignature_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        assertFailsWith<IllegalArgumentException> {
+            wallet.applyTransparentSignatures(
+                PreparedTransaction(ByteArray(0)),
+                indices = intArrayOf(0),
+                sigs = arrayOf(ByteArray(0)),
+            )
+        }
+    }
+
+    @Test
+    fun applyTransparentSignatures_nonDerSignature_isRejectedByTheNativeSigner() = withWallet { wallet ->
+        val error = assertFailsWith<ZcashException> {
+            wallet.applyTransparentSignatures(
+                PreparedTransaction(TRANSPARENT_SIGNING_FIXTURE_HEX.hexToBytes()),
+                indices = intArrayOf(0),
+                sigs = arrayOf(byteArrayOf(0xDE.toByte(), 0xAD.toByte(), 0xBE.toByte(), 0xEF.toByte())),
+            )
+        }
+
+        assertTrue(
+            error.message.orEmpty().contains("is not valid DER"),
+            "expected the native signer to reject the blob, got: ${error.message}",
+        )
+    }
+
+    @Test
+    fun transparentSigningRequest_fixtureInput_reportsThePrevTxidInDisplayOrder() = withWallet { wallet ->
+        val request = wallet.transparentSigningRequest(
+            PreparedTransaction(TRANSPARENT_SIGNING_FIXTURE_HEX.hexToBytes()),
+        )
+
+        assertEquals(
+            "201f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504030201",
+            request.inputs.single().prevTxid,
+            "hardware signers expect the txid in display order, not the PCZT's internal order",
+        )
+    }
+
+    @Test
+    fun transparentSigningRequest_walletNetwork_setsTheFallbackChangeAddressPrefix() = withTempDir { directory ->
+        val fixture = PreparedTransaction(TRANSPARENT_SIGNING_FIXTURE_HEX.hexToBytes())
+        val mainWallet = openWallet(directory.resolve("main.db").absolutePathString())
+        val testWallet = openWallet(
+            directory.resolve("test.db").absolutePathString(),
+            network = ZcashNetwork.TEST,
+        )
+        try {
+            val mainChange = mainWallet.transparentSigningRequest(fixture).outputs[1]
+            val testChange = testWallet.transparentSigningRequest(fixture).outputs[1]
+
+            assertTrue(mainChange.address.startsWith("t1"), mainChange.address)
+            assertTrue(testChange.address.startsWith("tm"), testChange.address)
+            assertNotEquals(mainChange.address, testChange.address)
+        } finally {
+            mainWallet.close()
+            testWallet.close()
+        }
+    }
+
+    @Test
     fun restoreAccount_eccVectorPhrase_derivesTheSameReceiversAsTheEccSdk() = withWallet { wallet ->
         val account = wallet.restoreAccount(name = "ecc", key = ECC_PHRASE, birthHeight = BIRTH_HEIGHT)
         val addresses = wallet.addresses(account)
@@ -874,9 +1018,10 @@ class ZcashWalletIntegrationTest {
         dbPath: String,
         dbKey: ByteArray? = null,
         serverType: ServerType = ServerType.LIGHTWALLETD,
+        network: ZcashNetwork = ZcashNetwork.MAIN,
     ) = ZcashWallet.open(
         dbPath = dbPath,
-        network = ZcashNetwork.MAIN,
+        network = network,
         server = ServerConfig(url = "http://127.0.0.1:1", type = serverType),
         dbKey = dbKey,
     )

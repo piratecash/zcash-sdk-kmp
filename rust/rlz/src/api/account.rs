@@ -160,14 +160,16 @@ pub fn receivers_of(coin: u8, ua: &str) -> Result<Receivers> {
                 receivers.taddr = Some(taddr.encode(&network));
             }
             zcash_address::unified::Receiver::Sapling(s) => {
-                let saddr = PaymentAddress::from_bytes(&s).unwrap();
+                let saddr = PaymentAddress::from_bytes(&s)
+                    .ok_or_else(|| anyhow!("invalid Sapling receiver in unified address"))?;
                 receivers.saddr = Some(saddr.encode(&network));
             }
             zcash_address::unified::Receiver::Orchard(o) => {
                 let oaddr = orchard::Address::from_raw_address_bytes(&o)
                     .into_option()
-                    .unwrap();
-                let oaddr = UnifiedAddress::from_receivers(Some(oaddr), None, None).unwrap();
+                    .ok_or_else(|| anyhow!("invalid Orchard receiver in unified address"))?;
+                let oaddr = UnifiedAddress::from_receivers(Some(oaddr), None, None)
+                    .ok_or_else(|| anyhow!("failed to wrap Orchard receiver"))?;
                 receivers.oaddr = Some(oaddr.encode(&network));
             }
             _ => {}
@@ -210,6 +212,23 @@ pub struct Receivers {
     pub taddr: Option<String>,
     pub saddr: Option<String>,
     pub oaddr: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AddressReceiversDto {
+    has_transparent: bool,
+}
+
+/// JSON summary of which receivers `address` carries. Needed because [`address_kind`]
+/// deliberately reports `Unified` regardless of what a unified address contains, so a
+/// caller who must distinguish a unified address with a transparent receiver from a
+/// shielded-only one has no other way to ask.
+pub fn address_receivers(coin: u8, address: &str) -> Result<String> {
+    let receivers = receivers_of(coin, address)?;
+    let dto = AddressReceiversDto {
+        has_transparent: receivers.taddr.is_some(),
+    };
+    Ok(serde_json::to_string(&dto)?)
 }
 
 #[cfg_attr(feature = "flutter", frb)]
@@ -1165,6 +1184,120 @@ mod tests {
         let receivers = receivers_of(MAIN, &ua).expect("receivers");
 
         (ua, receivers)
+    }
+
+    /// A unified address carrying only the Sapling receiver of the fixture account —
+    /// a real, decodable receiver, but no transparent one.
+    fn shielded_only_ua() -> String {
+        let (ua, _) = main_addresses();
+        let (_, decoded) = zcash_address::unified::Address::decode(&ua).expect("decode");
+        let sapling_item = decoded
+            .items()
+            .into_iter()
+            .find(|item| matches!(item, zcash_address::unified::Receiver::Sapling(_)))
+            .expect("fixture account has a sapling receiver");
+
+        let shielded = zcash_address::unified::Address::try_from_items(vec![sapling_item])
+            .expect("a single shielded item is a valid unified address");
+        shielded.encode(&network_from_coin(MAIN).network_type())
+    }
+
+    /// A structurally valid unified address whose single receiver has the right
+    /// byte length for its typecode but is not a valid point — never encountered
+    /// from real key derivation, only from a crafted string.
+    fn ua_with_invalid_receiver(receiver: zcash_address::unified::Receiver) -> String {
+        let address = zcash_address::unified::Address::try_from_items(vec![receiver])
+            .expect("a single shielded item is a valid unified address");
+        address.encode(&network_from_coin(MAIN).network_type())
+    }
+
+    #[test]
+    fn receivers_of_rejects_a_sapling_receiver_with_invalid_bytes() {
+        let ua = ua_with_invalid_receiver(zcash_address::unified::Receiver::Sapling([0xffu8; 43]));
+
+        assert!(receivers_of(MAIN, &ua).is_err());
+    }
+
+    #[test]
+    fn receivers_of_rejects_an_orchard_receiver_with_invalid_bytes() {
+        let ua = ua_with_invalid_receiver(zcash_address::unified::Receiver::Orchard([0xffu8; 43]));
+
+        assert!(receivers_of(MAIN, &ua).is_err());
+    }
+
+    #[test]
+    fn address_receivers_reports_transparent_for_a_ua_with_a_transparent_receiver() {
+        let (unified, _) = main_addresses();
+
+        let dto: AddressReceiversDto =
+            serde_json::from_str(&address_receivers(MAIN, &unified).expect("address_receivers"))
+                .expect("valid json");
+
+        assert!(dto.has_transparent);
+    }
+
+    #[test]
+    fn address_receivers_reports_no_transparent_for_a_shielded_only_ua() {
+        let shielded = shielded_only_ua();
+
+        let dto: AddressReceiversDto =
+            serde_json::from_str(&address_receivers(MAIN, &shielded).expect("address_receivers"))
+                .expect("valid json");
+
+        assert!(!dto.has_transparent);
+    }
+
+    #[test]
+    fn address_receivers_errors_on_a_malformed_address() {
+        assert!(address_receivers(MAIN, "not an address").is_err());
+    }
+
+    #[test]
+    fn address_receivers_errors_on_a_non_ua_address() {
+        let (_, receivers) = main_addresses();
+
+        assert!(address_receivers(MAIN, &receivers.taddr.expect("taddr")).is_err());
+    }
+
+    #[test]
+    fn address_receivers_errors_on_a_wrong_network_ua() {
+        let (unified, _) = main_addresses();
+
+        assert!(address_receivers(TEST, &unified).is_err());
+    }
+
+    #[test]
+    fn address_receivers_errors_on_a_ua_with_an_invalid_receiver() {
+        let invalid_sapling =
+            ua_with_invalid_receiver(zcash_address::unified::Receiver::Sapling([0xffu8; 43]));
+        let invalid_orchard =
+            ua_with_invalid_receiver(zcash_address::unified::Receiver::Orchard([0xffu8; 43]));
+
+        assert!(address_receivers(MAIN, &invalid_sapling).is_err());
+        assert!(address_receivers(MAIN, &invalid_orchard).is_err());
+    }
+
+    #[test]
+    fn address_kind_and_address_receivers_agree_on_every_fixture() {
+        let (unified, _) = main_addresses();
+        let shielded = shielded_only_ua();
+        let invalid_sapling =
+            ua_with_invalid_receiver(zcash_address::unified::Receiver::Sapling([0xffu8; 43]));
+        let invalid_orchard =
+            ua_with_invalid_receiver(zcash_address::unified::Receiver::Orchard([0xffu8; 43]));
+
+        for address in [&unified, &shielded] {
+            assert_eq!(
+                Some(AddressKind::Unified),
+                address_kind(MAIN, address),
+                "{address}"
+            );
+            assert!(address_receivers(MAIN, address).is_ok(), "{address}");
+        }
+        for address in [&invalid_sapling, &invalid_orchard] {
+            assert_eq!(None, address_kind(MAIN, address), "{address}");
+            assert!(address_receivers(MAIN, address).is_err(), "{address}");
+        }
     }
 
     #[test]

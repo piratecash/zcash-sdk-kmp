@@ -128,6 +128,7 @@ pub async fn issue_asset(
         false, // migration
         None,  // preselected
         None,  // anchor_height
+        false, // hardware_signing
     )
     .await?;
 

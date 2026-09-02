@@ -403,6 +403,7 @@ pub async fn prepare_tx(
         false, // migration
         None,  // preselected
         None,  // anchor_height
+        false, // hardware_signing
     )
     .await?;
     Ok(pczt)

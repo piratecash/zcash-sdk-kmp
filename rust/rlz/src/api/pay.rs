@@ -2,7 +2,7 @@ use anyhow::Result;
 use bincode::{config::legacy, Decode, Encode};
 
 use crate::{
-    api::coin::Coin,
+    api::coin::{network_from_coin, Coin},
     pay::{
         plan::{plan_transaction, NO_SPENDING_KEY},
         reserve::OwnInputs,
@@ -20,6 +20,8 @@ pub struct PaymentOptions {
     pub smart_transparent: bool,
     pub confirmations: u32,
     pub category: Option<u32>,
+    /// Forces a v5 (ZIP-244) transaction so an external hardware signer (e.g. Trezor) can sign it.
+    pub hardware_signing: bool,
 }
 
 #[cfg_attr(feature = "flutter", frb)]
@@ -53,6 +55,7 @@ pub async fn prepare(
         false, // migration — only used by note migration
         None,  // preselected
         None,  // anchor_height
+        options.hardware_signing,
     )
     .await
 }
@@ -85,6 +88,7 @@ pub async fn prepare_migration(
         true,  // migration
         None,  // preselected
         None,  // anchor_height
+        false, // hardware_signing
     )
     .await
 }
@@ -109,6 +113,24 @@ pub async fn sign_transaction_with_key(
             .await?;
 
     Ok(tx)
+}
+
+/// JSON payload an external signer (e.g. Trezor) needs to review and sign `pczt`'s
+/// transparent bundle. `coin` resolves the network for the fallback address encoding.
+pub fn transparent_signing_request(coin: u8, pczt: &PcztPackage) -> Result<String> {
+    let network = network_from_coin(coin);
+    let request = crate::pay::plan::transparent_signing_request(&network, pczt)?;
+    Ok(serde_json::to_string(&request)?)
+}
+
+/// Applies device-produced ECDSA signatures (`indices`/`sigs` parallel arrays) to `pczt`'s
+/// transparent inputs and finalizes it.
+pub fn apply_transparent_signatures(
+    pczt: &PcztPackage,
+    indices: &[u32],
+    sigs: &[Vec<u8>],
+) -> Result<PcztPackage> {
+    crate::pay::plan::apply_transparent_signatures(pczt, indices, sigs)
 }
 
 #[cfg_attr(feature = "flutter", frb)]

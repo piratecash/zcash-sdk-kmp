@@ -13,12 +13,12 @@ use dto::{
     RecipientDto, TxDto, TxPlanDto,
 };
 use jni::errors::ErrorPolicy;
-use jni::objects::{JByteArray, JIntArray, JLongArray, JObject, JString};
+use jni::objects::{JByteArray, JIntArray, JLongArray, JObject, JObjectArray, JString};
 use jni::refs::Reference;
 use jni::sys::{jboolean, jbyte, jint, jlong};
 use jni::{Env, EnvUnowned};
 use rlz::api::account::{
-    address_kind, addresses_from_key, delete_account, derive_unified_address,
+    address_kind, address_receivers, addresses_from_key, delete_account, derive_unified_address,
     generate_next_receive_address, get_account_pools, get_account_ufvk, list_accounts,
     list_tx_history, new_account, receivers_from_ua, receivers_of, transparent_address_balance,
     ua_from_ufvk, unified_address, AddressKind, NewAccount,
@@ -31,9 +31,9 @@ use rlz::api::key::{
 use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::get_current_height;
 use rlz::api::pay::{
-    broadcast, extract_transaction, pack_transaction, prepare, reserve_for_broadcast,
-    sign_transaction_with_key, to_plan, transaction_id, unpack_transaction, PaymentOptions,
-    PcztPackage,
+    apply_transparent_signatures, broadcast, extract_transaction, pack_transaction, prepare,
+    reserve_for_broadcast, sign_transaction_with_key, to_plan, transaction_id,
+    transparent_signing_request, unpack_transaction, PaymentOptions, PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sweep::discover_transparent_addresses;
@@ -538,6 +538,23 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_addressKind<'local>(
         .resolve::<ThrowNativeError>()
 }
 
+/// Stateless: needs no open wallet. Which receiver kinds `address` carries.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_addressReceivers<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    address: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let address = address.try_to_string(env)?;
+            let json = address_receivers(coin as u8, &address)?;
+            Ok(env.new_string(json)?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cash_p_zcash_ZcashJni_addressesFromViewingKey<'local>(
     mut unowned_env: EnvUnowned<'local>,
@@ -853,6 +870,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_prepare<'local>(
     recipient_pays_fee: jboolean,
     smart_transparent: jboolean,
     confirmations: jint,
+    hardware_signing: jboolean,
 ) -> JByteArray<'local> {
     unowned_env
         .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
@@ -869,6 +887,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_prepare<'local>(
                 smart_transparent,
                 confirmations: confirmations as u32,
                 category: None,
+                hardware_signing,
             };
             let package = runtime().block_on(prepare(&recipients, options, &coin))?;
             pack_package(env, &package)
@@ -888,6 +907,50 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_transactionPlan<'local>(
             let package = unpack_package(env, &pkg)?;
             let plan = to_plan(&package, &wallet(handle)?)?;
             to_json(env, &TxPlanDto::from(plan))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: no open wallet, no account. The JSON payload an external signer (e.g. Trezor)
+/// needs to review and sign the PCZT's transparent bundle.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentSigningRequest<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    pkg: JByteArray<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let package = unpack_package(env, &pkg)?;
+            let json = transparent_signing_request(coin as u8, &package)?;
+            Ok(env.new_string(json)?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: no open wallet, no account. Applies device-produced ECDSA signatures
+/// (`indices`/`sigs` parallel arrays) to the PCZT's transparent inputs and finalizes them.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_applyTransparentSignatures<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    pkg: JByteArray<'local>,
+    indices: JIntArray<'local>,
+    sigs: JObjectArray<'local, JByteArray<'local>>,
+) -> JByteArray<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
+            let package = unpack_package(env, &pkg)?;
+            let indices = account_ids(&indices, env)?;
+            let sig_count = sigs.len(env)?;
+            let mut sig_bytes = Vec::with_capacity(sig_count);
+            for i in 0..sig_count {
+                let sig = sigs.get_element(env, i)?;
+                sig_bytes.push(env.convert_byte_array(&sig)?);
+            }
+            let updated = apply_transparent_signatures(&package, &indices, &sig_bytes)?;
+            pack_package(env, &updated)
         })
         .resolve::<ThrowNativeError>()
 }

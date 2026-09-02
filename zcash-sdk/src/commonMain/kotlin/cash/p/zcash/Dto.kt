@@ -147,6 +147,88 @@ internal fun encodeRecipients(recipients: List<Recipient>): String =
 internal fun parseTransactionPlan(json: String): TransactionPlan =
     nativeJson.decodeFromString<TxPlanDto>(json).toTransactionPlan()
 
+/**
+ * Bridges rlz's `transparent_signing_request` wire JSON, which — unlike every other DTO
+ * here — is plain snake_case: it is serialized straight from the Rust struct, with no
+ * camelCase Rust-side DTO layer in between.
+ */
+@Serializable
+internal data class TransparentSigningRequestDto(
+    @SerialName("tx_version") val txVersion: Int,
+    @SerialName("version_group_id") val versionGroupId: Long,
+    @SerialName("consensus_branch_id") val consensusBranchId: Long,
+    @SerialName("expiry_height") val expiryHeight: Int,
+    @SerialName("lock_time") val lockTime: Long,
+    val shielded: ShieldedCountsDto,
+    val inputs: List<TransparentSigningInputDto>,
+    val outputs: List<TransparentSigningOutputDto>,
+) {
+    fun toTransparentSigningRequest(): TransparentSigningRequest = TransparentSigningRequest(
+        txVersion = txVersion,
+        versionGroupId = versionGroupId,
+        consensusBranchId = consensusBranchId,
+        expiryHeight = expiryHeight,
+        lockTime = lockTime,
+        shielded = shielded.toShieldedCounts(),
+        inputs = inputs.map(TransparentSigningInputDto::toTransparentSigningInput),
+        outputs = outputs.map(TransparentSigningOutputDto::toTransparentSigningOutput),
+    )
+}
+
+@Serializable
+internal data class ShieldedCountsDto(
+    @SerialName("sapling_spends") val saplingSpends: Int,
+    @SerialName("sapling_outputs") val saplingOutputs: Int,
+    @SerialName("orchard_actions") val orchardActions: Int,
+) {
+    fun toShieldedCounts(): ShieldedCounts = ShieldedCounts(saplingSpends, saplingOutputs, orchardActions)
+}
+
+@Serializable
+internal data class TransparentSigningInputDto(
+    val index: Int,
+    @SerialName("prev_txid") val prevTxid: String,
+    @SerialName("prev_index") val prevIndex: Int,
+    val value: Long,
+    val sequence: Long,
+    val scope: Int,
+    val dindex: Int,
+    @SerialName("script_pubkey") val scriptPubkey: String,
+) {
+    fun toTransparentSigningInput(): TransparentSigningInput = TransparentSigningInput(
+        index = index,
+        prevTxid = prevTxid,
+        prevIndex = prevIndex,
+        value = value,
+        sequence = sequence,
+        scope = scope,
+        dindex = dindex,
+        scriptPubkey = scriptPubkey,
+    )
+}
+
+@Serializable
+internal data class TransparentSigningOutputDto(
+    val index: Int,
+    val value: Long,
+    val address: String,
+    @SerialName("is_change") val isChange: Boolean,
+    val scope: Int? = null,
+    val dindex: Int? = null,
+) {
+    fun toTransparentSigningOutput(): TransparentSigningOutput = TransparentSigningOutput(
+        index = index,
+        value = value,
+        address = address,
+        isChange = isChange,
+        scope = scope,
+        dindex = dindex,
+    )
+}
+
+internal fun parseTransparentSigningRequest(json: String): TransparentSigningRequest =
+    nativeJson.decodeFromString<TransparentSigningRequestDto>(json).toTransparentSigningRequest()
+
 /** The native layer returns available, locked, change, value per pool in [Pool] bit order. */
 internal fun LongArray.toPoolBalance(): PoolBalance =
     PoolBalance(
@@ -205,6 +287,15 @@ internal fun parseAddressKind(wire: String): ZcashAddressKind? = when (wire) {
     "invalid" -> null
     else -> throw ZcashException("Unknown address kind: $wire")
 }
+
+/** Bridges `address_receivers`'s plain snake_case wire JSON — see [TransparentSigningRequestDto]. */
+@Serializable
+internal data class AddressReceiversDto(
+    @SerialName("has_transparent") val hasTransparent: Boolean,
+)
+
+internal fun parseAddressReceivers(json: String): AddressReceivers =
+    AddressReceivers(nativeJson.decodeFromString<AddressReceiversDto>(json).hasTransparent)
 
 private fun String.toMigrationPhase(): MigrationPhase = when (this) {
     "splitting" -> MigrationPhase.SPLITTING

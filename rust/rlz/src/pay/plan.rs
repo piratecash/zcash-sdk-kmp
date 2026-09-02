@@ -17,6 +17,7 @@ use orchard::{
     Address,
 };
 use pczt::{
+    common::determine_lock_time,
     roles::{
         creator::Creator, io_finalizer::IoFinalizer, issuer::Issuer, prover::Prover,
         signer::Signer, spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor,
@@ -28,6 +29,7 @@ use rand_core::{OsRng, RngCore};
 use ripemd::Ripemd160;
 use sapling_crypto::PaymentAddress;
 use secp256k1::{PublicKey, SecretKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
 use tracing::{event, info, span, Level};
@@ -47,7 +49,8 @@ use zcash_protocol::{
     memo::{Memo, MemoBytes},
     value::Zatoshis,
 };
-use zcash_protocol::{PoolType, ShieldedPool};
+use zcash_protocol::{PoolType, ShieldedPool, TxId};
+use zcash_script::script;
 use zcash_transparent::{
     address::TransparentAddress,
     builder::{SpendInfo, TransparentInputInfo},
@@ -289,6 +292,9 @@ pub async fn plan_transaction(
     migration: bool,
     preselected: Option<&[u32]>,
     anchor_height: Option<u32>,
+    // Forces a v5 (ZIP-244) transaction, the only version an external hardware signer
+    // (e.g. Trezor) currently understands, regardless of the account's own `hw` flag.
+    hardware_signing: bool,
 ) -> Result<PcztPackage> {
     let mut input_pools = fetch_unspent_notes_by_pool(connection, account).await?;
     let height = client.latest_height().await?;
@@ -729,7 +735,7 @@ pub async fn plan_transaction(
     // transactions, so force a v5 tx while keeping consensus_branch_id = Nu6_3
     // (V5 is valid in Nu6_3 per TxVersion::valid_in_branch). A v5 tx carrying the
     // current Nu6_3 branch id is valid on the network.
-    if hw != 0 {
+    if wants_hardware_v5(hw, hardware_signing) {
         builder
             .propose_version::<()>(TxVersion::V5)
             .map_err(|e| anyhow!("failed to force v5 for hardware signing: {e:?}"))?;
@@ -861,6 +867,9 @@ pub async fn plan_transaction(
     // ── Add outputs ──────────────────────────────────────────────────────
     event!(Level::INFO, "Adding Outputs");
     let mut n_outputs: [usize; NUM_POOLS as usize] = [0; NUM_POOLS as usize];
+    // In transparent-bundle order: the address every transparent output actually pays,
+    // for `label_transparent_outputs` to attach to the equivalent PCZT output.
+    let mut transparent_output_addresses: Vec<String> = Vec::new();
 
     for r in &recipient_states {
         let pool = r.pool_mask.to_best_pool().unwrap();
@@ -875,6 +884,7 @@ pub async fn plan_transaction(
                     builder
                         .add_transparent_output(&to, value)
                         .map_err(|e: zcash_transparent::builder::Error| anyhow!(e))?;
+                    transparent_output_addresses.push(r.recipient.address.clone());
                 }
             }
             1 => {
@@ -938,6 +948,7 @@ pub async fn plan_transaction(
     }
 
     // ── Add change output ────────────────────────────────────────────────
+    let mut transparent_change_label: Option<TransparentChangeLabel> = None;
     if change > 0 {
         let change_addr = if change_pool == 0 && tkeys.xvk.is_some() {
             generate_next_change_address(network, connection, account)
@@ -952,6 +963,8 @@ pub async fn plan_transaction(
                 builder
                     .add_transparent_output(&to, Zatoshis::const_from_u64(change))
                     .map_err(|e: zcash_transparent::builder::Error| anyhow!(e))?;
+                transparent_change_label =
+                    Some(load_transparent_change_label(connection, account, &change_addr).await?);
             }
             1 => {
                 let to = get_sapling_address(network, &change_addr)?;
@@ -1078,7 +1091,7 @@ pub async fn plan_transaction(
                     Ok(())
                 })?;
             }
-            Ok(())
+            label_transparent_outputs(u, transparent_output_addresses, transparent_change_label)
         })
         .unwrap();
 
@@ -1755,6 +1768,313 @@ fn orchard_proving_key_kind(branch_id: BranchId) -> OrchardProvingKeyKind {
     }
 }
 
+/// Whether the transaction must be forced to v5 (ZIP-244): either the account is
+/// itself hardware-bound (`hw != 0`), or this specific plan is being prepared for an
+/// external hardware signer that only understands v5.
+fn wants_hardware_v5(hw: u8, hardware_signing: bool) -> bool {
+    hw != 0 || hardware_signing
+}
+
+/// The change output's own derivation path, so an external signer can recognise the
+/// output as its own change rather than a payment to a third party.
+struct TransparentChangeLabel {
+    pubkey: PublicKey,
+    scope: u32,
+    dindex: u32,
+    address: String,
+}
+
+async fn load_transparent_change_label(
+    connection: &mut SqliteConnection,
+    account: u32,
+    address: &str,
+) -> Result<TransparentChangeLabel> {
+    let row = sqlx::query(
+        "SELECT pk, scope, dindex FROM transparent_address_accounts WHERE account = ?1 AND address = ?2",
+    )
+    .bind(account)
+    .bind(address)
+    .fetch_one(&mut *connection)
+    .await?;
+    let pk: Vec<u8> = row.get(0);
+    Ok(TransparentChangeLabel {
+        pubkey: PublicKey::from_slice(&pk)
+            .map_err(|e| anyhow!("invalid change address pubkey: {e}"))?,
+        scope: row.get(1),
+        dindex: row.get(2),
+        address: address.to_string(),
+    })
+}
+
+/// Labels a planned transparent bundle's outputs for an external signer: each recipient
+/// output gets the user-facing address it pays, and the change output (if any) gets its
+/// own BIP-32 derivation so the signer can recognise it as change rather than a payment.
+fn label_transparent_outputs(
+    mut u: zcash_transparent::pczt::Updater<'_>,
+    recipient_addresses: Vec<String>,
+    change: Option<TransparentChangeLabel>,
+) -> std::result::Result<(), zcash_transparent::pczt::UpdaterError> {
+    let change_index = recipient_addresses.len();
+    for (index, address) in recipient_addresses.into_iter().enumerate() {
+        u.update_output_with(index, |mut u| {
+            u.set_user_address(address);
+            Ok(())
+        })?;
+    }
+    if let Some(TransparentChangeLabel {
+        pubkey,
+        scope,
+        dindex,
+        address,
+    }) = change
+    {
+        u.update_output_with(change_index, |mut u| {
+            let path = Bip32Derivation::parse([0u8; 32], vec![scope, dindex]).unwrap();
+            u.set_bip32_derivation(pubkey.serialize(), path);
+            u.set_proprietary("scope".to_string(), scope.to_le_bytes().to_vec());
+            u.set_proprietary("dindex".to_string(), dindex.to_le_bytes().to_vec());
+            u.set_proprietary("address".to_string(), address.into_bytes());
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// JSON payload describing everything an external signer (e.g. Trezor) needs to review
+/// and sign a planned transparent bundle. Built from a planner PCZT before any signing.
+#[derive(Serialize, Deserialize)]
+pub struct TransparentSigningRequest {
+    pub tx_version: u32,
+    pub version_group_id: u32,
+    pub consensus_branch_id: u32,
+    pub expiry_height: u32,
+    pub lock_time: u32,
+    pub shielded: ShieldedCounts,
+    pub inputs: Vec<TransparentSigningInput>,
+    pub outputs: Vec<TransparentSigningOutput>,
+}
+
+/// Counts of shielded components, so a caller can refuse a bundle the device cannot sign.
+#[derive(Serialize, Deserialize)]
+pub struct ShieldedCounts {
+    pub sapling_spends: usize,
+    pub sapling_outputs: usize,
+    pub orchard_actions: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TransparentSigningInput {
+    pub index: usize,
+    /// Hex in display (block-explorer) order — the reverse of the txid's internal bytes.
+    pub prev_txid: String,
+    pub prev_index: u32,
+    pub value: u64,
+    /// The effective sequence: the PCZT leaves this `None` for every planner-built input,
+    /// which the extractor treats as `0xffff_ffff`, never as `0`.
+    pub sequence: u32,
+    pub scope: u32,
+    pub dindex: u32,
+    pub script_pubkey: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TransparentSigningOutput {
+    pub index: usize,
+    pub value: u64,
+    pub address: String,
+    pub is_change: bool,
+    pub scope: Option<u32>,
+    pub dindex: Option<u32>,
+}
+
+/// Like [`read_proprietary_u32`], but the field is optional (e.g. an output's `scope`,
+/// which is only present on a change output).
+fn read_proprietary_u32_opt(
+    proprietary: &BTreeMap<String, Vec<u8>>,
+    field: &str,
+    pool: &str,
+    index: usize,
+) -> Result<Option<u32>> {
+    if proprietary.contains_key(field) {
+        read_proprietary_u32(proprietary, field, pool, index).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolves a transparent output's address: the label the planner wrote for a recipient,
+/// or the address recovered from `script_pubkey` for a change output. The app never reads
+/// a change output's address here (Phase 4 derives it on the device), so the fallback
+/// exists for diagnostics and non-app callers, not as a correctness dependency.
+fn transparent_output_address(
+    network: &Network,
+    output: &pczt::transparent::Output,
+) -> Result<String> {
+    if let Some(address) = output.user_address() {
+        return Ok(address.clone());
+    }
+    let pubkey = script::PubKey::parse(&script::Code(output.script_pubkey().clone()))
+        .map_err(|error| anyhow!("failed to parse output script_pubkey: {error:?}"))?;
+    let address = TransparentAddress::from_script_pubkey(&pubkey)
+        .ok_or_else(|| anyhow!("output script_pubkey is not a standard transparent address"))?;
+    Ok(address.encode(network))
+}
+
+/// Builds the request an external signer reviews before producing transparent signatures.
+/// `network` matters because a fallback output address is re-encoded from
+/// `script_pubkey`, and the PCZT's consensus branch id does not distinguish networks.
+pub fn transparent_signing_request(
+    network: &Network,
+    package: &PcztPackage,
+) -> Result<TransparentSigningRequest> {
+    let pczt =
+        Pczt::parse(&package.pczt).map_err(|error| anyhow!("failed to parse PCZT: {error:?}"))?;
+    let global = pczt.global();
+    let tbundle = pczt.transparent();
+
+    let lock_time = determine_lock_time(global, tbundle.inputs())
+        .ok_or_else(|| anyhow!("transparent inputs do not agree on a lock time"))?;
+
+    let inputs = tbundle
+        .inputs()
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            Ok(TransparentSigningInput {
+                index,
+                prev_txid: TxId::from_bytes(*input.prevout_txid()).to_string(),
+                prev_index: *input.prevout_index(),
+                value: *input.value(),
+                sequence: input.sequence().unwrap_or(0xffff_ffff),
+                scope: read_proprietary_u32(input.proprietary(), "scope", "transparent", index)?,
+                dindex: read_proprietary_u32(input.proprietary(), "dindex", "transparent", index)?,
+                script_pubkey: hex::encode(input.script_pubkey()),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let outputs = tbundle
+        .outputs()
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let scope =
+                read_proprietary_u32_opt(output.proprietary(), "scope", "transparent", index)?;
+            let dindex =
+                read_proprietary_u32_opt(output.proprietary(), "dindex", "transparent", index)?;
+            Ok(TransparentSigningOutput {
+                index,
+                value: *output.value(),
+                address: transparent_output_address(network, output)?,
+                is_change: scope.is_some(),
+                scope,
+                dindex,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(TransparentSigningRequest {
+        tx_version: *global.tx_version(),
+        version_group_id: *global.version_group_id(),
+        consensus_branch_id: *global.consensus_branch_id(),
+        expiry_height: *global.expiry_height(),
+        lock_time,
+        shielded: ShieldedCounts {
+            sapling_spends: pczt.sapling().spends().len(),
+            sapling_outputs: pczt.sapling().outputs().len(),
+            orchard_actions: pczt.orchard().actions().len(),
+        },
+        inputs,
+        outputs,
+    })
+}
+
+/// Applies device-produced ECDSA signatures to every transparent input of a planned PCZT
+/// and finalizes it. `indices`/`sigs` are parallel arrays; on success the returned package
+/// has `can_broadcast = true`, matching what local signing already produces.
+pub fn apply_transparent_signatures(
+    package: &PcztPackage,
+    indices: &[u32],
+    sigs: &[Vec<u8>],
+) -> Result<PcztPackage> {
+    if indices.len() != sigs.len() {
+        return Err(anyhow!(
+            "indices and signatures have different lengths: {} vs {}",
+            indices.len(),
+            sigs.len()
+        ));
+    }
+
+    let expected = package.n_spends[0];
+    let mut seen = vec![false; expected];
+    for &index in indices {
+        let index = index as usize;
+        if index >= expected {
+            return Err(anyhow!(
+                "transparent input index {index} is out of range: only {expected} transparent input(s)"
+            ));
+        }
+        if seen[index] {
+            return Err(anyhow!("duplicate signature for transparent input {index}"));
+        }
+        seen[index] = true;
+    }
+    if let Some(index) = seen.iter().position(|signed| !signed) {
+        return Err(anyhow!("missing a signature for transparent input {index}"));
+    }
+
+    let signatures = indices
+        .iter()
+        .zip(sigs.iter())
+        .map(|(&index, sig)| {
+            let signature = secp256k1::ecdsa::Signature::from_der(sig).map_err(|error| {
+                anyhow!("signature for transparent input {index} is not valid DER: {error}")
+            })?;
+            Ok((index as usize, signature))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let pczt =
+        Pczt::parse(&package.pczt).map_err(|error| anyhow!("failed to parse PCZT: {error:?}"))?;
+    let mut signer =
+        Signer::new(pczt).map_err(|error| anyhow!("failed to start signing session: {error:?}"))?;
+    for (index, signature) in signatures {
+        signer
+            .append_transparent_signature(index, signature)
+            .map_err(|error| match error {
+                pczt::roles::signer::Error::InvalidIndex => {
+                    anyhow!("transparent input index {index} is out of range")
+                }
+                pczt::roles::signer::Error::TransparentSign(error) => anyhow!(
+                    "signature for transparent input {index} failed sighash verification: {error:?}"
+                ),
+                other => {
+                    anyhow!("failed to apply signature for transparent input {index}: {other:?}")
+                }
+            })?;
+    }
+
+    let pczt = signer.finish();
+    let pczt = SpendFinalizer::new(pczt)
+        .finalize_spends()
+        .map_err(|error| anyhow!("failed to finalize PCZT spends: {error:?}"))?;
+
+    Ok(PcztPackage {
+        pczt: pczt
+            .serialize()
+            .map_err(|error| anyhow!("failed to serialize signed PCZT: {error:?}"))?,
+        n_spends: package.n_spends,
+        sapling_indices: package.sapling_indices.clone(),
+        orchard_indices: package.orchard_indices.clone(),
+        ironwood_indices: package.ironwood_indices.clone(),
+        can_sign: package.can_sign,
+        can_broadcast: true,
+        price: package.price,
+        category: package.category,
+        is_issuance: package.is_issuance,
+    })
+}
+
 pub(crate) fn get_orchard_pk(consensus_branch_id: u32) -> Result<&'static ProvingKey> {
     // ZSA and Ironwood are mutually exclusive hard forks with different
     // V6 version group IDs and circuit versions.
@@ -1770,13 +2090,19 @@ pub(crate) fn get_orchard_pk(consensus_branch_id: u32) -> Result<&'static Provin
 #[cfg(test)]
 mod tests {
     use super::{
-        account_can_sign, require_orchard_key, require_sapling_key, require_transparent_key,
-        sign_transaction, verify_spending_key, PcztPackage, NO_SPENDING_KEY,
+        account_can_sign, apply_transparent_signatures, determine_lock_time, extract_transaction,
+        require_orchard_key, require_sapling_key, require_transparent_key, sign_transaction,
+        transparent_signing_request, verify_spending_key, Pczt, PcztPackage, NO_SPENDING_KEY,
     };
-    use super::{orchard_proving_key_kind, BranchId, Creator, OrchardProvingKeyKind};
+    use super::{
+        get_transparent_address, label_transparent_outputs, orchard_proving_key_kind,
+        wants_hardware_v5, BranchId, Creator, OrchardProvingKeyKind, Signer,
+        TransparentChangeLabel,
+    };
     use super::{
         AssetBase, BlockHeight, BuildConfig, Builder, BundlePadding, FeeRule, IoFinalizer,
-        OutPoint, SpendInfo, TransparentAddress, TransparentInputInfo, TxOut, Updater, Zatoshis,
+        OutPoint, SpendInfo, TransparentAddress, TransparentInputInfo, TxOut, TxVersion, Updater,
+        Zatoshis,
     };
     use crate::account::tests::{restore, test_usk, watch_only_keys, TEST_PHRASE};
     use crate::account::{derive_spending_key, derive_transparent_sk};
@@ -1786,6 +2112,7 @@ mod tests {
     use crate::pay::signing_key::{self, SigningKey};
     use bip32::{ExtendedPrivateKey, Prefix};
     use incrementalmerkletree::{Hashable, Level, Position};
+    use pczt::roles::verifier::{TransparentError, Verifier};
     use ripemd::Ripemd160;
     use sapling_crypto::{
         value::NoteValue, Anchor, MerklePath, Node, Note, Rseed, NOTE_COMMITMENT_TREE_DEPTH,
@@ -1795,6 +2122,7 @@ mod tests {
     use std::convert::Infallible;
     use std::str::FromStr as _;
     use zcash_keys::encoding::encode_extended_spending_key;
+    use zcash_keys::encoding::AddressCodec as _;
     use zcash_keys::keys::{sapling::ExtendedSpendingKey, Era, UnifiedSpendingKey};
     use zcash_protocol::consensus::NetworkConstants as _;
     use zcash_transparent::{keys::AccountPrivKey, pczt::Bip32Derivation};
@@ -1955,6 +2283,168 @@ mod tests {
 
     fn transparent_pczt_bytes(tsk: &AccountPrivKey, scope: u32, dindex: u32) -> Vec<u8> {
         transparent_pczt_bytes_custom(tsk, scope, dindex, le_bytes(scope), le_bytes(dindex), true)
+    }
+
+    /// Deliberately asymmetric: a palindromic txid would let a byte-order assertion pass
+    /// under both internal and display order.
+    const FIXTURE_PREVOUT_TXID: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
+    ];
+
+    /// A structurally valid transparent-only PCZT with one input (spendable by `tsk` at
+    /// `(scope, dindex)`), one recipient output paying `recipient_address`, and one change
+    /// output back to `tsk` at `(change_scope, change_dindex)` — built and labeled through
+    /// the exact same `Builder`/`label_transparent_outputs` pipeline `plan_transaction` uses.
+    fn labeled_transparent_pczt_bytes(
+        tsk: &AccountPrivKey,
+        scope: u32,
+        dindex: u32,
+        recipient_address: &str,
+        change_scope: u32,
+        change_dindex: u32,
+    ) -> Vec<u8> {
+        let sk_bytes = derive_transparent_sk(tsk, scope, dindex).expect("derive sk");
+        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+
+        let change_sk_bytes =
+            derive_transparent_sk(tsk, change_scope, change_dindex).expect("derive change sk");
+        let change_sk = SecretKey::from_slice(&change_sk_bytes).expect("change secret key");
+        let change_pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &change_sk);
+
+        let build_config = BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: None,
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        };
+        let mut builder = Builder::new(
+            &Network::Main,
+            BlockHeight::from_u32(1_700_000),
+            build_config,
+        );
+
+        let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
+        let addr = TransparentAddress::PublicKeyHash(pkh);
+        // 30,000 in, 10,000 to the recipient, 10,000 change, 10,000 ZIP-317 grace-action fee.
+        let coin = TxOut::new(Zatoshis::const_from_u64(30_000), addr.script().into());
+        let utxo = OutPoint::new(FIXTURE_PREVOUT_TXID, 0);
+        builder.add_transparent_input(
+            TransparentInputInfo::from_parts(utxo, coin, SpendInfo::P2pkh { pubkey })
+                .expect("input"),
+        );
+
+        let recipient_addr =
+            get_transparent_address(&Network::Main, recipient_address).expect("recipient address");
+        builder
+            .add_transparent_output(&recipient_addr, Zatoshis::const_from_u64(10_000))
+            .expect("recipient output");
+
+        let change_pkh: [u8; 20] =
+            Ripemd160::digest(Sha256::digest(change_pubkey.serialize())).into();
+        let change_addr = TransparentAddress::PublicKeyHash(change_pkh);
+        builder
+            .add_transparent_output(&change_addr, Zatoshis::const_from_u64(10_000))
+            .expect("change output");
+
+        let r = builder
+            .build_for_pczt(
+                rand_core::OsRng,
+                &FeeRule::standard(),
+                |_asset: &AssetBase| false,
+            )
+            .expect("build_for_pczt");
+        let pczt = Creator::build_from_parts(r.pczt_parts).expect("creator");
+
+        let pczt = Updater::new(pczt)
+            .update_transparent_with(|mut u| {
+                u.update_input_with(0, |mut u| {
+                    let path = Bip32Derivation::parse([0u8; 32], vec![scope, dindex])
+                        .expect("derivation path");
+                    u.set_bip32_derivation(pubkey.serialize(), path);
+                    u.set_hash160_preimage(pubkey.serialize().to_vec());
+                    u.set_proprietary("scope".to_string(), scope.to_le_bytes().to_vec());
+                    u.set_proprietary("dindex".to_string(), dindex.to_le_bytes().to_vec());
+                    Ok(())
+                })?;
+                label_transparent_outputs(
+                    u,
+                    vec![recipient_address.to_string()],
+                    Some(TransparentChangeLabel {
+                        pubkey: change_pubkey,
+                        scope: change_scope,
+                        dindex: change_dindex,
+                        address: change_addr.encode(&Network::Main),
+                    }),
+                )
+            })
+            .expect("update transparent")
+            .finish();
+
+        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        pczt.serialize().expect("serialize")
+    }
+
+    #[test]
+    fn label_transparent_outputs_labels_recipient_and_change() {
+        let tprv = transparent_only_tprv();
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+        let recipient_address = TransparentAddress::PublicKeyHash([9u8; 20]).encode(&Network::Main);
+
+        let bytes = labeled_transparent_pczt_bytes(&tsk, 0, 0, &recipient_address, 1, 3);
+        let pczt = Pczt::parse(&bytes).expect("parse pczt");
+        let outputs = pczt.transparent().outputs();
+        assert_eq!(
+            outputs.len(),
+            2,
+            "expected one recipient and one change output"
+        );
+
+        assert_eq!(
+            outputs[0].user_address().as_deref(),
+            Some(recipient_address.as_str()),
+            "recipient output must carry the original recipient address"
+        );
+        assert!(
+            outputs[1].user_address().is_none(),
+            "change output has no third-party recipient to label"
+        );
+
+        let change = &outputs[1];
+        assert_eq!(
+            change.proprietary().get("scope").cloned(),
+            Some(1u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            change.proprietary().get("dindex").cloned(),
+            Some(3u32.to_le_bytes().to_vec())
+        );
+        assert!(
+            change.proprietary().contains_key("address"),
+            "change output must record its own address for recovery"
+        );
+
+        let change_sk_bytes = derive_transparent_sk(&tsk, 1, 3).expect("derive change sk");
+        let change_sk = SecretKey::from_slice(&change_sk_bytes).expect("change secret key");
+        let change_pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &change_sk);
+        Verifier::new(pczt)
+            .with_transparent(|bundle| {
+                let derivations = bundle.outputs()[1].bip32_derivation();
+                assert_eq!(
+                    derivations.get(&change_pubkey.serialize()),
+                    Some(&Bip32Derivation::parse([0u8; 32], vec![1, 3]).expect("derivation path")),
+                    "change output must carry the BIP-32 derivation an external signer needs \
+                     to recognise it as change"
+                );
+                assert_eq!(derivations.len(), 1);
+                Ok::<(), TransparentError<Infallible>>(())
+            })
+            .expect("verify transparent");
     }
 
     /// A sapling spending key built directly from raw seed bytes, unrelated to any
@@ -2810,6 +3300,307 @@ mod tests {
         assert_eq!(
             orchard_proving_key_kind(BranchId::Nu7),
             OrchardProvingKeyKind::Zsa,
+        );
+    }
+
+    #[test]
+    fn wants_hardware_v5_when_account_is_hardware_bound() {
+        assert!(wants_hardware_v5(1, false));
+    }
+
+    #[test]
+    fn wants_hardware_v5_when_plan_targets_external_hardware_signer() {
+        assert!(wants_hardware_v5(0, true));
+    }
+
+    #[test]
+    fn wants_hardware_v5_false_for_a_plain_software_account() {
+        assert!(!wants_hardware_v5(0, false));
+    }
+
+    /// A transparent-only PCZT built the same way `plan_transaction` builds one, at a
+    /// height past Nu6_3's mainnet activation (3,428,143) so the branch's own suggested
+    /// version is `V6` — only `hardware_signing` can force `V5` here. Returns
+    /// `(tx_version, version_group_id)` from the built header.
+    fn built_pczt_header(hardware_signing: bool) -> (u32, u32) {
+        let build_config = BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: None,
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        };
+        let mut builder = Builder::new(
+            &Network::Main,
+            BlockHeight::from_u32(3_500_000),
+            build_config,
+        );
+        if wants_hardware_v5(0, hardware_signing) {
+            builder
+                .propose_version::<()>(TxVersion::V5)
+                .expect("propose v5");
+        }
+
+        let sk = SecretKey::from_slice(&[7u8; 32]).expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
+        let addr = TransparentAddress::PublicKeyHash(pkh);
+        let coin = TxOut::new(Zatoshis::const_from_u64(20_000), addr.script().into());
+        let utxo = OutPoint::new([9u8; 32], 0);
+        builder.add_transparent_input(
+            TransparentInputInfo::from_parts(utxo, coin, SpendInfo::P2pkh { pubkey })
+                .expect("input"),
+        );
+        builder
+            .add_transparent_output(&addr, Zatoshis::const_from_u64(10_000))
+            .expect("output");
+
+        let r = builder
+            .build_for_pczt(
+                rand_core::OsRng,
+                &FeeRule::standard(),
+                |_asset: &AssetBase| false,
+            )
+            .expect("build_for_pczt");
+        let pczt = Creator::build_from_parts(r.pczt_parts).expect("creator");
+        let global = pczt.global();
+        (*global.tx_version(), *global.version_group_id())
+    }
+
+    #[test]
+    fn wants_hardware_v5_true_forces_a_v5_header() {
+        let (tx_version, version_group_id) = built_pczt_header(true);
+        assert_eq!(tx_version, 5);
+        assert_eq!(version_group_id, 0x26A7_270A);
+    }
+
+    #[test]
+    fn wants_hardware_v5_false_leaves_the_branchs_suggested_version() {
+        let (tx_version, _version_group_id) = built_pczt_header(false);
+        assert_eq!(tx_version, 6);
+    }
+
+    #[test]
+    fn transparent_signing_request_reports_header_inputs_and_outputs() {
+        let tprv = transparent_only_tprv();
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+        let recipient_address = TransparentAddress::PublicKeyHash([9u8; 20]).encode(&Network::Main);
+        let bytes = labeled_transparent_pczt_bytes(&tsk, 0, 0, &recipient_address, 1, 3);
+
+        let parsed = Pczt::parse(&bytes).expect("parse pczt");
+        let global = parsed.global();
+        let tbundle = parsed.transparent();
+        let expected_lock_time = determine_lock_time(global, tbundle.inputs()).expect("lock time");
+
+        let mut package = empty_package();
+        package.pczt = bytes;
+        package.n_spends = [1, 0, 0, 0];
+
+        let request = transparent_signing_request(&Network::Main, &package).expect("request");
+
+        assert_eq!(request.tx_version, *global.tx_version());
+        assert_eq!(request.version_group_id, *global.version_group_id());
+        assert_eq!(request.consensus_branch_id, *global.consensus_branch_id());
+        assert_eq!(request.expiry_height, *global.expiry_height());
+        assert_eq!(request.lock_time, expected_lock_time);
+        assert_eq!(request.shielded.sapling_spends, 0);
+        assert_eq!(request.shielded.sapling_outputs, 0);
+        assert_eq!(request.shielded.orchard_actions, 0);
+
+        assert_eq!(request.inputs.len(), 1);
+        let input = &request.inputs[0];
+        assert_eq!(input.index, 0);
+        let mut display_order = FIXTURE_PREVOUT_TXID;
+        display_order.reverse();
+        assert_eq!(
+            input.prev_txid,
+            hex::encode(display_order),
+            "hardware signers expect the txid in display order, not internal order"
+        );
+        assert_eq!(input.prev_index, 0);
+        assert_eq!(input.value, 30_000);
+        assert_eq!(
+            input.sequence, 0xffff_ffff,
+            "a planner-built input leaves no explicit sequence, which must read back as final"
+        );
+        assert_eq!(input.scope, 0);
+        assert_eq!(input.dindex, 0);
+
+        assert_eq!(request.outputs.len(), 2);
+        let recipient = &request.outputs[0];
+        assert_eq!(recipient.value, 10_000);
+        assert_eq!(recipient.address, recipient_address);
+        assert!(!recipient.is_change);
+        assert_eq!(recipient.scope, None);
+        assert_eq!(recipient.dindex, None);
+
+        let change = &request.outputs[1];
+        assert_eq!(change.value, 10_000);
+        assert!(change.is_change);
+        assert_eq!(change.scope, Some(1));
+        assert_eq!(change.dindex, Some(3));
+    }
+
+    #[test]
+    fn transparent_signing_request_reports_the_unified_address_for_a_ua_recipient() {
+        let tprv = transparent_only_tprv();
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+        let (ua, _) = crate::api::account::derive_unified_address(0, TEST_PHRASE, None, 0)
+            .expect("derive ua");
+        let bytes = labeled_transparent_pczt_bytes(&tsk, 0, 0, &ua, 1, 3);
+
+        let mut package = empty_package();
+        package.pczt = bytes;
+        package.n_spends = [1, 0, 0, 0];
+
+        let request = transparent_signing_request(&Network::Main, &package).expect("request");
+        assert_eq!(
+            request.outputs[0].address, ua,
+            "a UA recipient's own address must survive, not a re-derived transparent encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_transparent_signatures_accepts_a_valid_signature_and_can_broadcast() {
+        let tprv = transparent_only_tprv();
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+        let bytes = transparent_pczt_bytes(&tsk, 0, 0);
+
+        let sk_bytes = derive_transparent_sk(&tsk, 0, 0).expect("derive sk");
+        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let pczt = Pczt::parse(&bytes).expect("parse pczt");
+        let signer = Signer::new(pczt).expect("signer");
+        let sighash = signer.transparent_sighash(0).expect("sighash");
+        let signature =
+            secp256k1::Secp256k1::new().sign_ecdsa(&secp256k1::Message::from_digest(sighash), &sk);
+
+        let mut package = empty_package();
+        package.pczt = bytes;
+        package.n_spends = [1, 0, 0, 0];
+        assert!(!package.can_broadcast);
+
+        let signed =
+            apply_transparent_signatures(&package, &[0], &[signature.serialize_der()[..].to_vec()])
+                .expect("apply signatures");
+
+        assert!(signed.can_broadcast);
+        extract_transaction(&signed)
+            .await
+            .expect("signed transaction must extract");
+    }
+
+    #[test]
+    fn apply_transparent_signatures_rejects_a_signature_that_does_not_verify() {
+        let tprv = transparent_only_tprv();
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+        let bytes = transparent_pczt_bytes(&tsk, 0, 0);
+
+        let sk_bytes = derive_transparent_sk(&tsk, 0, 0).expect("derive sk");
+        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let pczt = Pczt::parse(&bytes).expect("parse pczt");
+        let signer = Signer::new(pczt).expect("signer");
+        let sighash = signer.transparent_sighash(0).expect("sighash");
+        let signature =
+            secp256k1::Secp256k1::new().sign_ecdsa(&secp256k1::Message::from_digest(sighash), &sk);
+        let mut der = signature.serialize_der()[..].to_vec();
+        let last = der.len() - 1;
+        der[last] ^= 0xFF;
+
+        let mut package = empty_package();
+        package.pczt = bytes;
+        package.n_spends = [1, 0, 0, 0];
+
+        let error = apply_transparent_signatures(&package, &[0], &[der])
+            .err()
+            .expect("a corrupted signature must be rejected");
+        assert!(
+            error.to_string().contains("failed sighash verification"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn apply_transparent_signatures_rejects_a_non_der_blob() {
+        let tprv = transparent_only_tprv();
+        let tsk = AccountPrivKey::from_extended_privkey(
+            ExtendedPrivateKey::<SecretKey>::from_str(&tprv).expect("parse"),
+        );
+        let bytes = transparent_pczt_bytes(&tsk, 0, 0);
+
+        let mut package = empty_package();
+        package.pczt = bytes;
+        package.n_spends = [1, 0, 0, 0];
+
+        let error = apply_transparent_signatures(&package, &[0], &[vec![0xDE, 0xAD, 0xBE, 0xEF]])
+            .err()
+            .expect("a non-DER blob must be rejected");
+        assert!(
+            error.to_string().contains("is not valid DER"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn apply_transparent_signatures_rejects_mismatched_indices_and_signatures_lengths() {
+        let mut package = empty_package();
+        package.n_spends = [2, 0, 0, 0];
+
+        let error = apply_transparent_signatures(&package, &[0, 1], &[Vec::new()])
+            .err()
+            .expect("a length mismatch must be rejected");
+        assert!(
+            error.to_string().contains("different lengths"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn apply_transparent_signatures_rejects_an_out_of_range_index() {
+        let mut package = empty_package();
+        package.n_spends = [2, 0, 0, 0];
+
+        let error = apply_transparent_signatures(&package, &[5], &[Vec::new()])
+            .err()
+            .expect("an out-of-range index must be rejected");
+        assert!(
+            error.to_string().contains("out of range"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn apply_transparent_signatures_rejects_a_duplicate_index() {
+        let mut package = empty_package();
+        package.n_spends = [2, 0, 0, 0];
+
+        let error = apply_transparent_signatures(&package, &[0, 0], &[Vec::new(), Vec::new()])
+            .err()
+            .expect("a duplicate index must be rejected");
+        assert!(
+            error.to_string().contains("duplicate"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn apply_transparent_signatures_rejects_a_missing_index() {
+        let mut package = empty_package();
+        package.n_spends = [2, 0, 0, 0];
+
+        let error = apply_transparent_signatures(&package, &[0], &[Vec::new()])
+            .err()
+            .expect("a missing index must be rejected");
+        assert!(
+            error.to_string().contains("missing a signature"),
+            "unexpected error: {error}"
         );
     }
 

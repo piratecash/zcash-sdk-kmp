@@ -221,6 +221,7 @@ async fn test_orchard_transfer() {
         smart_transparent: false,
         confirmations: 0,
         category: None,
+        hardware_signing: false,
     };
 
     println!("Planning O2O transfer of {send_amount} zats...");
@@ -721,6 +722,7 @@ async fn test_zsa_transfer() {
         smart_transparent: false,
         confirmations: 0,
         category: None,
+        hardware_signing: false,
     };
 
     let pczt = rlz::api::pay::prepare(&[pay_recipient], options, &sender)

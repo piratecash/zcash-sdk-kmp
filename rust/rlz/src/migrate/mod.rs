@@ -397,7 +397,8 @@ pub async fn step(
             None,
             true, // migration
             Some(&preselected),
-            None, // anchor_height
+            None,  // anchor_height
+            false, // hardware_signing
         )
         .await?;
 
@@ -489,6 +490,7 @@ pub async fn step(
             true, // migration — O→I
             Some(&preselected),
             Some(anchor_height),
+            false, // hardware_signing
         )
         .await?;
 

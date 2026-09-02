@@ -180,6 +180,7 @@ private fun completedSyncState(height: Int?, target: Int): SyncState = when {
  */
 public class ZcashWallet private constructor(
     private val handle: Long,
+    private val network: ZcashNetwork,
     syncBackendForTest: SyncBackend? = null,
 ) {
 
@@ -347,6 +348,7 @@ public class ZcashWallet private constructor(
             options.recipientPaysFee,
             options.smartTransparent,
             options.confirmations,
+            options.hardwareSigning,
         )
         PreparedTransaction(bytes)
     }
@@ -376,6 +378,42 @@ public class ZcashWallet private constructor(
     /** The final wire-format transaction bytes, ready for [broadcast]. */
     public suspend fun extract(transaction: PreparedTransaction): ByteArray =
         withNative { ZcashJni.extractTransaction(transaction.bytes) }
+
+    /**
+     * The JSON payload an external signer (e.g. Trezor) needs to review and sign [transaction]'s
+     * transparent bundle. [transaction] must come from a [prepare] with `hardwareSigning = true`.
+     *
+     * Stateless: only this wallet's own [network] is used, no account and no database access.
+     */
+    public suspend fun transparentSigningRequest(transaction: PreparedTransaction): TransparentSigningRequest =
+        withNative {
+            parseTransparentSigningRequest(ZcashJni.transparentSigningRequest(network.coin, transaction.bytes))
+        }
+
+    /**
+     * Applies device-produced ECDSA signatures to [transaction]'s transparent inputs and
+     * finalizes them, ready for [extract].
+     *
+     * [indices] and [sigs] are parallel arrays: `sigs[i]` signs the transparent input at
+     * `indices[i]`. Structural mistakes — mismatched sizes, a negative or duplicate index, an
+     * empty signature — are rejected here, before the native call; DER and sighash validity stay
+     * native.
+     */
+    public suspend fun applyTransparentSignatures(
+        transaction: PreparedTransaction,
+        indices: IntArray,
+        sigs: Array<ByteArray>,
+    ): PreparedTransaction {
+        require(indices.size == sigs.size) {
+            "indices and sigs must have the same size: ${indices.size} != ${sigs.size}"
+        }
+        require(indices.none { it < 0 }) { "indices must not contain a negative index" }
+        require(indices.toSet().size == indices.size) { "indices must not contain a duplicate index" }
+        require(sigs.none { it.isEmpty() }) { "sigs must not contain an empty signature" }
+        return withNative {
+            PreparedTransaction(ZcashJni.applyTransparentSignatures(transaction.bytes, indices, sigs))
+        }
+    }
 
     /**
      * Reserves wallet-owned inputs before a caller starts network I/O. Idempotent for the same tx.
@@ -532,7 +570,8 @@ public class ZcashWallet private constructor(
 
     public companion object {
 
-        internal fun forSyncTest(backend: SyncBackend): ZcashWallet = ZcashWallet(0, backend)
+        internal fun forSyncTest(backend: SyncBackend): ZcashWallet =
+            ZcashWallet(0, ZcashNetwork.MAIN, backend)
 
         /**
          * [ZcashSdk.initialize] must have run first.
@@ -558,7 +597,7 @@ public class ZcashWallet private constructor(
                     server.proxy,
                 )
             }
-            ZcashWallet(handle)
+            ZcashWallet(handle, network)
         }
     }
 }

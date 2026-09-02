@@ -52,6 +52,9 @@ public enum class ZcashAddressKind {
     TEX,
 }
 
+/** Which receiver kinds a (possibly unified) address carries. */
+public data class AddressReceivers(val hasTransparent: Boolean)
+
 public sealed interface SyncState {
     public data object Stopped : SyncState
     public data object Connecting : SyncState
@@ -121,6 +124,8 @@ public data class PaymentOptions(
     val recipientPaysFee: Boolean = false,
     val smartTransparent: Boolean = false,
     val confirmations: Int = DEFAULT_CONFIRMATIONS,
+    /** Forces a v5 (ZIP-244) transaction so an external hardware signer (e.g. Trezor) can sign it. */
+    val hardwareSigning: Boolean = false,
 ) {
     init {
         require(confirmations >= 0) { "Confirmations must not be negative: $confirmations" }
@@ -161,6 +166,50 @@ public data class TransactionPlan(
     val fee: Long,
     val canSign: Boolean,
     val canBroadcast: Boolean,
+)
+
+/**
+ * The JSON payload an external signer (e.g. Trezor) needs to review and sign a PCZT's
+ * transparent bundle. Returned by [ZcashWallet.transparentSigningRequest].
+ */
+public data class TransparentSigningRequest(
+    val txVersion: Int,
+    val versionGroupId: Long,
+    val consensusBranchId: Long,
+    val expiryHeight: Int,
+    val lockTime: Long,
+    val shielded: ShieldedCounts,
+    val inputs: List<TransparentSigningInput>,
+    val outputs: List<TransparentSigningOutput>,
+)
+
+/** Shielded component counts, so the caller can refuse a bundle the device cannot sign. */
+public data class ShieldedCounts(
+    val saplingSpends: Int,
+    val saplingOutputs: Int,
+    val orchardActions: Int,
+)
+
+/** One transparent input of a [TransparentSigningRequest]. */
+public data class TransparentSigningInput(
+    val index: Int,
+    val prevTxid: String,
+    val prevIndex: Int,
+    val value: Long,
+    val sequence: Long,
+    val scope: Int,
+    val dindex: Int,
+    val scriptPubkey: String,
+)
+
+/** One transparent output of a [TransparentSigningRequest]. [scope]/[dindex] are set only for change. */
+public data class TransparentSigningOutput(
+    val index: Int,
+    val value: Long,
+    val address: String,
+    val isChange: Boolean,
+    val scope: Int? = null,
+    val dindex: Int? = null,
 )
 
 /**

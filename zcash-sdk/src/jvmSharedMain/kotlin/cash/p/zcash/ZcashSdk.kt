@@ -241,6 +241,20 @@ public fun ZcashSdk.addressKind(address: String, network: ZcashNetwork): ZcashAd
 }
 
 /**
+ * Which receiver kinds [address] carries on [network]. Unlike [addressKind], which only names
+ * the address's own format, this looks inside a unified address for what it actually holds —
+ * e.g. whether it carries a transparent (ZIP-320 TEX-capable) receiver.
+ *
+ * The very first call blocks while the native library loads, unless [ZcashSdk.initialize] or any
+ * other SDK call already did it.
+ */
+public fun ZcashSdk.addressReceivers(address: String, network: ZcashNetwork): AddressReceivers {
+    require(address.isNotBlank()) { "Address must not be blank" }
+    NativeLibrary.ensureLoadedBlocking()
+    return mapNativeError { parseAddressReceivers(ZcashJni.addressReceivers(network.coin, address)) }
+}
+
+/**
  * The txid of a fully signed transaction, in the display order explorers use.
  *
  * Needs no [ZcashSdk.initialize] and no open wallet: the bytes carry everything. An offline

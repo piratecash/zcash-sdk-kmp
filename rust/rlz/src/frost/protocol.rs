@@ -543,6 +543,7 @@ pub async fn publish(
         false, // migration
         None,  // preselected
         None,  // anchor_height
+        false, // hardware_signing
     )
     .await
     .context("plan_transaction in DKG publish")?;
