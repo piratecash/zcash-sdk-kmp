@@ -57,14 +57,12 @@ impl ZebraClient {
         // Direct/proxy Zebra JSON-RPC uses reqwest; the proxy applies only
         // when the Proxy transport (3) is selected.
         // reqwest natively supports socks5/socks5h/http/https proxy URLs.
-        let client = if transport == 3 && !proxy.is_empty() {
-            reqwest::Client::builder()
-                .proxy(reqwest::Proxy::all(proxy).anyhow()?)
-                .build()
-                .anyhow()?
-        } else {
-            reqwest::Client::new()
-        };
+        // A redirect target is server-chosen text that would end up in connection errors.
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        if transport == 3 && !proxy.is_empty() {
+            builder = builder.proxy(reqwest::Proxy::all(proxy).anyhow()?);
+        }
+        let client = builder.build().anyhow()?;
 
         let url = Url::parse(url).anyhow()?;
         let host = url.host_str().ok_or(anyhow::anyhow!("No host in URL"))?;
@@ -117,10 +115,14 @@ macro_rules! jsonrpc {
 }
 
 impl ZebraClient {
+    /// Server text is untrusted and may echo the request's own credentials, so no part of a
+    /// response reaches an error: a JSON-RPC error keeps only its code, a malformed result only the
+    /// method name.
     pub async fn jsonrpc_impl<R>(&self, req: Value) -> Result<R>
     where
         R: for<'de> Deserialize<'de>,
     {
+        let method = req["method"].as_str().unwrap_or("?").to_string();
         let rep = match self.transport {
             // Tor and Nym hand a raw stream to post_stream; Direct and
             // Proxy keep the reqwest path.
@@ -140,22 +142,24 @@ impl ZebraClient {
             #[cfg(not(feature = "nym"))]
             2 => anyhow::bail!("nym feature disabled: transport 2 is unavailable"),
             _ => {
-                let body: Value = self
+                // The URL may carry credentials; keep it out of every error.
+                let response = self
                     .client
                     .post(&self.url)
                     .json(&req)
                     .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<Value>()
-                    .await?;
+                    .await
+                    .map_err(reqwest::Error::without_url)?;
+                // reqwest's own status error keeps the server's reason phrase; report the code only.
+                let status = response.status();
+                if !status.is_success() {
+                    anyhow::bail!("HTTP status {} from {method}", status.as_u16());
+                }
+                let body: Value = response.json().await.map_err(reqwest::Error::without_url)?;
                 if let Some(error) = body.pointer("/error") {
                     if !error.is_null() {
-                        let msg = error
-                            .pointer("/message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("unknown error");
-                        anyhow::bail!("JSON RPC error: {}", msg);
+                        let code = error.pointer("/code").and_then(Value::as_i64);
+                        anyhow::bail!("JSON RPC error, code {code:?}, method {method}");
                     }
                 }
                 body
@@ -163,8 +167,9 @@ impl ZebraClient {
         };
         let result = rep
             .pointer("/result")
-            .ok_or_else(|| anyhow::anyhow!("Missing result field in JSON-RPC response: {rep}"))?;
-        let res: R = serde_json::from_value(result.clone())?;
+            .ok_or_else(|| anyhow::anyhow!("Missing result field in JSON-RPC response"))?;
+        let res: R = serde_json::from_value(result.clone())
+            .map_err(|_| anyhow::anyhow!("JSON RPC result of {method} has an unexpected shape"))?;
         Ok(res)
     }
 
@@ -345,6 +350,14 @@ impl LwdServer for ZebraClient {
             hex::decode(&ironwood_tree).unwrap_or_default(),
         ))
     }
+
+    async fn chain_anchor(&mut self, height: u32) -> Result<Vec<u8>> {
+        let res = jsonrpc!(self, "z_gettreestate", [height.to_string()], Value)?;
+        let hash = res["hash"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid response from node: No hash field"))?;
+        Ok(hex::decode(hash)?)
+    }
 }
 
 fn fetch_stream<I, T, F, Fut>(items: I, fetch: F) -> impl Stream<Item = Result<T>>
@@ -497,6 +510,7 @@ mod tests {
     use crate::api::coin::Network;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio_stream::wrappers::ReceiverStream;
+    use zcash_primitives::transaction::TxId;
 
     #[tokio::test]
     async fn jsonrpc_rejects_transport_2_when_nym_is_off() {
@@ -513,6 +527,205 @@ mod tests {
             .to_string();
         assert!(err.contains("nym"), "{err}");
         assert!(err.contains("transport 2"), "{err}");
+    }
+
+    /// The endpoint URL may carry credentials; reqwest puts it in every error, and those errors
+    /// reach the native log and the JNI error slot.
+    #[tokio::test]
+    async fn jsonrpc_transport_error_omits_the_request_url() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let client = ZebraClient::new(&Network::Main, "http://127.0.0.1:1/?api_key=SECRET", 0, "")
+            .expect("constructing the client must not need the network");
+        let err = client
+            .jsonrpc_impl::<serde_json::Value>(serde_json::json!({}))
+            .await
+            .expect_err("nothing listens on port 1");
+
+        let shown = format!("{err:#}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+    }
+
+    /// One loopback HTTP server that answers its first request with `body` and closes.
+    /// One HTTP/1.1 response on a loopback port; `status_line` may carry extra header lines.
+    async fn one_shot_http_server(status_line: &str, body: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("respond");
+        });
+        port
+    }
+
+    /// A client pointed at a one-shot server, its URL carrying `credential_path`.
+    async fn client_answering(body: &'static str, credential_path: &str) -> ZebraClient {
+        let port = one_shot_http_server("200 OK", body).await;
+        client_at(port, credential_path)
+    }
+
+    /// A client whose server answers only an HTTP status line; the URL carries a query credential.
+    async fn client_refusing(status_line: &'static str) -> ZebraClient {
+        let port = one_shot_http_server(status_line, "").await;
+        client_at(port, "/?api_key=SECRET")
+    }
+
+    fn client_at(port: u16, credential_path: &str) -> ZebraClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let url = format!("http://127.0.0.1:{port}{credential_path}");
+        ZebraClient::new(&Network::Main, &url, 0, "").expect("client")
+    }
+
+    fn shown(err: anyhow::Error) -> String {
+        format!("{err:#}")
+    }
+
+    /// A server that reflects the request's credential in its error text must not get it into the
+    /// native log or the JNI error slot.
+    #[tokio::test]
+    async fn jsonrpc_error_from_the_server_omits_the_endpoint_credentials() {
+        let client = client_answering(
+            r#"{"error":{"message":"Invalid API key: SECRET"}}"#,
+            "/?api_key=SECRET",
+        )
+        .await;
+
+        let text = shown(
+            client
+                .jsonrpc_impl::<serde_json::Value>(serde_json::json!({}))
+                .await
+                .expect_err("the server answered with an error"),
+        );
+
+        assert!(text.contains("JSON RPC error"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_error_from_the_server_omits_a_credential_carried_in_the_path() {
+        let client = client_answering(
+            r#"{"error":{"message":"Invalid API key: SECRET"}}"#,
+            "/rpc/SECRET",
+        )
+        .await;
+
+        let text = shown(
+            client
+                .jsonrpc_impl::<serde_json::Value>(serde_json::json!({}))
+                .await
+                .expect_err("the server answered with an error"),
+        );
+
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_response_without_a_result_omits_the_response_body() {
+        let client = client_answering(
+            r#"{"request_url":"http://127.0.0.1/?api_key=SECRET"}"#,
+            "/?api_key=SECRET",
+        )
+        .await;
+
+        let text = shown(
+            client
+                .jsonrpc_impl::<serde_json::Value>(serde_json::json!({}))
+                .await
+                .expect_err("no result field"),
+        );
+
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    /// reqwest keeps the server's custom reason phrase even after `without_url`.
+    #[tokio::test]
+    async fn jsonrpc_http_error_status_omits_the_reason_phrase() {
+        let mut client = client_refusing("401 Invalid API key: SECRET").await;
+
+        let text = shown(
+            client
+                .latest_height()
+                .await
+                .expect_err("the server refused"),
+        );
+
+        assert!(text.contains("401"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    /// A redirect target is server-chosen text that would end up in TLS and connection errors.
+    #[tokio::test]
+    async fn jsonrpc_does_not_follow_redirects() {
+        let target = one_shot_http_server("200 OK", r#"{"result":100}"#).await;
+        let redirect = format!("302 Found\r\nLocation: http://127.0.0.1:{target}/");
+        let mut client = client_at(
+            one_shot_http_server(&redirect, "").await,
+            "/?api_key=SECRET",
+        );
+
+        let text = shown(
+            client
+                .latest_height()
+                .await
+                .expect_err("redirect not followed"),
+        );
+
+        assert!(text.contains("302"), "{text}");
+    }
+
+    /// The node's acknowledgement is not the txid: a well-formed 64-hex string (say a reflected
+    /// credential) must not reach the caller either.
+    #[tokio::test]
+    async fn send_reports_the_locally_computed_txid_not_the_nodes_text() {
+        let (raw, _) = crate::pay::reserve::tests::transparent_transaction();
+        let local: [u8; 32] = crate::pay::reserve::parse_transaction(&raw)
+            .expect("parse")
+            .txid
+            .try_into()
+            .expect("32-byte txid");
+        let mut client: crate::Client = Box::new(
+            client_answering(r#"{"result":"abababababababababababababababababababababababababababababababab","error":null}"#, "/?api_key=abababababababababababababababababababababababababababababababab").await,
+        );
+
+        let outcome = crate::pay::send(&mut client, 0, &raw)
+            .await
+            .expect("accepted");
+
+        assert_eq!(
+            outcome,
+            BroadcastOutcome {
+                error_code: 0,
+                message: TxId::from_bytes(local).to_string(),
+            }
+        );
+    }
+
+    /// serde quotes the offending value when a result has the wrong type.
+    #[tokio::test]
+    async fn jsonrpc_result_of_the_wrong_type_omits_the_value() {
+        let mut client = client_answering(r#"{"result":"SECRET"}"#, "/?api_key=SECRET").await;
+
+        let text = shown(
+            client
+                .latest_height()
+                .await
+                .expect_err("a string is not a height"),
+        );
+
+        assert!(text.contains("getblockcount"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
     }
 
     /// An empty stream would read as "the epoch ended", and the caller would loop forever.

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, span, Level};
 use zcash_keys::encoding::AddressCodec as _;
 use zcash_note_encryption::Domain;
+use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::BranchId;
 use zcash_transparent::address::TransparentAddress;
 
@@ -315,11 +316,17 @@ pub struct TxPlanOut {
     pub asset_name: String, // "ZEC" for ZEC, asset name for ZSA
 }
 
+/// On success `message` is the txid computed from `data`; the node's acknowledgement text is not
+/// trusted with it.
 pub async fn send(client: &mut Client, height: u32, data: &[u8]) -> Result<BroadcastOutcome> {
-    let span = span!(Level::INFO, "transaction");
-    let outcome = client.post_transaction(height, data).await?;
-    span.in_scope(|| {
-        info!("TXID: {}", outcome.message);
-    });
+    let txid: [u8; 32] = reserve::parse_transaction(data)?
+        .txid
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("txid is not 32 bytes"))?;
+    let mut outcome = client.post_transaction(height, data).await?;
+    if outcome.error_code == 0 {
+        outcome.message = TxId::from_bytes(txid).to_string();
+        span!(Level::INFO, "transaction").in_scope(|| info!("TXID: {}", outcome.message));
+    }
     Ok(outcome)
 }

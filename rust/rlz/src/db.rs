@@ -101,6 +101,10 @@ pub async fn create_schema(connection: &mut SqliteConnection) -> Result<()> {
             .execute(&mut *connection)
             .await;
 
+    // `create_schema` runs on every open (api/coin.rs), so a swallowed failure here would leave
+    // an existing database without the columns and make every later query referencing them fail.
+    migrate_address_columns(connection).await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sapling_accounts(
         account INTEGER PRIMARY KEY,
@@ -656,6 +660,58 @@ async fn migrate_can_sign(connection: &mut SqliteConnection) -> Result<()> {
     Ok(())
 }
 
+async fn has_column(connection: &mut SqliteConnection, table: &str, name: &str) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+        .bind(table)
+        .bind(name)
+        .fetch_one(&mut *connection)
+        .await?;
+
+    Ok(count > 0)
+}
+
+/// `backfilled_height`: NULL means "history never fetched for this address" — every pre-existing
+/// row gets that value, which is what makes an upgraded database self-heal on the next discovery
+/// walk. `seen_used`: whether any window ever proved the address used; existing rows are
+/// classified by their notes and spends alone. `catch_up_owed_through`: the highest height at
+/// which the row is known to have history the database does not hold, NULL when nothing is owed.
+const TRANSPARENT_ADDRESS_COLUMNS: [(&str, &str); 3] = [
+    ("backfilled_height", "INTEGER"),
+    ("seen_used", "BOOL NOT NULL DEFAULT FALSE"),
+    ("catch_up_owed_through", "INTEGER"),
+];
+
+async fn migrate_address_columns(connection: &mut SqliteConnection) -> Result<()> {
+    for (name, definition) in TRANSPARENT_ADDRESS_COLUMNS {
+        if !has_column(&mut *connection, "transparent_address_accounts", name).await? {
+            add_address_column(&mut *connection, name, definition).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// `BEGIN IMMEDIATE` serializes concurrent openers; the loser then sees the winner's column and
+/// skips an `ALTER TABLE` that would fail an otherwise valid wallet open.
+async fn add_address_column(
+    connection: &mut SqliteConnection,
+    name: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+    if has_column(&mut tx, "transparent_address_accounts", name).await? {
+        return Ok(());
+    }
+    sqlx::query(&format!(
+        "ALTER TABLE transparent_address_accounts ADD COLUMN {name} {definition}"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(())
+}
+
 pub async fn migrate_sapling_addresses(
     network: &Network,
     connection: &mut SqliteConnection,
@@ -839,6 +895,196 @@ pub async fn delete_prop_prefix(connection: &mut SqliteConnection, prefix: &str)
     Ok(())
 }
 
+/// How far `account`'s transparent address space has been swept, and whether that sweep still
+/// describes the database. `certified` means no trim has landed since the walk that wrote the
+/// record and no announced transaction is still owed; `gap` is the widest gap limit any walk has
+/// ever used; `trim` is the live counter itself, which is what tells a caller "a trim invalidated
+/// the walk" from "trims keep landing".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransparentCoverage {
+    pub certified: bool,
+    pub gap: u32,
+    pub trim: i64,
+}
+
+fn coverage_keys(account: u32) -> (String, String) {
+    (
+        format!("tcov_trim:{account}"),
+        format!("tcov_certified:{account}"),
+    )
+}
+
+fn incarnation_key(account: u32) -> String {
+    format!("tcov_life:{account}")
+}
+
+/// Tells an account apart from its replacement at the same numeric id. Everything else a restored
+/// account carries — seed fingerprint, index, birthday, key — is reproduced exactly, so this
+/// counter is the only thing a walk can compare to notice that its account is gone. It deliberately
+/// outlives the account it counts.
+pub(crate) async fn transparent_incarnation(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<u32> {
+    let counter = get_prop(connection, &incarnation_key(account))
+        .await?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+
+    Ok(counter)
+}
+
+fn parse_coverage(stored: &str) -> Option<(i64, u32)> {
+    let (trim, gap) = stored.split_once(':')?;
+    Some((trim.parse().ok()?, gap.parse().ok()?))
+}
+
+pub(crate) async fn transparent_trim_counter(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<i64> {
+    let (trim_key, _) = coverage_keys(account);
+    let counter = get_prop(connection, &trim_key)
+        .await?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+
+    Ok(counter)
+}
+
+/// Absent keys mean no walk has ever completed: `certified = false`, `gap = 0`.
+pub async fn read_transparent_coverage(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<TransparentCoverage> {
+    let trim = transparent_trim_counter(&mut *connection, account).await?;
+    let (_, certified_key) = coverage_keys(account);
+    let stored = get_prop(&mut *connection, &certified_key).await?;
+
+    Ok(match stored.as_deref().and_then(parse_coverage) {
+        Some((stored_trim, gap)) => TransparentCoverage {
+            certified: stored_trim == trim,
+            gap,
+            trim,
+        },
+        None => TransparentCoverage {
+            certified: false,
+            gap: 0,
+            trim,
+        },
+    })
+}
+
+/// Stamps a completed walk with the trim counter it finished under.
+///
+/// The gap half is a high-water mark, unlike the trim half: a walk never un-discovers an
+/// address, so a later narrower walk must not lower it. Stored plainly, the deep-sweep
+/// obligation would oscillate for the life of the wallet — read 500, walk 20, write 20, and the
+/// next read owes the deep pass again.
+pub async fn write_transparent_coverage(
+    connection: &mut SqliteConnection,
+    account: u32,
+    gap: u32,
+) -> Result<()> {
+    let trim = transparent_trim_counter(&mut *connection, account).await?;
+    let (_, certified_key) = coverage_keys(account);
+    let recorded = get_prop(&mut *connection, &certified_key)
+        .await?
+        .as_deref()
+        .and_then(parse_coverage)
+        .map_or(0, |(_, gap)| gap);
+
+    put_prop(
+        connection,
+        &certified_key,
+        &format!("{trim}:{}", recorded.max(gap)),
+    )
+    .await
+}
+
+/// Retires every walk already in flight: what they hold in memory belongs to the account as it
+/// was before this call, so their next window is refused and the ledger they carry is never
+/// published.
+pub(crate) async fn retire_transparent_walks(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<()> {
+    let incarnation = transparent_incarnation(&mut *connection, account).await?;
+    put_prop(
+        connection,
+        &incarnation_key(account),
+        &incarnation.wrapping_add(1).to_string(),
+    )
+    .await
+}
+
+/// Account ids are reused, so a record left behind by a deleted account would certify a
+/// brand-new one that has never been walked.
+pub async fn clear_transparent_coverage(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<()> {
+    let (trim_key, certified_key) = coverage_keys(account);
+    sqlx::query("DELETE FROM props WHERE key IN (?, ?)")
+        .bind(trim_key)
+        .bind(certified_key)
+        .execute(&mut *connection)
+        .await?;
+    retire_transparent_walks(connection, account).await
+}
+
+/// Raises the catch-up an address owes `transparent_sync` to `through`: history at that height
+/// is known to exist and is not in the database. Never lowered here; only a marker reaching it
+/// pays it.
+pub(crate) async fn raise_catch_up_debt(
+    connection: &mut SqliteConnection,
+    id_taddress: u32,
+    through: u32,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE transparent_address_accounts
+        SET catch_up_owed_through = MAX(COALESCE(catch_up_owed_through, 0), ?)
+        WHERE id_taddress = ?",
+    )
+    .bind(through)
+    .bind(id_taddress)
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(())
+}
+
+/// Only for a reset that rescans the whole history from birth: the new walk re-derives every debt
+/// from what it drops, so nothing is owed against markers at 0.
+pub(crate) async fn clear_catch_up_debts(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE transparent_address_accounts SET catch_up_owed_through = NULL WHERE account = ?",
+    )
+    .bind(account)
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn catch_up_owed_through(
+    connection: &mut SqliteConnection,
+    id_taddress: u32,
+) -> Result<Option<u32>> {
+    let owed: Option<u32> = sqlx::query_scalar(
+        "SELECT catch_up_owed_through FROM transparent_address_accounts WHERE id_taddress = ?",
+    )
+    .bind(id_taddress)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(owed)
+}
+
 pub async fn store_account_metadata(
     connection: &mut SqliteConnection,
     name: &str,
@@ -1005,6 +1251,117 @@ pub async fn store_account_transparent_addr(
     .await?;
 
     Ok(r.rows_affected() > 0)
+}
+
+/// The stored address at a given account/scope/dindex, if one has been created.
+/// `UNIQUE(account, scope, dindex)` makes the answer unambiguous.
+pub async fn transparent_address_row(
+    connection: &mut SqliteConnection,
+    account: u32,
+    scope: u32,
+    dindex: u32,
+) -> Result<Option<(u32, String)>> {
+    let row = sqlx::query(
+        "SELECT id_taddress, address FROM transparent_address_accounts
+        WHERE account = ? AND scope = ? AND dindex = ?",
+    )
+    .bind(account)
+    .bind(scope)
+    .bind(dindex)
+    .map(|row: SqliteRow| {
+        let id_taddress: u32 = row.get(0);
+        let address: String = row.get(1);
+        (id_taddress, address)
+    })
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    Ok(row)
+}
+
+/// The furthest derivation index the wallet has ever stored for a scope, if any. Discovery walks
+/// through it before its trailing-gap stop applies, so a row an earlier wider walk left behind
+/// cannot sit outside a later narrower walk's reach.
+pub async fn highest_stored_dindex(
+    connection: &mut SqliteConnection,
+    account: u32,
+    scope: u32,
+) -> Result<Option<u32>> {
+    let highest: Option<u32> = sqlx::query_scalar(
+        "SELECT MAX(dindex) FROM transparent_address_accounts WHERE account = ? AND scope = ?",
+    )
+    .bind(account)
+    .bind(scope)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(highest)
+}
+
+/// The scope and derivation index of a stored address, given its id — the two coordinates
+/// `advance_backfilled_height`'s uniqueness key needs, for callers that only kept the id.
+pub async fn taddress_scope_dindex(
+    connection: &mut SqliteConnection,
+    id_taddress: u32,
+) -> Result<(u32, u32)> {
+    let row: (u32, u32) = sqlx::query_as(
+        "SELECT scope, dindex FROM transparent_address_accounts WHERE id_taddress = ?",
+    )
+    .bind(id_taddress)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(row)
+}
+
+/// Records coverage of `[covered_from, through]` for one address's transparent history.
+///
+/// Lands only where `covered_from` is contiguous with what the row already proves — at or
+/// below `MAX(marker + 1, birth_height)`, `MAX` rather than `COALESCE` so a marker clamped to
+/// `0` (e.g. by `reset_sync`) still floors at `birth_height` instead of getting stuck below it
+/// forever — and never lowers an existing marker. Both are silent no-ops, not errors: the
+/// caller re-covers the same range on its next pass.
+pub async fn advance_backfilled_height(
+    connection: &mut SqliteConnection,
+    account: u32,
+    birth_height: u32,
+    scope: u32,
+    dindex: u32,
+    covered_from: u32,
+    through: u32,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE transparent_address_accounts SET backfilled_height = ?
+        WHERE account = ? AND scope = ? AND dindex = ?
+        AND ? <= MAX(COALESCE(backfilled_height + 1, 0), ?)
+        AND (backfilled_height IS NULL OR backfilled_height < ?)",
+    )
+    .bind(through)
+    .bind(account)
+    .bind(scope)
+    .bind(dindex)
+    .bind(covered_from)
+    .bind(birth_height)
+    .bind(through)
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(())
+}
+
+/// The backfill coverage marker for a stored address, by row id.
+pub async fn transparent_backfilled_height(
+    connection: &mut SqliteConnection,
+    id_taddress: u32,
+) -> Result<Option<u32>> {
+    let height: Option<u32> = sqlx::query_scalar(
+        "SELECT backfilled_height FROM transparent_address_accounts WHERE id_taddress = ?",
+    )
+    .bind(id_taddress)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(height)
 }
 
 pub async fn init_account_sapling(
@@ -1379,6 +1736,7 @@ pub async fn delete_account(connection: &mut SqliteConnection, account: u32) -> 
         .bind(account)
         .execute(&mut *tx)
         .await?;
+    clear_transparent_coverage(&mut tx, account).await?;
     tx.commit().await?;
 
     Ok(())
@@ -1911,9 +2269,12 @@ pub async fn transparent_address_balance(
 }
 
 /// The account's own default address first, then every other receive address, then the newest
-/// `limit` change addresses. Receive addresses are handed to payers and can be paid at any later
-/// time, so none of them may fall out of the scan set; change addresses only appear on a spend.
-/// The final `ORDER BY` is what fixes the scan order — a bare `UNION ALL` promises none.
+/// `limit` change addresses, plus any older change address that still holds an unspent note —
+/// otherwise a Suite-side spend on it would go unrecorded once it fell out of the window — plus
+/// any change address that still owes a catch-up: discovery or a trim left history above the seam
+/// unfetched for it, and only this scan fetches it. Receive addresses are handed to payers and can
+/// be paid at any later time, so none of them may fall out of the scan set. The final `ORDER BY`
+/// is what fixes the scan order — a bare `UNION ALL` promises none.
 pub async fn transparent_addresses_to_scan(
     connection: &mut SqliteConnection,
     account: u32,
@@ -1921,13 +2282,23 @@ pub async fn transparent_addresses_to_scan(
 ) -> Result<Vec<(u32, String)>> {
     let addresses = sqlx::query(
         "WITH change AS
-        (SELECT * FROM transparent_address_accounts WHERE account = ?1 AND scope = 1 ORDER BY dindex DESC LIMIT ?2)
+        (SELECT * FROM transparent_address_accounts WHERE account = ?1 AND scope = 1 ORDER BY dindex DESC LIMIT ?2),
+        funded_change AS
+        (SELECT DISTINCT ta.* FROM transparent_address_accounts ta
+            JOIN notes n ON n.taddress = ta.id_taddress
+            LEFT JOIN spends s ON s.id_note = n.id_note
+         WHERE ta.account = ?1 AND ta.scope = 1 AND n.pool = 0 AND n.id_asset IS NULL AND s.id_note IS NULL),
+        owed AS
+        (SELECT * FROM transparent_address_accounts
+         WHERE account = ?1 AND scope = 1 AND catch_up_owed_through IS NOT NULL)
         SELECT ta.id_taddress, ta.address,
             CASE WHEN ta.dindex = a.dindex THEN 0 ELSE 1 END AS scan_order, ta.dindex
         FROM transparent_address_accounts ta
             LEFT JOIN accounts a ON a.id_account = ta.account
         WHERE ta.account = ?1 AND ta.scope = 0
         UNION ALL SELECT id_taddress, address, 2, dindex FROM change
+        UNION SELECT id_taddress, address, 2, dindex FROM funded_change
+        UNION SELECT id_taddress, address, 2, dindex FROM owed
         ORDER BY scan_order, dindex DESC",
     )
     .bind(account)
@@ -1941,6 +2312,34 @@ pub async fn transparent_addresses_to_scan(
     .await?;
 
     Ok(addresses)
+}
+
+/// Whether `account` has ever received or spent at `address` — the same notes-union-spends
+/// definition of "used" [`fetch_transparent_address_tx_count`] reports over, or a window ever
+/// proved it used (`seen_used`), which survives the trim that deletes the notes.
+///
+/// An address with no stored row cannot carry either, so it reads as unused.
+pub async fn transparent_address_is_used(
+    connection: &mut SqliteConnection,
+    account: u32,
+    address: &str,
+) -> Result<bool> {
+    let used: bool = sqlx::query_scalar(
+        "WITH n AS (
+        SELECT account, taddress FROM notes WHERE pool = 0 UNION ALL
+        SELECT n.account, n.taddress FROM spends s JOIN notes n ON s.id_note = n.id_note AND s.account = n.account WHERE s.pool = 0)
+        SELECT EXISTS(
+        SELECT 1 FROM transparent_address_accounts ta
+        WHERE ta.account = ?1 AND ta.address = ?2
+        AND (ta.seen_used OR EXISTS(
+            SELECT 1 FROM n WHERE n.account = ta.account AND n.taddress = ta.id_taddress)))",
+    )
+    .bind(account)
+    .bind(address)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(used)
 }
 
 pub async fn fetch_transparent_address_tx_count(
@@ -2669,6 +3068,102 @@ pub(crate) mod tests {
         create_schema(&mut connection).await.expect("second open");
     }
 
+    /// A `transparent_address_accounts` table from before `backfilled_height` existed, with one
+    /// stored row — matching what a wallet upgraded from an older release still holds on disk.
+    pub(crate) async fn pre_backfilled_height_migration_db() -> SqliteConnection {
+        let mut connection = SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("database");
+        sqlx::query(
+            "CREATE TABLE transparent_address_accounts(
+                id_taddress INTEGER PRIMARY KEY,
+                account INTEGER NOT NULL,
+                scope INTEGER NOT NULL,
+                dindex INTEGER NOT NULL,
+                sk BLOB,
+                pk BLOB NOT NULL,
+                address TEXT NOT NULL,
+                UNIQUE (account, scope, dindex))",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("legacy transparent_address_accounts (pre backfilled_height)");
+
+        sqlx::query(
+            "INSERT INTO transparent_address_accounts(id_taddress, account, scope, dindex, pk, address)
+            VALUES (1, 1, 0, 0, x'0102', 'taddr')",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("pre-existing row");
+
+        connection
+    }
+
+    #[tokio::test]
+    async fn create_schema_adds_backfilled_height_to_an_old_database() {
+        let mut connection = pre_backfilled_height_migration_db().await;
+        create_schema(&mut connection).await.expect("first open");
+
+        let marker: Option<i64> = sqlx::query_scalar(
+            "SELECT backfilled_height FROM transparent_address_accounts WHERE id_taddress = 1",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("column exists and the pre-existing row survives");
+        // NULL is the correct default: it means "history never fetched for this address",
+        // which is what makes an upgraded database self-heal on the first discovery walk.
+        assert_eq!(marker, None);
+
+        // Re-opening an already-migrated database must not error (duplicate ALTER TABLE).
+        create_schema(&mut connection).await.expect("second open");
+    }
+
+    /// A database from a build that shipped `backfilled_height` alone gets the two later columns
+    /// and keeps the one it has.
+    #[tokio::test]
+    async fn migrate_address_columns_adds_only_the_missing_columns() {
+        let mut connection = pre_backfilled_height_migration_db().await;
+        sqlx::query(
+            "ALTER TABLE transparent_address_accounts ADD COLUMN backfilled_height INTEGER",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("the older migration");
+        sqlx::query("UPDATE transparent_address_accounts SET backfilled_height = 7")
+            .execute(&mut connection)
+            .await
+            .expect("a marker the older build wrote");
+
+        create_schema(&mut connection).await.expect("open");
+
+        let (marker, used, owed): (Option<i64>, bool, Option<i64>) = sqlx::query_as(
+            "SELECT backfilled_height, seen_used, catch_up_owed_through
+            FROM transparent_address_accounts WHERE id_taddress = 1",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("all three columns");
+        assert_eq!((marker, used, owed), (Some(7), false, None));
+        create_schema(&mut connection).await.expect("second open");
+    }
+
+    #[tokio::test]
+    async fn add_address_column_after_a_concurrent_opener_added_it_succeeds() {
+        let mut connection = pre_backfilled_height_migration_db().await;
+        create_schema(&mut connection)
+            .await
+            .expect("winning opener");
+
+        // The losing opener read the schema before the winner committed, so it still believes
+        // every column is missing; the locked step must find each one and give up quietly.
+        for (name, definition) in TRANSPARENT_ADDRESS_COLUMNS {
+            add_address_column(&mut connection, name, definition)
+                .await
+                .expect("a losing opener must not fail the wallet open");
+        }
+    }
+
     #[tokio::test]
     async fn store_account_metadata_records_can_sign_false_for_dkg_accounts() {
         // Mirrors frost/dkg.rs's call shape (no fingerprint, no hw, can_sign: false) — a DKG
@@ -3087,13 +3582,23 @@ pub(crate) mod tests {
     }
 
     async fn insert_account(connection: &mut SqliteConnection, dindex: u32) {
+        insert_account_with_birth(connection, ACCOUNT, 0, dindex).await;
+    }
+
+    pub(crate) async fn insert_account_with_birth(
+        connection: &mut SqliteConnection,
+        account: u32,
+        birth: u32,
+        dindex: u32,
+    ) {
         sqlx::query(
             "INSERT INTO accounts(id_account, name, aindex, dindex, def_dindex, birth, position,
              use_internal, hidden, saved)
-             VALUES (?1, 'test', 0, ?2, ?2, 0, 0, FALSE, FALSE, TRUE)",
+             VALUES (?1, 'test', 0, ?2, ?2, ?3, 0, FALSE, FALSE, TRUE)",
         )
-        .bind(ACCOUNT)
+        .bind(account)
         .bind(dindex)
+        .bind(birth)
         .execute(&mut *connection)
         .await
         .expect("account");
@@ -3193,6 +3698,142 @@ pub(crate) mod tests {
 
         assert!(first);
         assert!(!second);
+    }
+
+    async fn backfilled_height(connection: &mut SqliteConnection, id_taddress: u32) -> Option<i64> {
+        sqlx::query_scalar(
+            "SELECT backfilled_height FROM transparent_address_accounts WHERE id_taddress = ?",
+        )
+        .bind(id_taddress)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("row")
+    }
+
+    #[tokio::test]
+    async fn transparent_address_row_finds_the_stored_row_by_scope_and_dindex() {
+        let mut connection = memory_db().await;
+        store_account_transparent_addr(
+            &mut connection,
+            ACCOUNT,
+            1,
+            3,
+            None,
+            b"pk",
+            "t1change",
+            false,
+        )
+        .await
+        .expect("insert");
+
+        let row = transparent_address_row(&mut connection, ACCOUNT, 1, 3)
+            .await
+            .expect("query");
+
+        assert_eq!(
+            row.map(|(_, address)| address),
+            Some("t1change".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn transparent_address_row_returns_none_for_an_address_never_stored() {
+        let mut connection = memory_db().await;
+
+        let row = transparent_address_row(&mut connection, ACCOUNT, 0, 5)
+            .await
+            .expect("query");
+
+        assert_eq!(row, None);
+    }
+
+    #[tokio::test]
+    async fn advance_backfilled_height_lands_from_null_when_covered_from_is_the_birth_height() {
+        let mut connection = memory_db().await;
+        store_account_transparent_addr(&mut connection, ACCOUNT, 0, 0, None, b"pk", "t1a", false)
+            .await
+            .expect("insert");
+        let (id, _) = transparent_address_row(&mut connection, ACCOUNT, 0, 0)
+            .await
+            .expect("query")
+            .expect("row");
+
+        advance_backfilled_height(&mut connection, ACCOUNT, 100, 0, 0, 100, 200)
+            .await
+            .expect("advance");
+
+        assert_eq!(backfilled_height(&mut connection, id).await, Some(200));
+    }
+
+    /// The recovery path: `reset_sync` clamps the marker to `0`, not `NULL`. Without the
+    /// `MAX(marker + 1, birth_height)` floor, `covered_from = birth_height` would be tested
+    /// against `marker + 1 = 1` and the account would never be able to recover.
+    #[tokio::test]
+    async fn advance_backfilled_height_recovers_after_a_reset_using_birth_height_as_the_floor() {
+        let mut connection = memory_db().await;
+        store_account_transparent_addr(&mut connection, ACCOUNT, 0, 0, None, b"pk", "t1a", false)
+            .await
+            .expect("insert");
+        let (id, _) = transparent_address_row(&mut connection, ACCOUNT, 0, 0)
+            .await
+            .expect("query")
+            .expect("row");
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET backfilled_height = 0 WHERE id_taddress = ?",
+        )
+        .bind(id)
+        .execute(&mut connection)
+        .await
+        .expect("simulate reset_sync's clamp to 0");
+
+        advance_backfilled_height(&mut connection, ACCOUNT, 100, 0, 0, 100, 150)
+            .await
+            .expect("advance");
+
+        assert_eq!(backfilled_height(&mut connection, id).await, Some(150));
+    }
+
+    #[tokio::test]
+    async fn advance_backfilled_height_refuses_a_claim_that_leaves_a_gap() {
+        let mut connection = memory_db().await;
+        store_account_transparent_addr(&mut connection, ACCOUNT, 0, 0, None, b"pk", "t1a", false)
+            .await
+            .expect("insert");
+        let (id, _) = transparent_address_row(&mut connection, ACCOUNT, 0, 0)
+            .await
+            .expect("query")
+            .expect("row");
+        advance_backfilled_height(&mut connection, ACCOUNT, 100, 0, 0, 100, 200)
+            .await
+            .expect("first advance");
+
+        // covered_from = 250 leaves [201, 249] unaccounted for.
+        advance_backfilled_height(&mut connection, ACCOUNT, 100, 0, 0, 250, 300)
+            .await
+            .expect("second advance is a silent no-op");
+
+        assert_eq!(backfilled_height(&mut connection, id).await, Some(200));
+    }
+
+    #[tokio::test]
+    async fn advance_backfilled_height_never_lowers_an_existing_marker() {
+        let mut connection = memory_db().await;
+        store_account_transparent_addr(&mut connection, ACCOUNT, 0, 0, None, b"pk", "t1a", false)
+            .await
+            .expect("insert");
+        let (id, _) = transparent_address_row(&mut connection, ACCOUNT, 0, 0)
+            .await
+            .expect("query")
+            .expect("row");
+        advance_backfilled_height(&mut connection, ACCOUNT, 100, 0, 0, 100, 300)
+            .await
+            .expect("first advance");
+
+        advance_backfilled_height(&mut connection, ACCOUNT, 100, 0, 0, 100, 250)
+            .await
+            .expect("second advance is a silent no-op");
+
+        assert_eq!(backfilled_height(&mut connection, id).await, Some(300));
     }
 
     #[tokio::test]
@@ -3296,6 +3937,219 @@ pub(crate) mod tests {
 
         let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
         assert_eq!(addresses, vec!["t1default", "t1change2", "t1change1"]);
+    }
+
+    /// A change address old enough to fall out of the newest-`limit` window must still be
+    /// scanned while it holds money nobody has spent yet, and must not appear twice when it is
+    /// also inside the window.
+    #[tokio::test]
+    async fn transparent_addresses_to_scan_returns_an_old_change_address_with_an_unspent_note() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1default").await;
+        for dindex in 0..=5 {
+            insert_scoped_taddress(
+                &mut connection,
+                dindex + 2,
+                1,
+                dindex,
+                &format!("t1change{dindex}"),
+            )
+            .await;
+        }
+        insert_transparent_note(&mut connection, 1, 500, 2).await; // t1change0: outside the newest-2 window
+        insert_transparent_note(&mut connection, 2, 700, 7).await; // t1change5: inside the newest-2 window
+
+        let scanned = transparent_addresses_to_scan(&mut connection, ACCOUNT, 2)
+            .await
+            .expect("addresses");
+
+        let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
+        assert!(
+            addresses.contains(&"t1change0"),
+            "a funded address outside the window must still be scanned: {addresses:?}"
+        );
+        for address in ["t1change0", "t1change5"] {
+            assert_eq!(
+                addresses.iter().filter(|a| **a == address).count(),
+                1,
+                "{address} must not be duplicated: {addresses:?}"
+            );
+        }
+    }
+
+    /// The trim deletes the note but owes the catch-up for it in the same transaction, so the
+    /// `owed` branch keeps returning the address until a sync has paid that debt.
+    #[tokio::test]
+    async fn transparent_addresses_to_scan_keeps_an_old_change_address_the_trim_re_owed() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1default").await;
+        for dindex in 0..=5 {
+            insert_scoped_taddress(
+                &mut connection,
+                dindex + 2,
+                1,
+                dindex,
+                &format!("t1change{dindex}"),
+            )
+            .await;
+        }
+        insert_transparent_note(&mut connection, 1, 500, 2).await; // t1change0: outside the newest-2 window
+
+        crate::sync::trim_sync_data(&mut connection, ACCOUNT, 50)
+            .await
+            .expect("trim");
+
+        let scanned = transparent_addresses_to_scan(&mut connection, ACCOUNT, 2)
+            .await
+            .expect("addresses");
+
+        let addresses: Vec<&str> = scanned.iter().map(|(_, a)| a.as_str()).collect();
+        assert!(
+            addresses.contains(&"t1change0"),
+            "the trim owed the catch-up for the note it deleted: {addresses:?}"
+        );
+        assert_eq!(
+            catch_up_owed_through(&mut connection, 2)
+                .await
+                .expect("debt"),
+            Some(100),
+            "owed through the deleted note's height"
+        );
+    }
+
+    /// The flag is what survives the trim of the notes, so it has to count where "used" is decided.
+    #[tokio::test]
+    async fn transparent_address_is_used_counts_a_seen_used_row_without_notes() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1seen").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 1, "t1never").await;
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET seen_used = TRUE WHERE id_taddress = 1",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("flag");
+
+        assert!(
+            transparent_address_is_used(&mut connection, ACCOUNT, "t1seen")
+                .await
+                .expect("used")
+        );
+        assert!(
+            !transparent_address_is_used(&mut connection, ACCOUNT, "t1never")
+                .await
+                .expect("used")
+        );
+    }
+
+    async fn coverage(connection: &mut SqliteConnection, account: u32) -> TransparentCoverage {
+        read_transparent_coverage(connection, account)
+            .await
+            .expect("coverage record")
+    }
+
+    #[tokio::test]
+    async fn trim_sync_data_bumps_the_transparent_trim_counter() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_taddress(&mut connection, 1, "t1used").await;
+        insert_transparent_note(&mut connection, 1, 500, 1).await;
+        let before = coverage(&mut connection, ACCOUNT).await.trim;
+
+        crate::sync::trim_sync_data(&mut connection, ACCOUNT, 50)
+            .await
+            .expect("trim");
+
+        assert_eq!(coverage(&mut connection, ACCOUNT).await.trim, before + 1);
+    }
+
+    #[tokio::test]
+    async fn reset_sync_bumps_the_transparent_trim_counter() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_taddress(&mut connection, 1, "t1used").await;
+        insert_transparent_note(&mut connection, 1, 500, 1).await;
+        let before = coverage(&mut connection, ACCOUNT).await.trim;
+
+        crate::account::reset_sync(&Network::Main, &mut connection, ACCOUNT)
+            .await
+            .expect("reset");
+
+        assert_eq!(coverage(&mut connection, ACCOUNT).await.trim, before + 1);
+    }
+
+    #[tokio::test]
+    async fn recover_from_partial_sync_on_a_synced_wallet_leaves_the_trim_counter_alone() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        set_sync_height(&mut connection, 100).await;
+        insert_taddress(&mut connection, 1, "t1used").await;
+        insert_transparent_note(&mut connection, 1, 500, 1).await;
+
+        crate::sync::recover_from_partial_sync(&mut connection, &[ACCOUNT])
+            .await
+            .expect("recover");
+
+        assert_eq!(
+            coverage(&mut connection, ACCOUNT).await.trim,
+            0,
+            "a pass that deletes nothing must not expire every certification in the wallet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_narrower_walk_after_a_deep_one_keeps_the_recorded_gap() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_taddress(&mut connection, 1, "t1used").await;
+        insert_transparent_note(&mut connection, 1, 500, 1).await;
+        write_transparent_coverage(&mut connection, ACCOUNT, 500)
+            .await
+            .expect("deep walk");
+        crate::sync::trim_sync_data(&mut connection, ACCOUNT, 50)
+            .await
+            .expect("trim");
+
+        write_transparent_coverage(&mut connection, ACCOUNT, 20)
+            .await
+            .expect("narrow walk");
+
+        let coverage = coverage(&mut connection, ACCOUNT).await;
+        assert_eq!(coverage.gap, 500, "a walk never un-discovers an address");
+        assert!(
+            coverage.certified,
+            "the narrower walk still refreshes the trim stamp"
+        );
+    }
+
+    async fn stored_account(connection: &mut SqliteConnection, name: &str) -> u32 {
+        store_account_metadata(connection, name, &None, &None, 0, false, false, true)
+            .await
+            .expect("account")
+    }
+
+    #[tokio::test]
+    async fn delete_account_clears_the_transparent_coverage_record() {
+        let mut connection = memory_db().await;
+        let account = stored_account(&mut connection, "first").await;
+        write_transparent_coverage(&mut connection, account, 100)
+            .await
+            .expect("completed walk");
+        assert!(coverage(&mut connection, account).await.certified);
+
+        delete_account(&mut connection, account)
+            .await
+            .expect("delete");
+        let reused = stored_account(&mut connection, "second").await;
+
+        assert_eq!(reused, account, "account ids are reused");
+        assert!(
+            !coverage(&mut connection, reused).await.certified,
+            "a new account must not inherit the deleted account's certification"
+        );
     }
 
     async fn use_internal_of(connection: &mut SqliteConnection, account: u32) -> bool {

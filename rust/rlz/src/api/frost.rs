@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
 use crate::{
-    api::coin::Coin,
+    api::{coin::Coin, sync::locked_connection},
     frost::dkg::{get_dkg_params, get_mailbox_account},
 };
 use std::str::FromStr;
@@ -116,7 +116,9 @@ pub async fn set_dkg_address(id: u8, address: &str, c: &Coin) -> Result<()> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn cancel_dkg(c: &Coin) -> Result<()> {
-    let mut connection = c.get_connection().await?;
+    // Deletes accounts, so it frees numeric ids for reuse: it has to queue behind a discovery
+    // walk's window instead of pulling the account out from under it mid-write.
+    let (_guard, mut connection) = locked_connection(c).await?;
     let account = get_funding_account(&mut connection).await?;
     crate::frost::dkg::cancel_dkg(&mut connection, account).await
 }
@@ -152,8 +154,8 @@ pub enum DKGStatus {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn reset_sign(c: &Coin) -> Result<()> {
-    let mut connection = c.get_connection().await?;
-    crate::frost::sign::reset_sign(&mut *connection).await
+    let (_guard, mut connection) = locked_connection(c).await?;
+    crate::frost::sign::reset_sign(&mut connection).await
 }
 
 #[cfg_attr(feature = "flutter", frb)]

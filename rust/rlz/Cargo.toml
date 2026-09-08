@@ -151,6 +151,7 @@ unexpected_cfgs = {level = "warn", check-cfg = ['cfg(frb_expand)']}
 chrono = "0.4"
 rand = "0.6"
 proptest = "=1.4.0"
+tokio = {version = "1", features = ["test-util"]}
 zcash_primitives = {version = "0.30.0", features = ["test-dependencies"]}
 
 [features]

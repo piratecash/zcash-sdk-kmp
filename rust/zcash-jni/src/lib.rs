@@ -20,8 +20,9 @@ use jni::{Env, EnvUnowned};
 use rlz::api::account::{
     address_kind, address_receivers, addresses_from_key, delete_account, derive_unified_address,
     generate_next_receive_address, get_account_pools, get_account_ufvk, list_accounts,
-    list_tx_history, new_account, receivers_from_ua, receivers_of, transparent_address_balance,
-    ua_from_ufvk, unified_address, AddressKind, NewAccount,
+    list_tx_history, new_account, next_unused_receive_address, receivers_from_ua, receivers_of,
+    transparent_address_balance, transparent_coverage, ua_from_ufvk, unified_address, AddressKind,
+    NewAccount,
 };
 use rlz::api::coin::{init_datadir, Coin};
 use rlz::api::key::{
@@ -447,6 +448,62 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_nextTransparentAddress<'local>
                 Some(address) => Ok(env.new_string(&address)?),
                 None => Ok(JString::default()),
             }
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// The lowest receive-scope transparent address that is neither used nor excluded, as
+/// `"{address}\n{certified}\n{gap}"`; `null` when the account has no transparent key.
+///
+/// `excluded` crosses as one newline-joined string: which addresses have already been handed out
+/// and not yet seen used is knowledge only the caller has.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_nextUnusedTransparentAddress<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    excluded: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let excluded = excluded
+                .try_to_string(env)?
+                .split('\n')
+                .filter(|address| !address.is_empty())
+                .map(str::to_owned)
+                .collect();
+
+            match runtime().block_on(next_unused_receive_address(excluded, &coin))? {
+                Some(answer) => Ok(env.new_string(&format!(
+                    "{}\n{}\n{}",
+                    answer.address, answer.certified, answer.gap
+                ))?),
+                None => Ok(JString::default()),
+            }
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// How far the account's transparent address space has been swept, as
+/// `"{certified}\n{gap}\n{trim}"`. Allocates nothing, unlike the selector.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentCoverage<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let coverage = runtime().block_on(transparent_coverage(&coin))?;
+
+            Ok(env.new_string(&format!(
+                "{}\n{}\n{}",
+                coverage.certified, coverage.gap, coverage.trim
+            ))?)
         })
         .resolve::<ThrowNativeError>()
 }

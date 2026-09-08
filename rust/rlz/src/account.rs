@@ -8,8 +8,9 @@ use crate::{
     bip38,
     db::{
         init_account_orchard, init_account_sapling, init_account_transparent,
-        store_account_orchard_vk, store_account_sapling_vk, store_account_seed_fingerprint,
-        store_account_transparent_addr, store_account_transparent_vk, update_dindex,
+        read_transparent_coverage, store_account_orchard_vk, store_account_sapling_vk,
+        store_account_seed_fingerprint, store_account_transparent_addr,
+        store_account_transparent_vk, transparent_address_is_used, update_dindex,
     },
     key::{
         is_account_xprv, is_sapling_esk, is_valid_phrase, is_valid_sapling_key,
@@ -859,6 +860,84 @@ pub async fn generate_next_receive_address(
     generate_next_transparent_address(network, connection, account, 0).await
 }
 
+/// A receive address chosen for the caller, with the coverage statement that describes the very
+/// same instant — both read under one lock, so no trim can land between them.
+pub struct NextUnusedAddress {
+    pub address: String,
+    pub certified: bool,
+    pub gap: u32,
+}
+
+/// The lowest receive-scope index of `account` that is neither used nor in `excluded`, stored so
+/// `transparent_sync` picks it up. `None` when the account has no transparent key.
+///
+/// Candidates are derived, not read: discovery only stores addresses with history, so a wallet
+/// used at 0 and 2 has no row for 1 and a stored-rows-only query would answer 3.
+///
+/// `excluded` is a caller contract — every address handed out and not yet seen used must be in
+/// it. "Reserved for a swap payout" is knowledge the SDK does not have and must not invent.
+///
+/// The account's default address is left where it is.
+pub async fn next_unused_receive_address(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    account: u32,
+    excluded: &[String],
+) -> Result<Option<NextUnusedAddress>> {
+    let (xsk, xvk) = get_transparent_keys(connection, account).await?;
+    let Some(tvk) = xvk.as_ref() else {
+        return Ok(None);
+    };
+
+    let max_stored: Option<u32> = sqlx::query_scalar(
+        "SELECT MAX(dindex) FROM transparent_address_accounts WHERE account = ? AND scope = 0",
+    )
+    .bind(account)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    // Pigeonhole bound, and the reason there is no fallback branch: at most `MAX(stored dindex)
+    // + 1` candidates can be used and at most `excluded.len()` more reserved, so the last index
+    // of this range can be neither.
+    let last = max_stored.map_or(0, |dindex| dindex + 1) + excluded.len() as u32;
+    for dindex in 0..=last {
+        let (pk, address) = derive_transparent_address(tvk, 0, dindex, false)?;
+        let address = address.encode(network);
+        if excluded.iter().any(|reserved| reserved == &address)
+            || transparent_address_is_used(&mut *connection, account, &address).await?
+        {
+            continue;
+        }
+
+        let sk = xsk
+            .as_ref()
+            .map(|tsk| derive_transparent_sk(tsk, 0, dindex))
+            .transpose()?;
+        store_account_transparent_addr(
+            &mut *connection,
+            account,
+            0,
+            dindex,
+            sk,
+            &pk,
+            &address,
+            false,
+        )
+        .await?;
+        let coverage = read_transparent_coverage(&mut *connection, account).await?;
+
+        return Ok(Some(NextUnusedAddress {
+            address,
+            certified: coverage.certified,
+            gap: coverage.gap,
+        }));
+    }
+
+    Err(anyhow!(
+        "no unused receive address for account {account} within the pigeonhole bound {last}"
+    ))
+}
+
 /// `None` when the account has no transparent key, so no such address exists.
 async fn generate_next_transparent_address(
     network: &Network,
@@ -993,6 +1072,10 @@ pub async fn reset_sync(
         .fetch_one(&mut *connection)
         .await?;
     trim_sync_data(&mut *connection, account, 0).await?;
+    // A full rescan from birth re-derives every catch-up from what the new walk drops, so nothing
+    // is owed against markers at 0; walks still in flight were started against the old state.
+    crate::db::clear_catch_up_debts(&mut *connection, account).await?;
+    crate::db::retire_transparent_walks(&mut *connection, account).await?;
     init_sync_heights(network, &mut *connection, account, birth_height).await?;
     Ok(())
 }
@@ -1426,7 +1509,7 @@ pub(crate) mod tests {
     use crate::db::tests::{
         blob, memory_db, non_null_rows, pre_can_sign_migration_db, SECRET_COLUMNS, VIEWING_COLUMNS,
     };
-    use crate::db::{create_schema, get_account_can_sign};
+    use crate::db::{create_schema, get_account_can_sign, write_transparent_coverage};
     use bip32::{ChildNumber, ExtendedKeyAttrs, Prefix};
     use sha2::{Digest, Sha256};
     use zcash_keys::encoding::{encode_extended_full_viewing_key, encode_extended_spending_key};
@@ -1913,6 +1996,267 @@ pub(crate) mod tests {
             .await
             .expect("address after");
         assert_eq!(before, after);
+    }
+
+    async fn transparent_xvk(connection: &mut SqliteConnection, account: u32) -> AccountPubKey {
+        let (_, xvk) = get_transparent_keys(connection, account)
+            .await
+            .expect("keys");
+
+        xvk.expect("the fixture account has a transparent key")
+    }
+
+    /// The receive-scope address `account` derives at `dindex`, stored or not.
+    async fn receive_address_at(
+        connection: &mut SqliteConnection,
+        account: u32,
+        dindex: u32,
+    ) -> String {
+        let xvk = transparent_xvk(connection, account).await;
+        let (_, address) = derive_transparent_address(&xvk, 0, dindex, false).expect("derive");
+
+        address.encode(&Network::Main)
+    }
+
+    /// A stored row and nothing else — what the legacy `MAX(dindex) + 1` allocator leaves behind.
+    async fn store_receive_row(
+        connection: &mut SqliteConnection,
+        account: u32,
+        dindex: u32,
+    ) -> String {
+        let xvk = transparent_xvk(connection, account).await;
+        let (pk, address) = derive_transparent_address(&xvk, 0, dindex, false).expect("derive");
+        let address = address.encode(&Network::Main);
+        store_account_transparent_addr(connection, account, 0, dindex, None, &pk, &address, false)
+            .await
+            .expect("store");
+
+        address
+    }
+
+    /// A stored row plus a transparent note at height 100 — the wallet's definition of "used".
+    async fn mark_used(connection: &mut SqliteConnection, account: u32, dindex: u32) -> String {
+        let address = store_receive_row(connection, account, dindex).await;
+        let id_taddress = crate::db::transparent_address_row(connection, account, 0, dindex)
+            .await
+            .expect("row query")
+            .expect("row just stored")
+            .0;
+        sqlx::query(
+            "INSERT INTO notes(height, account, pool, nullifier, tx, value, taddress)
+             VALUES (100, ?1, 0, ?2, 0, 1000, ?3)",
+        )
+        .bind(account)
+        .bind(dindex.to_le_bytes().to_vec())
+        .bind(id_taddress)
+        .execute(&mut *connection)
+        .await
+        .expect("transparent note");
+
+        address
+    }
+
+    async fn select(
+        connection: &mut SqliteConnection,
+        account: u32,
+        excluded: &[String],
+    ) -> NextUnusedAddress {
+        next_unused_receive_address(&Network::Main, connection, account, excluded)
+            .await
+            .expect("select")
+            .expect("the fixture account has a transparent key")
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_returns_the_lowest_unused_index_across_a_gap() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        mark_used(&mut connection, account, 0).await;
+        mark_used(&mut connection, account, 2).await;
+        let expected = receive_address_at(&mut connection, account, 1).await;
+
+        let answer = select(&mut connection, account, &[]).await;
+
+        // d1 has no stored row, so a stored-rows-only query would have answered d3.
+        assert_eq!(answer.address, expected);
+    }
+
+    /// Seen paid above the seam, with no note in the database yet: still not a fresh address.
+    #[tokio::test]
+    async fn next_unused_receive_address_skips_a_seen_used_address() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET seen_used = TRUE
+            WHERE account = ? AND scope = 0 AND dindex = 0",
+        )
+        .bind(account)
+        .execute(&mut connection)
+        .await
+        .expect("flag");
+        let expected = receive_address_at(&mut connection, account, 1).await;
+
+        let answer = select(&mut connection, account, &[]).await;
+
+        assert_eq!(answer.address, expected);
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_skips_an_excluded_address() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        mark_used(&mut connection, account, 0).await;
+        let excluded = receive_address_at(&mut connection, account, 1).await;
+        let expected = receive_address_at(&mut connection, account, 2).await;
+
+        let answer = select(&mut connection, account, &[excluded.clone()]).await;
+
+        assert_eq!(answer.address, expected);
+        assert_ne!(answer.address, excluded);
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_allocates_a_fresh_index_when_everything_is_used_or_excluded(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        mark_used(&mut connection, account, 0).await;
+        mark_used(&mut connection, account, 1).await;
+        let excluded = receive_address_at(&mut connection, account, 2).await;
+        let expected = receive_address_at(&mut connection, account, 3).await;
+
+        let answer = select(&mut connection, account, &[excluded]).await;
+
+        assert_eq!(answer.address, expected);
+        assert!(
+            crate::db::transparent_address_row(&mut connection, account, 0, 3)
+                .await
+                .expect("row query")
+                .is_some(),
+            "the answer must be stored so transparent_sync picks it up"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_does_not_return_an_excluded_address_beyond_the_stored_maximum(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        mark_used(&mut connection, account, 0).await;
+        let reserved = vec![
+            receive_address_at(&mut connection, account, 1).await,
+            receive_address_at(&mut connection, account, 2).await,
+        ];
+        let expected = receive_address_at(&mut connection, account, 3).await;
+
+        let answer = select(&mut connection, account, &reserved).await;
+
+        // `MAX(dindex) + 1` is d1, which is reserved for a swap payout — the answer the removed
+        // fallback would have given, and a second payment to a one-time address.
+        assert_eq!(answer.address, expected);
+        assert!(!reserved.contains(&answer.address));
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_returns_a_stored_index_with_no_history_unless_it_is_excluded(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        mark_used(&mut connection, account, 0).await;
+        let allocated = store_receive_row(&mut connection, account, 1).await;
+        let after = receive_address_at(&mut connection, account, 2).await;
+
+        // A row the legacy allocator stored and nobody has paid to *is* the lowest unused index;
+        // the caller's exclusion list is the only thing that keeps it out of the answer.
+        assert_eq!(
+            select(&mut connection, account, &[]).await.address,
+            allocated
+        );
+        assert_eq!(
+            select(&mut connection, account, &[allocated]).await.address,
+            after
+        );
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_without_a_transparent_key_returns_none() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, Some(2))
+            .await
+            .expect("restore sapling-only account");
+
+        let answer = next_unused_receive_address(&Network::Main, &mut connection, account, &[])
+            .await
+            .expect("select");
+
+        assert!(answer.is_none());
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_reports_certified_after_a_completed_walk() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        write_transparent_coverage(&mut connection, account, 100)
+            .await
+            .expect("a walk at gap 100 completed");
+
+        let answer = select(&mut connection, account, &[]).await;
+
+        assert!(answer.certified);
+        assert_eq!(answer.gap, 100);
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_reports_uncertified_after_a_trim() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let used = mark_used(&mut connection, account, 0).await;
+        write_transparent_coverage(&mut connection, account, 100)
+            .await
+            .expect("a walk at gap 100 completed");
+
+        crate::sync::trim_sync_data(&mut connection, account, 50)
+            .await
+            .expect("a trim that deletes the used address's only note");
+
+        let answer = select(&mut connection, account, &[]).await;
+        assert_eq!(
+            answer.address, used,
+            "the note is gone, so d0 reads unused again"
+        );
+        assert!(
+            !answer.certified,
+            "the answer is no longer backed by a walk this database has seen"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_reports_uncertified_when_no_walk_has_run() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        let answer = select(&mut connection, account, &[]).await;
+
+        assert!(!answer.certified);
+        assert_eq!(answer.gap, 0);
     }
 
     #[tokio::test]

@@ -193,6 +193,21 @@ impl LwdServer for GRPCClient {
         let ironwood_tree = hex::decode(&state.ironwood_tree).unwrap_or_default();
         Ok((sapling_tree, orchard_tree, ironwood_tree))
     }
+
+    async fn chain_anchor(&mut self, height: u32) -> Result<Vec<u8>> {
+        let state = self
+            .get_tree_state(Request::new(BlockId {
+                height: height as u64,
+                hash: vec![],
+            }))
+            .await?
+            .into_inner();
+        anyhow::ensure!(
+            !state.hash.is_empty(),
+            "tree state at {height} carries no block hash"
+        );
+        Ok(hex::decode(&state.hash)?)
+    }
 }
 
 pub async fn query_lwd_list(coin: u8) -> Result<Vec<LWDInfo>> {

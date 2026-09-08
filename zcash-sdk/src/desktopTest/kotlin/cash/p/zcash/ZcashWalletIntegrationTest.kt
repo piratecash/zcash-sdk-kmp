@@ -248,6 +248,41 @@ class ZcashWalletIntegrationTest {
         }
 
     @Test
+    fun nextUnusedTransparentAddress_onAFreshAccount_returnsTheFirstAddress() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val own = assertNotNull(wallet.addresses(id).transparent)
+
+        val answer = assertNotNull(wallet.nextUnusedTransparentAddress(id, excluded = emptyList()))
+
+        assertEquals(own, answer.address)
+        assertFalse(answer.certified)
+        assertEquals(0, answer.gap)
+    }
+
+    @Test
+    fun nextUnusedTransparentAddress_withTheAnswerExcluded_returnsTheNextOne() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val first = assertNotNull(wallet.nextUnusedTransparentAddress(id, excluded = emptyList()))
+
+        val second =
+            assertNotNull(wallet.nextUnusedTransparentAddress(id, excluded = listOf(first.address)))
+
+        assertTrue(second.address.startsWith("t1"))
+        assertNotEquals(first.address, second.address)
+    }
+
+    @Test
+    fun transparentCoverage_onAFreshAccount_reportsUncertified() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        val coverage = wallet.transparentCoverage(id)
+
+        assertFalse(coverage.certified)
+        assertEquals(0, coverage.gap)
+        assertEquals(0L, coverage.trim)
+    }
+
+    @Test
     fun transparentBalance_freshAccount_isZero() = withWallet { wallet ->
         val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
         val address = assertNotNull(wallet.nextTransparentAddress(id))

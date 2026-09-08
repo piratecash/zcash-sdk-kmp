@@ -11,7 +11,7 @@ use csv_async::AsyncWriter;
 use flutter_rust_bridge::frb;
 use sapling_crypto::{zip32::sapling_derive_internal_fvk, PaymentAddress};
 use secp256k1::{PublicKey, SecretKey};
-use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
+use sqlx::{sqlite::SqliteRow, Connection, Row, SqliteConnection};
 use zcash_address::{
     unified::{Container, Encoding},
     ZcashAddress,
@@ -28,17 +28,22 @@ use zcash_transparent::{
 };
 use zip32::AccountId;
 
-#[cfg(feature = "flutter")]
-use crate::{api::pay::PcztPackage, frb_generated::StreamSink};
 use crate::{
+    account::NextUnusedAddress,
     api::{
         coin::{network_from_coin, Coin},
         pay::SigningEvent,
+        sync::locked_connection,
     },
-    db::{get_account_dindex, get_account_hw},
+    db::{
+        clear_transparent_coverage, get_account_dindex, get_account_hw, read_transparent_coverage,
+        TransparentCoverage,
+    },
     io::{decrypt, encrypt},
     ledger::HWAPI,
 };
+#[cfg(feature = "flutter")]
+use crate::{api::pay::PcztPackage, frb_generated::StreamSink};
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn get_account_pools(account: u32, c: &Coin) -> Result<u8> {
@@ -241,7 +246,7 @@ pub async fn list_accounts(c: &Coin) -> Result<Vec<Account>> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn update_account(update: &AccountUpdate, c: &Coin) -> Result<()> {
-    let mut connection = c.get_connection().await?;
+    let (_guard, mut connection) = locked_connection(c).await?;
 
     if let Some(ref name) = update.name {
         sqlx::query("UPDATE accounts SET name = ? WHERE id_account = ?")
@@ -259,11 +264,23 @@ pub async fn update_account(update: &AccountUpdate, c: &Coin) -> Result<()> {
             .await?;
     }
     if let Some(ref birth) = update.birth {
+        // Markers and the coverage record certify history scanned from the old birthday, so they
+        // fall with it in the same transaction: a walk that read them afterwards would skip every
+        // stored address and certify the account with the newly exposed prefix never requested.
+        let mut db_tx = connection.begin().await?;
         sqlx::query("UPDATE accounts SET birth = ? WHERE id_account = ?")
             .bind(birth)
             .bind(update.id)
-            .execute(&mut *connection)
+            .execute(&mut *db_tx)
             .await?;
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET backfilled_height = NULL WHERE account = ?",
+        )
+        .bind(update.id)
+        .execute(&mut *db_tx)
+        .await?;
+        clear_transparent_coverage(&mut db_tx, update.id).await?;
+        db_tx.commit().await?;
     }
     if let Some(ref enabled) = update.enabled {
         sqlx::query("UPDATE accounts SET enabled = ? WHERE id_account = ?")
@@ -300,7 +317,7 @@ pub async fn update_account(update: &AccountUpdate, c: &Coin) -> Result<()> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn delete_account(account: u32, c: &Coin) -> Result<()> {
-    let mut connection = c.get_connection().await?;
+    let (_guard, mut connection) = locked_connection(c).await?;
 
     crate::db::delete_account(&mut connection, account).await?;
 
@@ -329,7 +346,7 @@ pub async fn has_transparent_pub_key(c: &Coin) -> Result<bool> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn generate_next_dindex(c: &Coin) -> Result<u32> {
-    let mut connection = c.get_connection().await?;
+    let (_guard, mut connection) = locked_connection(c).await?;
 
     crate::account::generate_next_dindex(&c.network(), &mut connection, c.account).await
 }
@@ -338,9 +355,30 @@ pub async fn generate_next_dindex(c: &Coin) -> Result<u32> {
 ///
 /// The account's default address is left where it is, unlike [`generate_next_dindex`].
 pub async fn generate_next_receive_address(c: &Coin) -> Result<Option<String>> {
-    let mut connection = c.get_connection().await?;
+    let (_guard, mut connection) = locked_connection(c).await?;
 
     crate::account::generate_next_receive_address(&c.network(), &mut connection, c.account).await
+}
+
+/// The lowest receive-scope address that is neither used nor in `excluded`, with the coverage
+/// statement describing the same instant; `None` when the account has no transparent key.
+///
+/// `excluded` is a caller contract: every address handed out and not yet seen used belongs in it.
+pub async fn next_unused_receive_address(
+    excluded: Vec<String>,
+    c: &Coin,
+) -> Result<Option<NextUnusedAddress>> {
+    let (_guard, mut connection) = locked_connection(c).await?;
+
+    crate::account::next_unused_receive_address(&c.network(), &mut connection, c.account, &excluded)
+        .await
+}
+
+/// How far the account's transparent address space has been swept, allocating nothing.
+pub async fn transparent_coverage(c: &Coin) -> Result<TransparentCoverage> {
+    let (_guard, mut connection) = locked_connection(c).await?;
+
+    read_transparent_coverage(&mut connection, c.account).await
 }
 
 /// Unspent value at `address`, in zatoshi. Nothing is fetched: this is the last sync's view.
@@ -359,7 +397,7 @@ pub async fn generate_next_change_address(c: &Coin) -> Result<Option<String>> {
 
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn reset_sync(id: u32, c: &Coin) -> Result<()> {
-    let mut connection = c.get_connection().await?;
+    let (_guard, mut connection) = locked_connection(c).await?;
 
     crate::account::reset_sync(&c.network(), &mut connection, id).await
 }
@@ -452,7 +490,7 @@ pub struct TAddressTxCount {
 }
 
 pub async fn remove_account(account_id: u32, c: &Coin) -> Result<()> {
-    let mut connection = c.get_connection().await?;
+    let (_guard, mut connection) = locked_connection(c).await?;
     crate::db::delete_account(&mut connection, account_id).await?;
     Ok(())
 }
@@ -1165,7 +1203,9 @@ mod tests {
         account_efvk, account_xpub, restore, watch_only_keys, TEST_PHRASE,
     };
     use crate::api::coin::Network;
+    use crate::api::sync::{file_backed_coin, LOCK_TEST_SERIAL, SYNCING};
     use crate::db::tests::memory_db;
+    use std::time::Duration;
     use zcash_address::ToAddress;
 
     const MAIN: u8 = 0;
@@ -1464,5 +1504,170 @@ mod tests {
     #[test]
     fn addresses_from_key_rejects_garbage() {
         assert!(addresses_from_key(MAIN, "not a key").is_err());
+    }
+
+    /// The lock's whole claim: no allocator can store a row between the walk's `MAX(stored
+    /// dindex)` snapshot and its evaluation of the resulting range. Disjointness itself stays a
+    /// caller contract.
+    #[tokio::test]
+    async fn next_unused_receive_address_does_not_observe_a_half_written_legacy_allocation() {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin
+            .get_connection()
+            .await
+            .expect("acquire pooled connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore test account");
+        drop(connection);
+        let coin = Coin { account, ..coin };
+
+        let guard = SYNCING.lock().await;
+
+        let mut call = tokio::spawn({
+            let coin = coin.clone();
+            async move { next_unused_receive_address(vec![], &coin).await }
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut call)
+                .await
+                .is_err(),
+            "the selector must not run while a legacy allocation holds SYNCING mid-write"
+        );
+
+        drop(guard);
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut call)
+            .await
+            .expect("selection did not complete once SYNCING was released");
+        joined
+            .expect("task panicked")
+            .expect("selection failed")
+            .expect("an account with a transparent key has an unused receive address");
+    }
+
+    fn birth_update(id: u32, birth: u32) -> AccountUpdate {
+        AccountUpdate {
+            coin: MAIN,
+            id,
+            name: None,
+            icon: None,
+            birth: Some(birth),
+            folder: 0,
+            hidden: None,
+            enabled: None,
+        }
+    }
+
+    /// Markers and the coverage record certify history scanned from the birthday they were
+    /// earned under. Lowering it exposes a prefix nothing has ever requested, so leaving them
+    /// standing would let the next walk skip every stored address and certify the account with
+    /// that prefix still unscanned — funds in it stay invisible and unspendable.
+    #[tokio::test]
+    async fn update_account_lowering_the_birthday_drops_the_coverage_it_certified() {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin
+            .get_connection()
+            .await
+            .expect("acquire pooled connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore test account");
+        crate::db::advance_backfilled_height(
+            &mut connection,
+            account,
+            2_000_000,
+            0,
+            0,
+            2_000_000,
+            2_000_100,
+        )
+        .await
+        .expect("mark the account's address as covered");
+        crate::db::write_transparent_coverage(&mut connection, account, 20)
+            .await
+            .expect("certify the walk");
+        let (id, _) = crate::db::transparent_address_row(&mut connection, account, 0, 0)
+            .await
+            .expect("row lookup")
+            .expect("the account has a stored address");
+        assert_eq!(
+            crate::db::transparent_backfilled_height(&mut connection, id)
+                .await
+                .expect("marker"),
+            Some(2_000_100),
+            "precondition: the address starts out covered"
+        );
+        drop(connection);
+        let coin = Coin { account, ..coin };
+
+        update_account(&birth_update(account, 1_900_000), &coin)
+            .await
+            .expect("update the birthday");
+
+        let mut connection = coin
+            .get_connection()
+            .await
+            .expect("acquire pooled connection");
+        assert_eq!(
+            crate::db::transparent_backfilled_height(&mut connection, id)
+                .await
+                .expect("marker"),
+            None,
+            "a marker earned under the old birthday must not certify the prefix below the new one"
+        );
+        assert!(
+            !read_transparent_coverage(&mut connection, account)
+                .await
+                .expect("coverage read")
+                .certified,
+            "the walk that earned the record never requested the newly exposed prefix"
+        );
+    }
+
+    /// The invalidation and the walk that reads it must not interleave: an update landing between
+    /// a walk's skip decision and its certification would leave the record standing anyway.
+    #[tokio::test]
+    async fn update_account_waits_for_the_sync_guard() {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin
+            .get_connection()
+            .await
+            .expect("acquire pooled connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore test account");
+        drop(connection);
+        let coin = Coin { account, ..coin };
+
+        let guard = SYNCING.lock().await;
+
+        let mut call = tokio::spawn({
+            let coin = coin.clone();
+            async move { update_account(&birth_update(account, 1_900_000), &coin).await }
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut call)
+                .await
+                .is_err(),
+            "an update must not rewrite coverage while a walk holds SYNCING"
+        );
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), &mut call)
+            .await
+            .expect("the update did not complete once SYNCING was released")
+            .expect("task panicked")
+            .expect("update failed");
     }
 }

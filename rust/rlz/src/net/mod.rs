@@ -83,6 +83,11 @@ pub trait LwdServer: Send {
     async fn mempool_stream(&mut self, network: &Network) -> Result<Self::MempoolStream>;
 
     async fn tree_state(&mut self, height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)>;
+
+    /// The backend's hash of the block at `height`. Taken from `GetTreeState`, which lightwalletd
+    /// serves from the node rather than from its compact-block cache, so two equal answers bracket
+    /// a transparent walk against one and the same chain.
+    async fn chain_anchor(&mut self, height: u32) -> Result<Vec<u8>>;
 }
 
 #[cfg(test)]

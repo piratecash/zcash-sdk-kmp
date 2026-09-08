@@ -283,7 +283,7 @@ async fn record_pending_tx(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         api::sync::Balance,
@@ -379,7 +379,7 @@ mod tests {
         bytes
     }
 
-    fn transparent_transaction() -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn transparent_transaction() -> (Vec<u8>, Vec<u8>) {
         let bundle = Bundle {
             vin: vec![TxIn::from_parts(
                 OutPoint::new([1; 32], 0),

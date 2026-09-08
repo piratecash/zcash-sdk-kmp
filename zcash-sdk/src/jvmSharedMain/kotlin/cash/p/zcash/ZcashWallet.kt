@@ -172,6 +172,42 @@ private fun completedSyncState(height: Int?, target: Int): SyncState = when {
 }
 
 /**
+ * A receive address chosen for the caller, with the coverage statement describing the same instant.
+ */
+public data class NextUnusedAddress(
+    val address: String,
+    val certified: Boolean,
+    val gap: Int,
+)
+
+/**
+ * How far an account's transparent address space has been swept.
+ *
+ * [certified] means no trim has landed since the walk that recorded [gap], the widest gap limit
+ * ever walked. [trim] is the raw counter, which is what separates "a trim invalidated the walk"
+ * from "trims keep landing".
+ */
+public data class TransparentCoverage(
+    val certified: Boolean,
+    val gap: Int,
+    val trim: Long,
+)
+
+private fun parseNextUnusedAddress(marshalled: String): NextUnusedAddress {
+    val (address, certified, gap) = marshalled.split('\n')
+    return NextUnusedAddress(address = address, certified = certified.toBoolean(), gap = gap.toInt())
+}
+
+private fun parseTransparentCoverage(marshalled: String): TransparentCoverage {
+    val (certified, gap, trim) = marshalled.split('\n')
+    return TransparentCoverage(
+        certified = certified.toBoolean(),
+        gap = gap.toInt(),
+        trim = trim.toLong(),
+    )
+}
+
+/**
  * One open wallet database.
  *
  * Opening the same path twice shares a single native connection pool, so a second wallet on
@@ -294,6 +330,27 @@ public class ZcashWallet private constructor(
      */
     public suspend fun nextTransparentAddress(id: Int): String? =
         withNative { ZcashJni.nextTransparentAddress(handle, id) }
+
+    /**
+     * The lowest receive-scope address of [id] the SDK has no history for and that is not in
+     * [excluded], or `null` when the account has no transparent key.
+     *
+     * [excluded] is a caller contract: an address handed out and not yet paid to has no history,
+     * so only the caller's list keeps it out of the answer. The address [addresses] reports stays
+     * where it is.
+     */
+    public suspend fun nextUnusedTransparentAddress(
+        id: Int,
+        excluded: List<String>,
+    ): NextUnusedAddress? =
+        withNative {
+            ZcashJni.nextUnusedTransparentAddress(handle, id, excluded.joinToString("\n"))
+                ?.let(::parseNextUnusedAddress)
+        }
+
+    /** How far [id]'s transparent address space has been swept. Allocates nothing. */
+    public suspend fun transparentCoverage(id: Int): TransparentCoverage =
+        withNative { parseTransparentCoverage(ZcashJni.transparentCoverage(handle, id)) }
 
     /**
      * Unspent value at [address] in zatoshi, as of the last sync — nothing is fetched here.

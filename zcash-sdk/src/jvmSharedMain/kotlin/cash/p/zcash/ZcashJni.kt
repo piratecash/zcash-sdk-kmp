@@ -48,6 +48,16 @@ internal object ZcashJni {
     /** A fresh receive-scope transparent address, or `null` when the account has no transparent key. */
     external fun nextTransparentAddress(handle: Long, account: Int): String?
 
+    /**
+     * The lowest receive-scope address that is neither used nor in [excluded], as
+     * `"{address}\n{certified}\n{gap}"`; `null` when the account has no transparent key.
+     * [excluded] crosses newline-joined.
+     */
+    external fun nextUnusedTransparentAddress(handle: Long, account: Int, excluded: String): String?
+
+    /** How far the account's transparent space has been swept, as `"{certified}\n{gap}\n{trim}"`. */
+    external fun transparentCoverage(handle: Long, account: Int): String
+
     /** Unspent value at [address] in zatoshi, as of the last sync. */
     external fun transparentBalance(handle: Long, account: Int, address: String): Long
 
