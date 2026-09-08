@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use arti_client::config::TorClientConfigBuilder;
@@ -24,6 +25,27 @@ use crate::db::{
 use crate::lwd::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::net::zebra::ZebraClient;
 use crate::{Client, IntoAnyhow};
+
+/// Pings make a connection that went dark fail within the keepalive window instead of waiting
+/// out TCP's retransmit backoff. Request/response channels ping fast; `MEMPOOL_KEEP_ALIVE_INTERVAL`
+/// is for the long-lived mempool subscription, kept slower than a stock lightwalletd's
+/// (grpc-go) 5-minute strike window so a quiet stream is never cut for pinging too often.
+#[cfg(not(test))]
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(200);
+
+#[cfg(not(test))]
+const MEMPOOL_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(310);
+#[cfg(test)]
+const MEMPOOL_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(not(test))]
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_millis(300);
+
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 #[cfg_attr(feature = "flutter", frb(dart_metadata = ("freezed")))]
 #[derive(Clone)]
@@ -219,6 +241,16 @@ impl Coin {
     }
 
     pub(crate) async fn client(&self) -> Result<Client> {
+        self.connect(KEEP_ALIVE_INTERVAL).await
+    }
+
+    /// Like `client()`, but pings at `MEMPOOL_KEEP_ALIVE_INTERVAL` — slow enough that a stock
+    /// lightwalletd never strikes the long-lived, mostly-quiet mempool subscription for it.
+    pub(crate) async fn mempool_client(&self) -> Result<Client> {
+        self.connect(MEMPOOL_KEEP_ALIVE_INTERVAL).await
+    }
+
+    async fn connect(&self, ping_interval: Duration) -> Result<Client> {
         // Mixnet-native endpoint (nym:// URL, a nym-rpc service): bypasses the
         // transport enum entirely — the mixnet IS the transport. Classified by
         // scheme before parsing, so a malformed recipient errors out instead of
@@ -247,22 +279,15 @@ impl Coin {
         match self.server_type {
             // lightwalletd (gRPC): transport chosen explicitly by the enum.
             0 => {
+                let endpoint = lightwalletd_endpoint(&self.url, ping_interval)?;
                 let channel = match self.transport {
-                    1 => connect_over_tor(&self.url).await?,
+                    1 => connect_over_tor(endpoint, &self.url).await?,
                     #[cfg(feature = "nym")]
                     2 => connect_over_nym(&self.url).await?,
                     3 if !self.proxy.is_empty() => {
-                        connect_over_proxy(&self.url, &self.proxy).await?
+                        connect_over_proxy(endpoint, &self.url, &self.proxy).await?
                     }
-                    _ => {
-                        let mut endpoint =
-                            tonic::transport::Channel::from_shared(self.url.clone())?;
-                        if self.url.starts_with("https") {
-                            let tls = ClientTlsConfig::new().with_enabled_roots();
-                            endpoint = endpoint.tls_config(tls)?;
-                        }
-                        endpoint.connect().await?
-                    }
+                    _ => endpoint.connect().await?,
                 };
                 let client = CompactTxStreamerClient::new(channel);
                 Ok(Box::new(client) as Client)
@@ -277,6 +302,20 @@ impl Coin {
             _ => unreachable!(),
         }
     }
+}
+
+/// Pings make a connection that went dark fail within the keepalive window instead of TCP's
+/// retransmit backoff. The interval is the caller's: a stock lightwalletd (grpc-go) cuts a client
+/// that pings faster than every 5 min on a stream it is not writing to.
+fn lightwalletd_endpoint(url: &str, ping_interval: Duration) -> Result<Endpoint> {
+    let mut endpoint = Endpoint::from_shared(url.to_string())?
+        .http2_keep_alive_interval(ping_interval)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .tcp_keepalive(Some(TCP_KEEPALIVE));
+    if url.starts_with("https") {
+        endpoint = endpoint.tls_config(ClientTlsConfig::new().with_enabled_roots())?;
+    }
+    Ok(endpoint)
 }
 
 async fn try_open(
@@ -329,7 +368,7 @@ async fn build_tor(directory: &str) -> anyhow::Result<TorClient<PreferredRuntime
     Ok(tor_client)
 }
 
-async fn connect_over_tor(url: &str) -> anyhow::Result<Channel> {
+async fn connect_over_tor(endpoint: Endpoint, url: &str) -> anyhow::Result<Channel> {
     let uri = url.parse::<Uri>()?;
 
     let host = uri
@@ -358,12 +397,6 @@ async fn connect_over_tor(url: &str) -> anyhow::Result<Channel> {
             Ok::<_, anyhow::Error>(compat_stream)
         }
     });
-
-    let mut endpoint = Endpoint::from_shared(url.to_string())?;
-    if url.starts_with("https") {
-        let tls = ClientTlsConfig::new().with_enabled_roots();
-        endpoint = endpoint.tls_config(tls)?;
-    }
 
     Ok(endpoint.connect_with_connector(connector).await?)
 }
@@ -405,7 +438,7 @@ async fn connect_over_nym(url: &str) -> anyhow::Result<Channel> {
 
 /// Build a tonic Channel to `url` whose TCP connection is established through an
 /// external proxy. Supports socks5://, socks5h://, http:// and https:// proxies.
-async fn connect_over_proxy(url: &str, proxy: &str) -> anyhow::Result<Channel> {
+async fn connect_over_proxy(endpoint: Endpoint, url: &str, proxy: &str) -> anyhow::Result<Channel> {
     let uri = url.parse::<Uri>()?;
     let host = uri
         .host()
@@ -429,12 +462,6 @@ async fn connect_over_proxy(url: &str, proxy: &str) -> anyhow::Result<Channel> {
             Ok::<_, anyhow::Error>(compat_stream)
         }
     });
-
-    let mut endpoint = Endpoint::from_shared(url.to_string())?;
-    if url.starts_with("https") {
-        let tls = ClientTlsConfig::new().with_enabled_roots();
-        endpoint = endpoint.tls_config(tls)?;
-    }
 
     Ok(endpoint.connect_with_connector(connector).await?)
 }
@@ -610,11 +637,74 @@ pub fn close_pool(db_filepath: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     /// TEST-NET-3: unroutable, so a regressed guard fails with a connection
     /// error whose text lacks the sentinel instead of quietly passing.
     #[cfg(not(feature = "nym"))]
     const UNROUTABLE: &str = "https://203.0.113.1:9067";
+
+    /// Reads one HTTP/2 frame header + payload, returning the frame type. `None` once the
+    /// connection is closed.
+    async fn read_h2_frame(stream: &mut TcpStream) -> Option<u8> {
+        let mut header = [0u8; 9];
+        stream.read_exact(&mut header).await.ok()?;
+        let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+        let frame_type = header[3];
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.ok()?;
+        Some(frame_type)
+    }
+
+    /// A loopback HTTP/2 server that completes the preface/SETTINGS handshake and then goes
+    /// silent forever, counting PING frames (type 0x6) it receives afterwards. Simulates a
+    /// connection that established fine and then went dark mid-stream.
+    async fn silent_h2_server() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let pings = Arc::new(AtomicUsize::new(0));
+        let pings_for_server = pings.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let pings = pings_for_server.clone();
+                tokio::spawn(async move {
+                    let mut preface = [0u8; 24];
+                    if stream.read_exact(&mut preface).await.is_err() {
+                        return;
+                    }
+                    if read_h2_frame(&mut stream).await.is_none() {
+                        return; // client SETTINGS
+                    }
+                    // Empty SETTINGS frame, then a SETTINGS ACK — completes the handshake.
+                    if stream
+                        .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if stream
+                        .write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0])
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    while let Some(frame_type) = read_h2_frame(&mut stream).await {
+                        if frame_type == 0x6 {
+                            pings.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), pings)
+    }
 
     fn coin_with(url: &str, transport: u8) -> Coin {
         Coin {
@@ -669,5 +759,70 @@ mod tests {
             .to_string();
         assert!(err.contains("nym"), "{err}");
         assert!(err.contains("transport 2"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn client_fails_within_the_keepalive_window_when_the_server_goes_silent_mid_stream() {
+        let (url, pings) = silent_h2_server().await;
+        let mut client = coin_with(&url, 0)
+            .client()
+            .await
+            .expect("connecting to a live (if silent) server must succeed");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.latest_height())
+            .await
+            .expect(
+                "the RPC must fail on its own within the keepalive window, nothing else aborts it",
+            );
+
+        assert!(
+            result.is_err(),
+            "a connection that never answers must not succeed"
+        );
+        assert!(
+            pings.load(Ordering::SeqCst) >= 1,
+            "the client must have pinged the silent server"
+        );
+    }
+
+    /// `()` already implements `Sink<T>`, but only for `T: Debug` — `MempoolMsg` is not, so a
+    /// minimal no-op stands in here instead of widening that derive elsewhere.
+    #[derive(Clone)]
+    struct NoopMempoolSink;
+
+    impl crate::Sink<crate::api::mempool::MempoolMsg> for NoopMempoolSink {
+        async fn send(&self, _value: crate::api::mempool::MempoolMsg) {}
+        async fn send_error(&self, _error: anyhow::Error) {}
+    }
+
+    #[tokio::test]
+    async fn observe_mempool_keeps_a_quiet_stream_unpinged_within_the_keepalive_window() {
+        use crate::api::mempool::observe_mempool;
+        use crate::api::sync::file_backed_coin;
+        use tokio_util::sync::CancellationToken;
+
+        let (url, pings) = silent_h2_server().await;
+        let coin = Coin {
+            url,
+            transport: 0,
+            ..file_backed_coin().await
+        };
+        let token = CancellationToken::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(700),
+            observe_mempool(NoopMempoolSink, token.clone(), &coin),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a quiet mempool stream must still be waiting, not pinged off within the window"
+        );
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            0,
+            "the mempool channel must not have pinged yet"
+        );
     }
 }

@@ -23,7 +23,7 @@ pub async fn observe_mempool<S: Sink<MempoolMsg> + Send + 'static>(
         mempool_sink,
         &c.network(),
         &mut connection,
-        &mut c.client().await?,
+        &mut c.mempool_client().await?,
         cancel_token,
     )
     .await
