@@ -527,6 +527,11 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentBalance<'local>(
         .resolve::<ThrowNativeError>()
 }
 
+/// A negative width would wrap to a huge `u32`; zero is what the walk clamps up to one.
+fn concurrency_arg(value: jint) -> u32 {
+    u32::try_from(value).unwrap_or(0)
+}
+
 /// Re-derives transparent addresses this account handed out before it was restored, storing the
 /// ones the server knows a transaction for. Returns how many were added.
 #[no_mangle]
@@ -537,6 +542,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_discoverTransparentAddresses<'
     account: jint,
     end_height: jint,
     gap_limit: jint,
+    concurrency: jint,
 ) -> jint {
     unowned_env
         .with_env(|_env| -> Result<jint, BridgeError> {
@@ -544,6 +550,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_discoverTransparentAddresses<'
             let added = runtime().block_on(discover_transparent_addresses(
                 end_height as u32,
                 gap_limit as u32,
+                concurrency_arg(concurrency),
                 &coin,
             ))?;
             Ok(added as jint)
@@ -1254,6 +1261,18 @@ mod tests {
             3,
             2,
         )
+    }
+
+    #[test]
+    fn concurrency_arg_negative_becomes_zero() {
+        assert_eq!(0, concurrency_arg(-1));
+        assert_eq!(0, concurrency_arg(jint::MIN));
+    }
+
+    #[test]
+    fn concurrency_arg_positive_passes_through() {
+        assert_eq!(8, concurrency_arg(8));
+        assert_eq!(0, concurrency_arg(0));
     }
 
     #[test]

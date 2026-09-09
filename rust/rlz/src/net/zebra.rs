@@ -36,7 +36,7 @@ use crate::{
     api::coin::Network,
     lwd::*,
     net::{forward_stream, BroadcastOutcome, LwdServer},
-    IntoAnyhow,
+    Client, IntoAnyhow,
 };
 
 #[derive(Clone)]
@@ -213,6 +213,10 @@ impl ZebraClient {
 
 #[async_trait]
 impl LwdServer for ZebraClient {
+    fn duplicate(&self) -> Client {
+        Box::new(self.clone())
+    }
+
     async fn latest_height(&mut self) -> Result<u32> {
         let block_count = jsonrpc!(self, "getblockcount", [], u32)?;
         Ok(block_count as u32)

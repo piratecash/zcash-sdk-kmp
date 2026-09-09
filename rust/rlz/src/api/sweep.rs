@@ -16,6 +16,10 @@ use flutter_rust_bridge::frb;
 /// connection no matter how many other discovery calls are queued behind it.
 static DISCOVERING: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// How many candidates a discovery walk probes at once over its one connection when the caller
+/// does not choose. The walk halves it on the first failed probe and clamps it to `1..=32`.
+pub const DEFAULT_DISCOVERY_CONCURRENCY: u32 = 8;
+
 #[cfg(not(test))]
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(test)]
@@ -60,6 +64,7 @@ impl TransparentScanner {
             c.account,
             end_height,
             gap_limit,
+            DEFAULT_DISCOVERY_CONCURRENCY,
             move |address| {
                 let _ = address_stream.add(address);
             },
@@ -79,10 +84,14 @@ impl TransparentScanner {
 /// Rediscovers transparent addresses the account handed out before it was restored: a restore
 /// keeps the keys but not the address rows, so payments made to a one-time address stay invisible
 /// until it is derived again. Returns how many addresses were added.
+///
+/// `concurrency` is how many candidates are probed at once over the one connection; the walk
+/// clamps it into `1..=32`, so 0 means the sequential walk.
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn discover_transparent_addresses(
     end_height: u32,
     gap_limit: u32,
+    concurrency: u32,
     c: &Coin,
 ) -> Result<u32> {
     let _walk = DISCOVERING.lock().await;
@@ -95,6 +104,7 @@ pub async fn discover_transparent_addresses(
         c.account,
         end_height,
         gap_limit,
+        concurrency,
         |_| {},
         CancellationToken::new(),
     )
@@ -122,7 +132,9 @@ mod tests {
 
         let mut call = tokio::spawn({
             let coin = coin.clone();
-            async move { discover_transparent_addresses(0, 0, &coin).await }
+            async move {
+                discover_transparent_addresses(0, 0, DEFAULT_DISCOVERY_CONCURRENCY, &coin).await
+            }
         });
 
         for _ in 0..10 {
@@ -193,7 +205,7 @@ mod tests {
 
         let call = tokio::time::timeout(
             Duration::from_secs(5),
-            discover_transparent_addresses(2_000_100, 0, &coin),
+            discover_transparent_addresses(2_000_100, 0, DEFAULT_DISCOVERY_CONCURRENCY, &coin),
         )
         .await
         .expect("discovery must give up on its own, with nothing aborting it");
@@ -216,9 +228,15 @@ mod tests {
         let handles: Vec<_> = (0..5)
             .map(|_| {
                 let coin = coin.clone();
-                tokio::spawn(
-                    async move { discover_transparent_addresses(2_000_100, 0, &coin).await },
-                )
+                tokio::spawn(async move {
+                    discover_transparent_addresses(
+                        2_000_100,
+                        0,
+                        DEFAULT_DISCOVERY_CONCURRENCY,
+                        &coin,
+                    )
+                    .await
+                })
             })
             .collect();
 

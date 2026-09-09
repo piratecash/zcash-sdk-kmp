@@ -11,11 +11,15 @@ use crate::{
     api::{coin::Network, network::LWDInfo},
     lwd::*,
     net::{forward_stream, BroadcastOutcome, LwdServer},
-    GRPCClient,
+    Client, GRPCClient,
 };
 
 #[async_trait]
 impl LwdServer for GRPCClient {
+    fn duplicate(&self) -> Client {
+        Box::new(self.clone())
+    }
+
     async fn latest_height(&mut self) -> Result<u32> {
         let block_id = self
             .get_latest_block(Request::new(ChainSpec {}))

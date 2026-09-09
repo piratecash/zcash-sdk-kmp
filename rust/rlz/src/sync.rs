@@ -34,6 +34,7 @@ use crate::{
     warp::{legacy::CommitmentTreeFrontier, sync::warp_sync},
 };
 use bincode::config;
+use futures::future::join_all;
 use sqlx::pool::PoolConnection;
 use sqlx::{Connection, Sqlite, SqlitePool};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -1510,6 +1511,19 @@ impl From<BackfillError> for anyhow::Error {
 /// that still fails propagates instead of narrowing further.
 const MIN_BACKFILL_WINDOW: u32 = 1_000;
 
+/// However many candidates the caller asks for at once, a discovery walk never has more than this
+/// many requests in flight on its one connection.
+const MAX_DISCOVERY_CONCURRENCY: u32 = 32;
+
+/// The `Ok` half of `fetch_window`: a window's first item, the rest of its stream, and the seam
+/// the request was made under: outside `SYNCING` a concurrent sync can move it onto another fork,
+/// so the ingest compares seams and asks again instead of committing a reply from a chain it left.
+struct Fetched {
+    seam: u32,
+    first: Option<(u32, zcash_primitives::transaction::Transaction, usize)>,
+    rx: Receiver<Result<(u32, zcash_primitives::transaction::Transaction, usize)>>,
+}
+
 /// Caps how long one address's one window may hold `SYNCING` for, in a discovery walk and in the
 /// regular sync alike. Held per window rather than for a whole run, so a stalled server cannot
 /// starve `synchronize_impl`'s sync ticks or freeze address selection behind a run that may
@@ -1546,14 +1560,9 @@ async fn fetch_window(
     taddr: &str,
     lo: u32,
     hi: u32,
+    seam: u32,
     cancellation_token: &CancellationToken,
-) -> Result<
-    (
-        Option<(u32, zcash_primitives::transaction::Transaction, usize)>,
-        Receiver<Result<(u32, zcash_primitives::transaction::Transaction, usize)>>,
-    ),
-    BackfillError,
-> {
+) -> Result<Fetched, BackfillError> {
     tokio::select! {
         _ = cancellation_token.cancelled() => Err(BackfillError::Cancelled),
         result = async {
@@ -1567,7 +1576,7 @@ async fn fetch_window(
                 Some(Err(e)) => return Err(BackfillError::Fetch(e)),
                 None => None,
             };
-            Ok((first, rx))
+            Ok(Fetched { seam, first, rx })
         } => result,
     }
 }
@@ -1763,6 +1772,7 @@ async fn walk_candidate(
     mut lo: u32,
     backfill_end: u32,
     cancellation_token: &CancellationToken,
+    mut first: Option<Fetched>,
 ) -> Result<(Option<(u32, String)>, bool), BackfillError> {
     let mut used = false;
     if lo > backfill_end {
@@ -1802,8 +1812,15 @@ async fn walk_candidate(
                 row = transparent_address_row(connection, account, scope, dindex)
                     .await
                     .map_err(BackfillError::Db)?;
-                let (first, mut rx) =
-                    fetch_window(client, network, taddr, lo, hi, cancellation_token).await?;
+                // A reply obtained under a different seam is unusable at any height: it may
+                // describe a fork a concurrent sync has since left.
+                let Fetched { first, mut rx, .. } = match first.take() {
+                    Some(fetched) if fetched.seam == seam => fetched,
+                    _ => {
+                        fetch_window(client, network, taddr, lo, hi, seam, cancellation_token)
+                            .await?
+                    }
+                };
                 // Any window that yielded something proves the address used, even if this window
                 // later fails and the walk has to narrow and retry it.
                 let found = first.is_some();
@@ -1885,6 +1902,23 @@ async fn walk_candidate(
     Ok((row, used))
 }
 
+/// One index planned into a batch. `candidate` is `None` when `candidate_start` said the index
+/// needs no request at all.
+struct BatchEntry {
+    dindex: u32,
+    candidate: Option<Candidate>,
+}
+
+/// Everything one batched candidate needs, derived once while the batch is planned.
+struct Candidate {
+    existing: Option<(u32, String)>,
+    lo: u32,
+    address: TransparentAddress,
+    pk: Vec<u8>,
+    taddr: String,
+    sk: Option<Vec<u8>>,
+}
+
 /// Rediscovers transparent addresses the wallet issued but has no rows for, and backfills the
 /// transaction history of every address in `[birth_height, seam]` — both the state a restore
 /// leaves behind (only the account's own address survives) and the gaps an address that already
@@ -1904,6 +1938,7 @@ pub async fn discover_transparent_addresses(
     account: u32,
     end_height: u32,
     gap_limit: u32,
+    concurrency: u32,
     progress_fn: impl Fn(String),
     cancellation_token: CancellationToken,
 ) -> Result<u32> {
@@ -1943,6 +1978,10 @@ pub async fn discover_transparent_addresses(
     let mut n_added = 0;
     let mut covered: Vec<(u32, u32)> = vec![];
 
+    // One adaptive width for the whole invocation: a server that refused a batch is not asked to
+    // take a wider one again in the next scope.
+    let mut width = concurrency.clamp(1, MAX_DISCOVERY_CONCURRENCY);
+
     for scope in 0..2 {
         // A wider earlier walk can have stored an address past where this gap would stop; leaving
         // it unvisited would let the run certify coverage for history it never checked.
@@ -1954,74 +1993,183 @@ pub async fn discover_transparent_addresses(
                 anyhow::bail!("transparent discovery cancelled");
             }
 
-            let (pk, address) = match xvk.as_ref() {
-                Some(xvk) => derive_transparent_address(xvk, scope, dindex, false)?,
-                None if hw != 0 => {
-                    ledger
-                        .get_hw_transparent_address(network, aindex, scope, dindex)
-                        .await?
-                }
-                _ => anyhow::bail!("Sweep needs an xpub key"),
-            };
-            let taddr = address.encode(network);
-            progress_fn(taddr.clone());
+            // Plan over the indexes the sequential walk is certain to reach from here, so a batch
+            // never requests an address that walk would not have asked for.
+            let certain = gap_limit.saturating_add(1).saturating_sub(gap).max(
+                stored_through.map_or(0, |last| last.saturating_add(1).saturating_sub(dindex)),
+            );
+            let mut batch: Vec<BatchEntry> = vec![];
+            let mut requests = 0;
+            while (batch.len() as u32) < certain && requests < width {
+                let (pk, address) = match xvk.as_ref() {
+                    Some(xvk) => derive_transparent_address(xvk, scope, dindex, false)?,
+                    None if hw != 0 => {
+                        ledger
+                            .get_hw_transparent_address(network, aindex, scope, dindex)
+                            .await?
+                    }
+                    _ => anyhow::bail!("Sweep needs an xpub key"),
+                };
+                let taddr = address.encode(network);
+                progress_fn(taddr.clone());
 
-            let Some((existing, lo)) = candidate_start(
-                connection,
-                account,
-                &identity,
-                scope,
-                dindex,
-                &taddr,
-                birth_height,
-            )
-            .await?
-            else {
-                gap = 0;
-                covered.push((scope, dindex));
+                let candidate = match candidate_start(
+                    connection,
+                    account,
+                    &identity,
+                    scope,
+                    dindex,
+                    &taddr,
+                    birth_height,
+                )
+                .await?
+                {
+                    Some((existing, lo)) => {
+                        // An address already backfilled past the tip costs an index but no
+                        // request, so it never spends one of the batch's slots.
+                        if lo <= backfill_end {
+                            requests += 1;
+                        }
+                        let sk = tk
+                            .xsk
+                            .as_ref()
+                            .map(|tsk| derive_transparent_sk(tsk, scope, dindex))
+                            .transpose()?;
+                        Some(Candidate {
+                            existing,
+                            lo,
+                            address,
+                            pk,
+                            taddr,
+                            sk,
+                        })
+                    }
+                    None => None,
+                };
+                batch.push(BatchEntry { dindex, candidate });
                 dindex += 1;
-                continue;
-            };
+            }
 
-            let sk = tk
-                .xsk
-                .as_ref()
-                .map(|tsk| derive_transparent_sk(tsk, scope, dindex))
-                .transpose()?;
-
-            let (row, used) = walk_candidate(
-                network,
-                connection,
-                client,
-                account,
-                &identity,
-                birth_height,
-                scope,
-                dindex,
-                existing.clone(),
-                &address,
-                sk,
-                &pk,
-                &taddr,
-                lo,
-                backfill_end,
-                &cancellation_token,
-            )
-            .await?;
-
-            if row.is_some() {
-                covered.push((scope, dindex));
-                if existing.is_none() {
-                    n_added += 1;
+            // Ask for every candidate's whole first window at once, outside `SYNCING`. A lone
+            // request is left to `walk_candidate` under the guard, so width 1 is what it was.
+            let mut prefetched: Vec<Option<Result<Fetched, BackfillError>>> =
+                batch.iter().map(|_| None).collect();
+            if requests >= 2 {
+                // Read here rather than reused from planning: those guards are released between
+                // candidates, so only a fresh one states what the batch is actually requested under.
+                let batch_seam = {
+                    let _guard = SYNCING.lock().await;
+                    account_seam(connection, account).await?
+                };
+                let targets: Vec<(usize, &Candidate)> = batch
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, entry)| entry.candidate.as_ref().map(|c| (slot, c)))
+                    .filter(|(_, candidate)| candidate.lo <= backfill_end)
+                    .collect();
+                // Built before the join: a future borrowing `client` would not be `Send`, and the
+                // walk is spawned.
+                let mut duplicates: Vec<Client> =
+                    targets.iter().map(|_| client.duplicate()).collect();
+                let token = &cancellation_token;
+                let results = join_all(duplicates.iter_mut().zip(&targets).map(
+                    |(duplicate, (_, candidate))| async move {
+                        match tokio::time::timeout(
+                            WINDOW_TIMEOUT,
+                            fetch_window(
+                                duplicate,
+                                network,
+                                &candidate.taddr,
+                                candidate.lo,
+                                backfill_end,
+                                batch_seam,
+                                token,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_elapsed) => Err(BackfillError::Timeout {
+                                lo: candidate.lo,
+                                hi: backfill_end,
+                            }),
+                        }
+                    },
+                ))
+                .await;
+                for ((slot, _), result) in targets.iter().zip(results) {
+                    prefetched[*slot] = Some(result);
                 }
             }
-            if existing.is_some() || used {
-                gap = 0;
-            } else {
-                gap += 1;
+
+            // A cancellation anywhere in the batch ends the walk before anything of it is written.
+            if prefetched
+                .iter()
+                .any(|slot| matches!(slot, Some(Err(BackfillError::Cancelled))))
+            {
+                anyhow::bail!("transparent discovery cancelled");
             }
 
-            dindex += 1;
+            // Ingest strictly in index order.
+            for (slot, entry) in batch.into_iter().enumerate() {
+                // Per candidate, not per batch: a token cancelled while the batch waited for
+                // `SYNCING` is never seen by an empty prefetch, which skips `fetch_window` too.
+                if cancellation_token.is_cancelled() {
+                    anyhow::bail!("transparent discovery cancelled");
+                }
+                let Some(candidate) = entry.candidate else {
+                    gap = 0;
+                    covered.push((scope, entry.dindex));
+                    continue;
+                };
+                let first = match prefetched[slot].take() {
+                    Some(Ok(fetched)) => Some(fetched),
+                    // The first failed probe halves the width for the rest of the invocation and
+                    // drops every sibling stream unread, so this candidate's retry and each of the
+                    // later ones reaches the server alone, exactly as the sequential walk does.
+                    Some(Err(_fetch_or_timeout)) => {
+                        width = (width / 2).max(1);
+                        prefetched.iter_mut().for_each(|sibling| *sibling = None);
+                        None
+                    }
+                    None => None,
+                };
+
+                let (row, used) = walk_candidate(
+                    network,
+                    connection,
+                    client,
+                    account,
+                    &identity,
+                    birth_height,
+                    scope,
+                    entry.dindex,
+                    candidate.existing.clone(),
+                    &candidate.address,
+                    candidate.sk,
+                    &candidate.pk,
+                    &candidate.taddr,
+                    candidate.lo,
+                    backfill_end,
+                    &cancellation_token,
+                    first,
+                )
+                .await?;
+
+                if row.is_some() {
+                    covered.push((scope, entry.dindex));
+                    if candidate.existing.is_none() {
+                        n_added += 1;
+                    }
+                }
+                // The row re-read under the guard, not the one seen while planning: an address
+                // allocated in between is an existing address, not a step toward the gap.
+                if row.is_some() || used {
+                    gap = 0;
+                } else {
+                    gap += 1;
+                }
+            }
         }
     }
 
@@ -2066,6 +2214,7 @@ pub async fn transparent_sweep(
     account: u32,
     end_height: u32,
     gap_limit: u32,
+    concurrency: u32,
     progress_fn: impl Fn(String) + 'static + Send,
     cancellation_token: CancellationToken,
     walk: MutexGuard<'static, ()>,
@@ -2080,6 +2229,7 @@ pub async fn transparent_sweep(
             account,
             end_height,
             gap_limit,
+            concurrency,
             progress_fn,
             cancellation_token,
         )
@@ -2186,6 +2336,7 @@ mod tests {
         memory_db, set_pool_sync_height, set_pool_sync_height_for_account, ACCOUNT,
     };
     use crate::net::{BroadcastOutcome, LwdServer};
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
@@ -2398,16 +2549,21 @@ mod tests {
     /// the shape a mid-account network error takes. `stream_failures` is how many of the first
     /// streams announce a transaction and then break, so one fake can serve a failing call and
     /// the retry that follows it.
+    #[derive(Clone)]
     struct EmptyStreams {
-        calls: u32,
+        calls: Arc<AtomicU32>,
         fail_at_call: Option<u32>,
-        stream_failures: u32,
+        stream_failures: Arc<AtomicU32>,
         block_time: Option<u32>,
         fail_block: bool,
     }
 
     #[async_trait]
     impl LwdServer for EmptyStreams {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -2446,15 +2602,15 @@ mod tests {
             _start: u32,
             _end: u32,
         ) -> Result<Self::TransactionStream> {
-            self.calls += 1;
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
             anyhow::ensure!(
-                self.fail_at_call != Some(self.calls),
+                self.fail_at_call != Some(call),
                 "server failed on address {}",
-                self.calls
+                call
             );
             let (sender, receiver) = channel(2);
-            if self.stream_failures > 0 {
-                self.stream_failures -= 1;
+            if self.stream_failures.load(Ordering::Relaxed) > 0 {
+                self.stream_failures.fetch_sub(1, Ordering::Relaxed);
                 sender
                     .send(Ok((101, any_transaction(), 0)))
                     .await
@@ -2499,9 +2655,9 @@ mod tests {
             .expect("drop headers");
 
         let mut client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: Some(12345),
             fail_block: false,
         });
@@ -2559,9 +2715,9 @@ mod tests {
         fail_at_call: Option<u32>,
     ) -> Result<()> {
         let mut client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: None,
             fail_block: false,
         });
@@ -2609,9 +2765,9 @@ mod tests {
         .await
         .expect("undated transaction");
         let mut client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: Some(12345),
             fail_block: false,
         });
@@ -2651,9 +2807,9 @@ mod tests {
         .await;
         set_pool_sync_height(&mut connection, 0, 100).await;
         let mut client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 1,
+            stream_failures: Arc::new(AtomicU32::new(1)),
             block_time: None,
             fail_block: false,
         });
@@ -2686,6 +2842,7 @@ mod tests {
     /// Accepts the request and then never answers it, the way a hung or hostile server does.
     /// `calls` lets a test wait until the stall is provably in flight before it moves the clock.
     /// `stall_wider_than` models the slow-but-honest server: it answers a narrow enough window.
+    #[derive(Clone)]
     struct StalledStream {
         calls: Arc<AtomicU32>,
         call_ranges: Arc<Mutex<Vec<(u32, u32)>>>,
@@ -2709,6 +2866,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for StalledStream {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -2990,6 +3151,7 @@ mod tests {
     /// has: a single failing call would be repaired by the very narrowing under test.
     /// `fail_mid_stream` turns the `fail_wider_than` rejection from a refused request into a
     /// stream that delivers one transaction and then dies.
+    #[derive(Clone)]
     struct UsedAtCalls {
         calls: Arc<AtomicU32>,
         used_at_calls: Vec<u32>,
@@ -3063,6 +3225,7 @@ mod tests {
 
     /// Yields a fixed sequence of transactions in the exact order given — used to prove ingestion
     /// is insensitive to delivery order (e.g. a spend arriving before the note it spends).
+    #[derive(Clone)]
     struct FixedTxs {
         items: Vec<(u32, Transaction, usize)>,
         block_time: Option<u32>,
@@ -3073,6 +3236,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for FixedTxs {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -3186,12 +3353,17 @@ mod tests {
     /// Sends the first transaction immediately, then blocks on a `Notify` the test owns before
     /// sending a second — proves cancellation wins over a stream with a genuine remainder still
     /// pending, not one already exhausted.
+    #[derive(Clone)]
     struct GatedStream {
         release_second: Arc<Notify>,
     }
 
     #[async_trait]
     impl LwdServer for GatedStream {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -3527,6 +3699,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for UsedAtCalls {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -3626,6 +3802,7 @@ mod tests {
     /// let its own guard go between candidates: under a fair mutex the probe (queued while the
     /// walk still held the guard for the first candidate) is served before the walk can re-acquire
     /// it for the second, so the flag can only be set in time if the walk actually released it.
+    #[derive(Clone)]
     struct GuardReleaseProbe {
         calls: Arc<AtomicU32>,
         probe_ran: Arc<AtomicBool>,
@@ -3633,6 +3810,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for GuardReleaseProbe {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -3740,6 +3921,18 @@ mod tests {
         gap_limit: u32,
         used_at_calls: Vec<u32>,
     ) -> (u32, u32) {
+        discover_with(connection, account, gap_limit, used_at_calls, 1).await
+    }
+
+    /// Width 1 is the sequential walk, so every test written before batching keeps running on the
+    /// path it was written for.
+    async fn discover_with(
+        connection: &mut SqliteConnection,
+        account: u32,
+        gap_limit: u32,
+        used_at_calls: Vec<u32>,
+        concurrency: u32,
+    ) -> (u32, u32) {
         let calls = Arc::new(AtomicU32::new(0));
         let mut client: Client = Box::new(UsedAtCalls {
             calls: calls.clone(),
@@ -3759,6 +3952,7 @@ mod tests {
             account,
             2_000_100,
             gap_limit,
+            concurrency,
             |_| {},
             CancellationToken::new(),
         )
@@ -3766,6 +3960,1286 @@ mod tests {
         .expect("discover");
 
         (n_added, calls.load(Ordering::Relaxed))
+    }
+
+    /// One request as the server saw it, with how many were open when it arrived.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Request {
+        taddr: String,
+        lo: u32,
+        hi: u32,
+        in_flight: u32,
+    }
+
+    /// What `ScriptedServer` does with one request.
+    #[derive(Clone, Default)]
+    enum Reply {
+        #[default]
+        Empty,
+        /// One payment at `height`, handed over `after` a delay.
+        Funded {
+            height: u32,
+            after: Duration,
+        },
+        Fail,
+        /// Accepts the request and never answers it.
+        Stall,
+        /// Cancels the walk, then never answers.
+        CancelsThenStalls(CancellationToken),
+        /// Answers empty and cancels the walk only once the reply is off the wire, so the whole
+        /// batch is prefetched successfully and the cancellation lands before the ingest.
+        CancelsAfterReplying(CancellationToken),
+        /// Stores another index's address row through its own connection first — what a concurrent
+        /// `next_unused_transparent_address` does while a probe is in flight.
+        StoresRow {
+            coin: Coin,
+            account: u32,
+            scope: u32,
+            dindex: u32,
+        },
+        /// Trims the account through its own connection first.
+        Trims {
+            coin: Coin,
+            account: u32,
+            height: u32,
+        },
+        /// Moves the seam through its own connection first — what a concurrent `synchronize` that
+        /// scanned a replacement chain leaves behind while a probe is in flight.
+        SyncsTo {
+            coin: Coin,
+            account: u32,
+            height: u32,
+        },
+    }
+
+    /// Replies to give for one address: `first` in order, then `then` forever.
+    struct Script {
+        first: VecDeque<Reply>,
+        then: Reply,
+    }
+
+    /// Answers by address, never by call order — under concurrency call order is not a fixture.
+    /// Records every request with the number in flight when it arrived. `hold` keeps a request
+    /// open long enough for the rest of its batch to reach the server, and `reject_above` refuses
+    /// one that found more than that many others already open.
+    #[derive(Clone, Default)]
+    struct ScriptedServer {
+        script: Arc<Mutex<HashMap<String, Script>>>,
+        default_reply: Reply,
+        requests: Arc<Mutex<Vec<Request>>>,
+        in_flight: Arc<AtomicU32>,
+        peak: Arc<AtomicU32>,
+        hold: Duration,
+        reject_above: Option<u32>,
+        /// Senders of stalled streams, kept alive so their receivers never see EOF.
+        stalled: Arc<Mutex<Vec<Sender<Result<(u32, Transaction, usize)>>>>>,
+    }
+
+    impl ScriptedServer {
+        /// Holds every request open for `hold`, so a whole batch is in flight at once.
+        fn holding(hold: Duration) -> Self {
+            Self {
+                hold,
+                ..Self::default()
+            }
+        }
+
+        /// A server that admits only `limit` concurrent requests and refuses the rest.
+        fn rejecting_above(limit: u32) -> Self {
+            Self {
+                hold: Duration::from_millis(20),
+                reject_above: Some(limit),
+                ..Self::default()
+            }
+        }
+
+        fn failing_everything() -> Self {
+            Self {
+                default_reply: Reply::Fail,
+                ..Self::default()
+            }
+        }
+
+        fn always(&self, taddr: &str, then: Reply) {
+            self.then_always(taddr, vec![], then);
+        }
+
+        fn then_always(&self, taddr: &str, first: Vec<Reply>, then: Reply) {
+            self.script.lock().expect("lock").insert(
+                taddr.to_string(),
+                Script {
+                    first: first.into(),
+                    then,
+                },
+            );
+        }
+
+        fn next_reply(&self, taddr: &str) -> Reply {
+            let mut script = self.script.lock().expect("lock");
+            match script.get_mut(taddr) {
+                Some(scripted) => scripted.first.pop_front().unwrap_or(scripted.then.clone()),
+                None => self.default_reply.clone(),
+            }
+        }
+
+        fn requests(&self) -> Vec<Request> {
+            self.requests.lock().expect("lock").clone()
+        }
+
+        fn addresses(&self) -> Vec<String> {
+            self.requests().into_iter().map(|r| r.taddr).collect()
+        }
+
+        fn ranges_for(&self, taddr: &str) -> Vec<(u32, u32)> {
+            self.requests()
+                .iter()
+                .filter(|request| request.taddr == taddr)
+                .map(|request| (request.lo, request.hi))
+                .collect()
+        }
+
+        fn peak(&self) -> u32 {
+            self.peak.load(Ordering::SeqCst)
+        }
+
+        fn stalling_stream(&self) -> ReceiverStream<Result<(u32, Transaction, usize)>> {
+            let (sender, receiver) = channel(1);
+            self.stalled.lock().expect("lock").push(sender);
+            ReceiverStream::new(receiver)
+        }
+    }
+
+    #[async_trait]
+    impl LwdServer for ScriptedServer {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
+        async fn latest_height(&mut self) -> Result<u32> {
+            unimplemented!()
+        }
+
+        async fn block(&mut self, _network: &Network, height: u32) -> Result<CompactBlock> {
+            block_response(height, Some(12345), false)
+        }
+
+        type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
+        async fn block_range(
+            &mut self,
+            _network: &Network,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::CompactBlockStream> {
+            unimplemented!()
+        }
+
+        async fn transaction(
+            &mut self,
+            _network: &Network,
+            _txid: &[u8],
+        ) -> Result<(u32, Transaction)> {
+            unimplemented!()
+        }
+
+        async fn post_transaction(&mut self, _height: u32, _tx: &[u8]) -> Result<BroadcastOutcome> {
+            unimplemented!()
+        }
+
+        type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn taddress_txs(
+            &mut self,
+            _network: &Network,
+            taddress: &str,
+            start: u32,
+            end: u32,
+        ) -> Result<Self::TransactionStream> {
+            let arrived = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.requests.lock().expect("lock").push(Request {
+                taddr: taddress.to_string(),
+                lo: start,
+                hi: end,
+                in_flight: arrived,
+            });
+            let reply = self.next_reply(taddress);
+            if !self.hold.is_zero() {
+                tokio::time::sleep(self.hold).await;
+            }
+            self.peak
+                .fetch_max(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                !self.reject_above.is_some_and(|limit| arrived > limit),
+                "server admits no more than {:?} concurrent requests",
+                self.reject_above
+            );
+
+            match reply {
+                Reply::Fail => anyhow::bail!("scripted failure for {taddress}"),
+                Reply::Stall => Ok(self.stalling_stream()),
+                Reply::CancelsThenStalls(token) => {
+                    token.cancel();
+                    Ok(self.stalling_stream())
+                }
+                Reply::CancelsAfterReplying(token) => {
+                    tokio::spawn(async move { token.cancel() });
+                    let (_sender, receiver) = channel(1);
+                    Ok(ReceiverStream::new(receiver))
+                }
+                Reply::StoresRow {
+                    coin,
+                    account,
+                    scope,
+                    dindex,
+                } => {
+                    let mut connection = coin.get_connection().await.expect("own connection");
+                    let tk = select_account_transparent(&mut connection, account, 0)
+                        .await
+                        .expect("transparent keys");
+                    let (pk, address) = derive_transparent_address(
+                        tk.xvk.as_ref().expect("xvk"),
+                        scope,
+                        dindex,
+                        false,
+                    )
+                    .expect("derive");
+                    store_account_transparent_addr(
+                        &mut connection,
+                        account,
+                        scope,
+                        dindex,
+                        None,
+                        &pk,
+                        &address.encode(&Network::Main),
+                        false,
+                    )
+                    .await
+                    .expect("store the concurrently allocated row");
+                    let (_sender, receiver) = channel(1);
+                    Ok(ReceiverStream::new(receiver))
+                }
+                Reply::Trims {
+                    coin,
+                    account,
+                    height,
+                } => {
+                    let mut connection = coin.get_connection().await.expect("own connection");
+                    trim_sync_data(&mut connection, account, height)
+                        .await
+                        .expect("trim under the walk");
+                    let (_sender, receiver) = channel(1);
+                    Ok(ReceiverStream::new(receiver))
+                }
+                Reply::SyncsTo {
+                    coin,
+                    account,
+                    height,
+                } => {
+                    let mut connection = coin.get_connection().await.expect("own connection");
+                    synced_to(&mut connection, account, height).await;
+                    let (_sender, receiver) = channel(1);
+                    Ok(ReceiverStream::new(receiver))
+                }
+                Reply::Funded { height, after } => {
+                    if !after.is_zero() {
+                        tokio::time::sleep(after).await;
+                    }
+                    let (sender, receiver) = channel(1);
+                    if (start..=end).contains(&height) {
+                        sender
+                            .send(Ok((height, transaction_paying(taddress, 10_000), 0)))
+                            .await
+                            .expect("queue payment");
+                    }
+                    drop(sender);
+                    Ok(ReceiverStream::new(receiver))
+                }
+                Reply::Empty => {
+                    let (_sender, receiver) = channel(1);
+                    Ok(ReceiverStream::new(receiver))
+                }
+            }
+        }
+
+        type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn mempool_stream(&mut self, _network: &Network) -> Result<Self::MempoolStream> {
+            unimplemented!()
+        }
+
+        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            unimplemented!()
+        }
+
+        async fn chain_anchor(&mut self, height: u32) -> Result<Vec<u8>> {
+            Ok(fake_anchor(height))
+        }
+    }
+
+    /// The address the walk derives for `(scope, dindex)`. Address-keyed mocks must match on this.
+    async fn taddress_at(
+        connection: &mut SqliteConnection,
+        account: u32,
+        scope: u32,
+        dindex: u32,
+    ) -> String {
+        let tk = select_account_transparent(connection, account, 0)
+            .await
+            .expect("transparent keys");
+        let (_, address) =
+            derive_transparent_address(tk.xvk.as_ref().expect("xvk"), scope, dindex, false)
+                .expect("derive");
+        address.encode(&Network::Main)
+    }
+
+    /// Puts `(scope, dindex)` in the state that makes the walk skip it: stored, known used and
+    /// backfilled past the seam — what a finished earlier walk leaves behind.
+    async fn store_covered_address(
+        connection: &mut SqliteConnection,
+        account: u32,
+        scope: u32,
+        dindex: u32,
+    ) {
+        let tk = select_account_transparent(connection, account, 0)
+            .await
+            .expect("transparent keys");
+        let (pk, address) =
+            derive_transparent_address(tk.xvk.as_ref().expect("xvk"), scope, dindex, false)
+                .expect("derive");
+        store_account_transparent_addr(
+            connection,
+            account,
+            scope,
+            dindex,
+            None,
+            &pk,
+            &address.encode(&Network::Main),
+            false,
+        )
+        .await
+        .expect("store");
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET seen_used = 1, backfilled_height = 2000100
+            WHERE account = ? AND scope = ? AND dindex = ?",
+        )
+        .bind(account)
+        .bind(scope)
+        .bind(dindex)
+        .execute(connection)
+        .await
+        .expect("cover");
+    }
+
+    /// Runs a walk against `server` on a freshly restored account and returns how many addresses
+    /// it added.
+    async fn discover_against(
+        connection: &mut SqliteConnection,
+        account: u32,
+        gap_limit: u32,
+        concurrency: u32,
+        server: impl LwdServer<
+                CompactBlockStream = ReceiverStream<Result<CompactBlock>>,
+                TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>,
+                MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>,
+            > + 'static,
+    ) -> Result<u32> {
+        discover_to(
+            connection,
+            account,
+            2_000_100,
+            gap_limit,
+            concurrency,
+            server,
+        )
+        .await
+    }
+
+    /// `discover_against` against a tip other than the fixture's.
+    async fn discover_to(
+        connection: &mut SqliteConnection,
+        account: u32,
+        end_height: u32,
+        gap_limit: u32,
+        concurrency: u32,
+        server: impl LwdServer<
+                CompactBlockStream = ReceiverStream<Result<CompactBlock>>,
+                TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>,
+                MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>,
+            > + 'static,
+    ) -> Result<u32> {
+        let mut client: Client = Box::new(server);
+        discover_transparent_addresses(
+            &Network::Main,
+            connection,
+            &mut client,
+            account,
+            end_height,
+            gap_limit,
+            concurrency,
+            |_| {},
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn restored_account(connection: &mut SqliteConnection) -> u32 {
+        restore(connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore")
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_addresses_probes_a_batch_concurrently() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let server = ScriptedServer::holding(Duration::from_millis(20));
+
+        discover_against(&mut connection, account, 8, 4, server.clone())
+            .await
+            .expect("discover");
+
+        assert_eq!(4, server.peak());
+    }
+
+    /// Whatever the caller asks for, one connection never carries more than the cap.
+    #[tokio::test]
+    async fn discover_transparent_addresses_clamps_the_width_to_the_maximum() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let server = ScriptedServer::holding(Duration::from_millis(20));
+
+        discover_against(&mut connection, account, 40, 64, server.clone())
+            .await
+            .expect("discover");
+
+        assert_eq!(32, server.peak());
+    }
+
+    /// A caller that asks for no concurrency at all gets the sequential walk, not a stalled one.
+    #[tokio::test]
+    async fn discover_transparent_addresses_clamps_a_zero_concurrency_to_one() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let server = ScriptedServer::holding(Duration::from_millis(20));
+
+        let n_added = discover_against(&mut connection, account, 2, 0, server.clone())
+            .await
+            .expect("discover");
+
+        assert_eq!(n_added, 0);
+        assert_eq!(
+            server.requests().len(),
+            7,
+            "the same requests the width-1 walk makes"
+        );
+        assert_eq!(1, server.peak(), "one request on the wire at a time");
+    }
+
+    /// The request set a successful wide walk makes is the one the sequential walk makes — no
+    /// address is probed that the narrow walk would not have reached.
+    #[tokio::test]
+    async fn discover_transparent_addresses_with_a_wide_batch_requests_exactly_what_the_sequential_walk_does(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+
+        let (n_added, calls) = discover_with(&mut connection, account, 2, vec![], 16).await;
+
+        assert_eq!(n_added, 0);
+        assert_eq!(calls, 7, "four external candidates, three internal");
+        assert_eq!(receive_dindexes(&mut connection, account).await, vec![0]);
+    }
+
+    /// A skipped index resets the gap where the sequential walk resets it — in index order, after
+    /// the candidates before it were counted. Applying it while the batch is planned would cut the
+    /// walk short of an address the narrow walk finds.
+    #[tokio::test]
+    async fn discover_transparent_addresses_counts_a_skipped_candidate_in_index_order() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        store_covered_address(&mut connection, account, 0, 5).await;
+        let funded = taddress_at(&mut connection, account, 0, 25).await;
+        let server = ScriptedServer::default();
+        server.always(
+            &funded,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+
+        let n_added = discover_against(&mut connection, account, 20, 16, server)
+            .await
+            .expect("discover");
+
+        assert_eq!(n_added, 1);
+        assert_eq!(
+            receive_dindexes(&mut connection, account).await,
+            vec![0, 5, 25]
+        );
+    }
+
+    /// A run of stored indexes the sync already covers costs the batch indexes, not requests: the
+    /// next batch must still be free to probe the addresses beyond them.
+    #[tokio::test]
+    async fn discover_transparent_addresses_does_not_spend_a_stored_run_on_extra_probes() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        for dindex in 0..9 {
+            store_covered_address(&mut connection, account, 0, dindex).await;
+        }
+        let server = ScriptedServer::default();
+
+        discover_against(&mut connection, account, 2, 16, server.clone())
+            .await
+            .expect("discover");
+
+        let mut expected = vec![];
+        for dindex in 9..12 {
+            expected.push(taddress_at(&mut connection, account, 0, dindex).await);
+        }
+        for dindex in 0..3 {
+            expected.push(taddress_at(&mut connection, account, 1, dindex).await);
+        }
+        assert_eq!(expected, server.addresses());
+    }
+
+    /// The order rows were written in, which `receive_dindexes` cannot show.
+    async fn receive_dindexes_by_rowid(
+        connection: &mut SqliteConnection,
+        account: u32,
+    ) -> Vec<u32> {
+        sqlx::query_scalar(
+            "SELECT dindex FROM transparent_address_accounts
+            WHERE account = ? AND scope = 0 ORDER BY rowid",
+        )
+        .bind(account)
+        .fetch_all(connection)
+        .await
+        .expect("addresses")
+    }
+
+    /// A server that refuses concurrent requests must not be asked for a wide batch again and
+    /// again: the first refusal halves the width for the rest of the walk.
+    #[tokio::test]
+    async fn discover_transparent_addresses_halves_the_batch_after_a_failed_probe() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let funded = taddress_at(&mut connection, account, 0, 5).await;
+        let server = ScriptedServer::rejecting_above(2);
+        server.always(
+            &funded,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+
+        let n_added = discover_against(&mut connection, account, 12, 4, server.clone())
+            .await
+            .expect("discover");
+
+        assert_eq!(4, server.peak(), "the first batch is the wide one");
+        assert_eq!(
+            2,
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.in_flight > 2)
+                .count(),
+            "only the first batch may exceed what the server admits"
+        );
+        assert_eq!(n_added, 1);
+        assert!(receive_dindexes(&mut connection, account)
+            .await
+            .contains(&5));
+    }
+
+    /// At the window floor a failed probe is terminal for the candidate, so the retry is the only
+    /// thing that can carry the walk past a server that refuses concurrency.
+    #[tokio::test]
+    async fn discover_transparent_addresses_recovers_at_the_window_floor_from_a_concurrency_rejection(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let funded = taddress_at(&mut connection, account, 0, 5).await;
+        let server = ScriptedServer::rejecting_above(2);
+        server.always(
+            &funded,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+
+        let n_added = discover_against(&mut connection, account, 8, 4, server)
+            .await
+            .expect("the retry recovers the walk");
+
+        assert_eq!(n_added, 1);
+        assert!(receive_dindexes(&mut connection, account)
+            .await
+            .contains(&5));
+    }
+
+    /// The halved width is one value for the whole invocation: the second scope must not start
+    /// over at the width the server already refused.
+    #[tokio::test]
+    async fn discover_transparent_addresses_keeps_the_halved_width_across_scopes() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let server = ScriptedServer::rejecting_above(2);
+
+        discover_against(&mut connection, account, 8, 4, server.clone())
+            .await
+            .expect("discover");
+
+        let mut internal = HashSet::new();
+        for dindex in 0..12 {
+            internal.insert(taddress_at(&mut connection, account, 1, dindex).await);
+        }
+        for request in server.requests() {
+            if internal.contains(&request.taddr) {
+                assert!(
+                    request.in_flight <= 2,
+                    "the internal scope ran {} requests in flight",
+                    request.in_flight
+                );
+            }
+        }
+    }
+
+    /// `gap_limit` reaches the caller as `-1 as u32` when Kotlin asks for "no limit", so planning
+    /// a batch from it must not overflow.
+    #[tokio::test]
+    async fn discover_transparent_addresses_with_the_maximum_gap_limit_fails_cleanly_instead_of_overflowing(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+
+        let error = discover_against(
+            &mut connection,
+            account,
+            u32::MAX,
+            4,
+            ScriptedServer::failing_everything(),
+        )
+        .await
+        .expect_err("every request fails");
+
+        assert!(
+            error.to_string().contains("scripted failure"),
+            "expected the server's failure, got {error}"
+        );
+    }
+
+    /// The public store takes any `u32`, so the highest stored index can be `u32::MAX`.
+    #[tokio::test]
+    async fn discover_transparent_addresses_with_a_stored_index_at_u32_max_fails_cleanly_instead_of_overflowing(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        store_account_transparent_addr(
+            &mut connection,
+            account,
+            0,
+            u32::MAX,
+            None,
+            b"pk",
+            "t1storedatthetop",
+            false,
+        )
+        .await
+        .expect("store the extreme index");
+
+        let error = discover_against(
+            &mut connection,
+            account,
+            2,
+            4,
+            ScriptedServer::failing_everything(),
+        )
+        .await
+        .expect_err("every request fails");
+
+        assert!(
+            error.to_string().contains("scripted failure"),
+            "expected the server's failure, got {error}"
+        );
+    }
+
+    /// Answers come back in whatever order the server chooses; rows must still be written in index
+    /// order, because that order is what the gap and the coverage record are built on.
+    #[tokio::test]
+    async fn discover_transparent_addresses_ingests_a_batch_in_index_order() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let slow = taddress_at(&mut connection, account, 0, 1).await;
+        let quick = taddress_at(&mut connection, account, 0, 3).await;
+        let server = ScriptedServer::default();
+        server.always(
+            &slow,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::from_millis(30),
+            },
+        );
+        server.always(
+            &quick,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+
+        let n_added = discover_against(&mut connection, account, 4, 4, server)
+            .await
+            .expect("discover");
+
+        assert_eq!(n_added, 2);
+        assert_eq!(
+            receive_dindexes_by_rowid(&mut connection, account).await,
+            vec![0, 1, 3]
+        );
+    }
+
+    /// An address whose marker already sits at the tip needs no request at all, batched or not.
+    #[tokio::test]
+    async fn discover_transparent_addresses_skips_the_prefetch_for_an_address_backfilled_to_the_tip(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET backfilled_height = 2000100
+            WHERE account = ? AND scope = 0 AND dindex = 0",
+        )
+        .bind(account)
+        .execute(&mut connection)
+        .await
+        .expect("mark fully covered");
+
+        let (n_added, calls) = discover_with(&mut connection, account, 2, vec![], 4).await;
+
+        assert_eq!(n_added, 0);
+        assert_eq!(calls, 6, "dindex 0 costs an index but no request");
+    }
+
+    /// A failed probe is retried once, as one whole-window request under the guard — the same
+    /// request the sequential walk makes first, not a narrowed one.
+    #[tokio::test]
+    async fn discover_transparent_addresses_retries_a_failed_prefetch_once_as_one_sequential_request(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        synced_to(&mut connection, account, 2_005_000).await;
+        let failing = taddress_at(&mut connection, account, 0, 1).await;
+        let server = ScriptedServer::default();
+        server.then_always(&failing, vec![Reply::Fail], Reply::Empty);
+
+        discover_to(&mut connection, account, 2_005_000, 2, 4, server.clone())
+            .await
+            .expect("the retry carries the walk");
+
+        let ranges = server.ranges_for(&failing);
+        assert_eq!(2, ranges.len(), "one probe and one retry, got {ranges:?}");
+        assert_eq!(
+            ranges[0], ranges[1],
+            "the retry asks for the same whole window"
+        );
+        assert_eq!(2_005_000, ranges[0].1, "and it reaches the tip");
+        let retry = server
+            .requests()
+            .into_iter()
+            .filter(|request| request.taddr == failing)
+            .nth(1)
+            .expect("the retry");
+        assert_eq!(1, retry.in_flight, "the retry is a lone sequential request");
+    }
+
+    /// When the retry fails too, the candidate must narrow exactly as it does after the sequential
+    /// walk's own first failure — the batched walk adds one request, nothing else.
+    #[tokio::test]
+    async fn discover_transparent_addresses_narrows_like_the_sequential_walk_when_the_retry_fails_too(
+    ) {
+        let mut sequential_db = memory_db().await;
+        let sequential_account = restored_account(&mut sequential_db).await;
+        synced_to(&mut sequential_db, sequential_account, 2_005_000).await;
+        let taddr = taddress_at(&mut sequential_db, sequential_account, 0, 1).await;
+        let sequential = ScriptedServer::default();
+        sequential.then_always(&taddr, vec![Reply::Fail], Reply::Empty);
+        discover_to(
+            &mut sequential_db,
+            sequential_account,
+            2_005_000,
+            2,
+            1,
+            sequential.clone(),
+        )
+        .await
+        .expect("the sequential walk narrows and finishes");
+
+        let mut batched_db = memory_db().await;
+        let batched_account = restored_account(&mut batched_db).await;
+        synced_to(&mut batched_db, batched_account, 2_005_000).await;
+        let batched = ScriptedServer::default();
+        batched.then_always(&taddr, vec![Reply::Fail, Reply::Fail], Reply::Empty);
+        discover_to(
+            &mut batched_db,
+            batched_account,
+            2_005_000,
+            2,
+            4,
+            batched.clone(),
+        )
+        .await
+        .expect("the batched walk narrows and finishes");
+
+        let after_the_retry = sequential.ranges_for(&taddr);
+        let mut expected = vec![after_the_retry[0]];
+        expected.extend(after_the_retry);
+        assert_eq!(expected, batched.ranges_for(&taddr));
+    }
+
+    /// A receive address allocated while a probe is in flight is an existing address by the time
+    /// the walk ingests it, and the gap must be read from the row the walk re-reads under the
+    /// guard — reading the one seen while planning would cut the walk short.
+    #[tokio::test]
+    async fn discover_transparent_addresses_counts_a_row_stored_by_a_concurrent_allocation_as_existing(
+    ) {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let allocating = taddress_at(&mut connection, account, 0, 1).await;
+        let funded = taddress_at(&mut connection, account, 0, 5).await;
+        let server = ScriptedServer::default();
+        server.always(
+            &allocating,
+            Reply::StoresRow {
+                coin: coin.clone(),
+                account,
+                scope: 0,
+                dindex: 2,
+            },
+        );
+        server.always(
+            &funded,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+
+        let n_added = discover_against(&mut connection, account, 2, 4, server)
+            .await
+            .expect("discover");
+
+        assert_eq!(
+            receive_dindexes(&mut connection, account).await,
+            vec![0, 2, 5]
+        );
+        assert_eq!(n_added, 2);
+    }
+
+    /// A cancellation seen anywhere in a batch ends the walk before any of that batch is written,
+    /// so a row is never stored for a candidate whose window the walk then abandons.
+    #[tokio::test]
+    async fn discover_transparent_addresses_cancelled_during_a_batch_writes_nothing_from_that_batch(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let (id, _) = transparent_address_row(&mut connection, account, 0, 0)
+            .await
+            .expect("row lookup")
+            .expect("row exists");
+        set_marker(&mut connection, id, Some(2_000_100)).await;
+        let funded = taddress_at(&mut connection, account, 0, 1).await;
+        let cancelling = taddress_at(&mut connection, account, 0, 2).await;
+        let token = CancellationToken::new();
+        let server = ScriptedServer::default();
+        server.always(
+            &funded,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+        server.always(&cancelling, Reply::CancelsThenStalls(token.clone()));
+        let mut client: Client = Box::new(server);
+
+        let error = discover_transparent_addresses(
+            &Network::Main,
+            &mut connection,
+            &mut client,
+            account,
+            2_000_100,
+            2,
+            4,
+            |_| {},
+            token,
+        )
+        .await
+        .expect_err("a cancelled batch must not report success");
+
+        assert!(error.to_string().contains("cancel"), "{error}");
+        assert!(
+            transparent_address_row(&mut connection, account, 0, 1)
+                .await
+                .expect("row lookup")
+                .is_none(),
+            "nothing of the cancelled batch may be written"
+        );
+        assert!(
+            !crate::db::read_transparent_coverage(&mut connection, account)
+                .await
+                .expect("coverage")
+                .certified
+        );
+    }
+
+    /// The prefetch holds no guard, so a trim can land between a probe and its ingest. The walk
+    /// must refuse to certify coverage it can no longer describe.
+    #[tokio::test]
+    async fn discover_transparent_addresses_refuses_to_certify_when_a_trim_lands_while_probes_are_in_flight(
+    ) {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        synced_to(&mut connection, account, 2_000_100).await;
+        let (id, _) = transparent_address_row(&mut connection, account, 0, 0)
+            .await
+            .expect("row lookup")
+            .expect("row exists");
+        set_marker(&mut connection, id, Some(2_000_100)).await;
+        let trimming = taddress_at(&mut connection, account, 0, 1).await;
+        let server = ScriptedServer::default();
+        server.always(
+            &trimming,
+            Reply::Trims {
+                coin: coin.clone(),
+                account,
+                height: 2_000_040,
+            },
+        );
+
+        let error = discover_against(&mut connection, account, 2, 4, server)
+            .await
+            .expect_err("a trim during the walk invalidates the coverage");
+
+        assert!(
+            error.to_string().contains("invalidated by a trim"),
+            "{error}"
+        );
+        assert_eq!(
+            transparent_backfilled_height(&mut connection, id)
+                .await
+                .expect("marker"),
+            Some(2_000_040)
+        );
+        assert!(
+            !crate::db::read_transparent_coverage(&mut connection, account)
+                .await
+                .expect("coverage")
+                .certified
+        );
+    }
+
+    /// A cancellation that arrives once a batch's probes have all succeeded is still a
+    /// cancellation: every empty result is ingested without ever entering `fetch_window`'s select,
+    /// so only a per-candidate check keeps the walk from certifying coverage it stopped short of.
+    #[tokio::test]
+    async fn discover_transparent_addresses_cancelled_after_a_successful_batch_does_not_certify() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        synced_to(&mut connection, account, 2_000_100).await;
+        let last = taddress_at(&mut connection, account, 1, 2).await;
+        let token = CancellationToken::new();
+        let server = ScriptedServer::default();
+        server.always(&last, Reply::CancelsAfterReplying(token.clone()));
+        let mut client: Client = Box::new(server);
+
+        let error = discover_transparent_addresses(
+            &Network::Main,
+            &mut connection,
+            &mut client,
+            account,
+            2_000_100,
+            2,
+            4,
+            |_| {},
+            token,
+        )
+        .await
+        .expect_err("a cancelled walk must not report success");
+
+        assert!(error.to_string().contains("cancel"), "{error}");
+        assert!(
+            !crate::db::read_transparent_coverage(&mut connection, account)
+                .await
+                .expect("coverage")
+                .certified
+        );
+    }
+
+    /// The prefetch holds no guard, so a concurrent synchronize can move the seam between a probe
+    /// and its ingest — onto a chain that reply does not describe. The walk must ask again instead
+    /// of committing the old answer against the new seam.
+    #[tokio::test]
+    async fn discover_transparent_addresses_refetches_a_prefetch_taken_before_the_seam_moved() {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        synced_to(&mut connection, account, 2_000_040).await;
+        let funded = taddress_at(&mut connection, account, 0, 1).await;
+        let syncing = taddress_at(&mut connection, account, 0, 2).await;
+        let server = ScriptedServer::default();
+        server.then_always(
+            &funded,
+            vec![Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            }],
+            Reply::Empty,
+        );
+        server.always(
+            &syncing,
+            Reply::SyncsTo {
+                coin: coin.clone(),
+                account,
+                height: 2_000_100,
+            },
+        );
+        let observed = server.clone();
+
+        let n_added = discover_against(&mut connection, account, 4, 4, server)
+            .await
+            .expect("discover");
+
+        assert_eq!(
+            2,
+            observed.ranges_for(&funded).len(),
+            "the reply obtained under the old seam must be asked for again"
+        );
+        assert_eq!(n_added, 0, "the stale payment must store no address row");
+        assert_eq!(
+            receive_dindexes(&mut connection, account).await,
+            vec![0],
+            "only the account's own address"
+        );
+    }
+
+    /// A probe the server accepts and never answers must not park the walk: the prefetch carries
+    /// its own deadline, and a timed-out probe is retried once like any other failed one.
+    #[tokio::test]
+    async fn discover_transparent_addresses_times_out_a_stalled_prefetch_and_retries_it_once() {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        tokio::time::pause();
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        synced_to(&mut connection, account, 2_000_100).await;
+        let stalling = taddress_at(&mut connection, account, 0, 1).await;
+        let server = ScriptedServer::holding(Duration::from_millis(20));
+        server.then_always(&stalling, vec![Reply::Stall], Reply::Empty);
+        let observed = server.clone();
+        let mut client: Client = Box::new(server);
+
+        let mut task = tokio::spawn(async move {
+            let result = discover_transparent_addresses(
+                &Network::Main,
+                &mut connection,
+                &mut client,
+                account,
+                2_000_100,
+                2,
+                4,
+                |_| {},
+                CancellationToken::new(),
+            )
+            .await;
+            (result, connection)
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observed.requests().len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the batch's requests never all started");
+
+        tokio::time::advance(WINDOW_TIMEOUT + Duration::from_millis(1)).await;
+        // The rest of the walk runs on the real clock: a paused one jumps to the next deadline at
+        // every idle moment, which would expire windows the server answers at once.
+        tokio::time::resume();
+
+        let (result, _connection) = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the walk did not finish once the prefetch deadline elapsed")
+            .expect("walk task panicked");
+        result.expect("the retry answers");
+
+        let ranges = observed.ranges_for(&stalling);
+        assert_eq!(
+            2,
+            ranges.len(),
+            "one timed-out probe and one retry, got {ranges:?}"
+        );
+        assert_eq!(ranges[0], ranges[1], "the retry asks for the same window");
+        assert_eq!(
+            1,
+            observed
+                .requests()
+                .iter()
+                .filter(|request| request.in_flight > 2)
+                .count(),
+            "only the batch that timed out ran wider than the halved width"
+        );
+    }
+
+    /// A server that serves one stream per connection: a request is refused while a stream it
+    /// admitted is still open. `held`'s stream stays open until all three of its items have been
+    /// handed over — the channel holds one, so the third `send` resolves only once the walk
+    /// consumed the second during ingest — or until its receiver is dropped. `slow` checks
+    /// admission after a delay, so it loses the race for the one slot.
+    #[derive(Clone)]
+    struct OneStreamAtATime {
+        slow: String,
+        held: String,
+        open: Arc<AtomicU32>,
+        /// How many streams were open at each admission check, in order.
+        checks: Arc<Mutex<Vec<(String, u32)>>>,
+    }
+
+    #[async_trait]
+    impl LwdServer for OneStreamAtATime {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
+        async fn latest_height(&mut self) -> Result<u32> {
+            unimplemented!()
+        }
+
+        async fn block(&mut self, _network: &Network, height: u32) -> Result<CompactBlock> {
+            block_response(height, Some(12345), false)
+        }
+
+        type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
+        async fn block_range(
+            &mut self,
+            _network: &Network,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::CompactBlockStream> {
+            unimplemented!()
+        }
+
+        async fn transaction(
+            &mut self,
+            _network: &Network,
+            _txid: &[u8],
+        ) -> Result<(u32, Transaction)> {
+            unimplemented!()
+        }
+
+        async fn post_transaction(&mut self, _height: u32, _tx: &[u8]) -> Result<BroadcastOutcome> {
+            unimplemented!()
+        }
+
+        type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn taddress_txs(
+            &mut self,
+            _network: &Network,
+            taddress: &str,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::TransactionStream> {
+            if taddress == self.slow {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let open = self.open.load(Ordering::SeqCst);
+            self.checks
+                .lock()
+                .expect("lock")
+                .push((taddress.to_string(), open));
+            anyhow::ensure!(open == 0, "the server serves one stream at a time");
+
+            let (sender, receiver) = channel(1);
+            if taddress == self.held {
+                self.open.fetch_add(1, Ordering::SeqCst);
+                let open = self.open.clone();
+                let address = taddress.to_string();
+                tokio::spawn(async move {
+                    for value in 0..3u64 {
+                        let item = (2_000_050, transaction_paying(&address, 10_000 + value), 0);
+                        if sender.send(Ok(item)).await.is_err() {
+                            break;
+                        }
+                    }
+                    drop(sender);
+                    open.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            Ok(ReceiverStream::new(receiver))
+        }
+
+        type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn mempool_stream(&mut self, _network: &Network) -> Result<Self::MempoolStream> {
+            unimplemented!()
+        }
+
+        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            unimplemented!()
+        }
+
+        async fn chain_anchor(&mut self, height: u32) -> Result<Vec<u8>> {
+            Ok(fake_anchor(height))
+        }
+    }
+
+    /// The retry of a failed probe must reach the server alone: every sibling stream of the batch
+    /// is dropped first, and the forwarder ends the request as soon as its receiver is gone.
+    #[tokio::test]
+    async fn discover_transparent_addresses_drops_its_siblings_prefetches_before_retrying_a_failed_probe(
+    ) {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let refused = taddress_at(&mut connection, account, 0, 0).await;
+        let held = taddress_at(&mut connection, account, 0, 1).await;
+        let server = OneStreamAtATime {
+            slow: refused.clone(),
+            held,
+            open: Arc::new(AtomicU32::new(0)),
+            checks: Arc::new(Mutex::new(vec![])),
+        };
+        let checks = server.checks.clone();
+
+        let n_added = discover_against(&mut connection, account, 2, 4, server)
+            .await
+            .expect("the retry reaches a server with nothing open");
+
+        let for_refused: Vec<u32> = checks
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(taddr, _)| *taddr == refused)
+            .map(|(_, open)| *open)
+            .collect();
+        assert_eq!(
+            vec![1, 0],
+            for_refused,
+            "the probe was refused while a sibling was open, the retry found the server free"
+        );
+        assert_eq!(receive_dindexes(&mut connection, account).await, vec![0, 1]);
+        assert_eq!(n_added, 1);
     }
 
     /// After a restore the wallet has no row for a one-time address it once handed out, so the
@@ -3886,6 +5360,7 @@ mod tests {
             account,
             2_000_100,
             1,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -3897,6 +5372,7 @@ mod tests {
     /// advances normally; the second never sends and the sender is kept alive (not dropped), so
     /// `fetch_window`'s `rx.recv()` blocks until `WINDOW_TIMEOUT` trips instead of seeing a closed
     /// stream.
+    #[derive(Clone)]
     struct HangsOnSecondCall {
         calls: Arc<AtomicU32>,
         hung_sender: Option<Sender<Result<(u32, Transaction, usize)>>>,
@@ -3904,6 +5380,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for HangsOnSecondCall {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -4003,6 +5483,7 @@ mod tests {
                 account,
                 2_000_100,
                 1,
+                1,
                 |_| {},
                 CancellationToken::new(),
             )
@@ -4074,6 +5555,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4112,6 +5594,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4151,6 +5634,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4173,6 +5657,7 @@ mod tests {
     /// and an empty stream for every other address — the per-address targeting `UsedAtCalls`'s
     /// pure call-counter can't provide, needed once a test cares which specific derived address
     /// actually receives funds.
+    #[derive(Clone)]
     struct FundedAddress {
         target: String,
         value: u64,
@@ -4182,6 +5667,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for FundedAddress {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -4278,6 +5767,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4325,6 +5815,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4388,6 +5879,7 @@ mod tests {
             account,
             TIP,
             GAP_LIMIT,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4446,6 +5938,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4496,6 +5989,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4571,6 +6065,7 @@ mod tests {
             account,
             2_003_000,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4617,6 +6112,7 @@ mod tests {
             account,
             2_003_000,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -4641,6 +6137,7 @@ mod tests {
     /// mid-stream; `serves_left` caps how many times the server ever hands it over, so a server
     /// that reports a transaction and then withholds it can be built. `fail_blocks` fails that
     /// many block lookups before the first one succeeds.
+    #[derive(Clone)]
     struct FlakyPayment {
         taddress: String,
         value: u64,
@@ -4656,8 +6153,8 @@ mod tests {
         /// deadline without racing the ingestion it is about to drop.
         consumed: Arc<AtomicBool>,
         calls: Arc<AtomicU32>,
-        serves_left: Option<u32>,
-        fail_blocks: u32,
+        serves_left: Option<Arc<AtomicU32>>,
+        fail_blocks: Arc<AtomicU32>,
         /// How many distinct payments a window containing `height` carries.
         payments: usize,
         /// Payments only the FIRST answer carries: a server that reports more than one window
@@ -4667,13 +6164,19 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for FlakyPayment {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
 
         async fn block(&mut self, _network: &Network, height: u32) -> Result<CompactBlock> {
-            let fail = self.fail_blocks > 0;
-            self.fail_blocks = self.fail_blocks.saturating_sub(1);
+            let fail = self.fail_blocks.load(Ordering::Relaxed) > 0;
+            if fail {
+                self.fail_blocks.fetch_sub(1, Ordering::Relaxed);
+            }
             block_response(height, Some(12345), fail)
         }
 
@@ -4721,8 +6224,14 @@ mod tests {
             };
             let (sender, receiver) = channel(self.payments + withheld + 1);
             let mut served = false;
-            if (start..=end).contains(&self.height) && self.serves_left != Some(0) {
-                self.serves_left = self.serves_left.map(|left| left - 1);
+            let serves = self
+                .serves_left
+                .as_ref()
+                .is_none_or(|left| left.load(Ordering::Relaxed) > 0);
+            if (start..=end).contains(&self.height) && serves {
+                if let Some(left) = self.serves_left.as_ref() {
+                    left.fetch_sub(1, Ordering::Relaxed);
+                }
                 for i in 0..self.payments + withheld {
                     sender
                         .send(Ok((
@@ -4789,7 +6298,7 @@ mod tests {
             consumed: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(AtomicU32::new(0)),
             serves_left: None,
-            fail_blocks: 0,
+            fail_blocks: Arc::new(AtomicU32::new(0)),
             payments: 1,
             withheld_after_first_call: 0,
         }
@@ -4859,6 +6368,7 @@ mod tests {
             2_000_000,
             2_003_000,
             cancellation_token,
+            None,
         )
         .await
     }
@@ -5152,8 +6662,8 @@ mod tests {
         synced_to(&mut connection, account, 2_003_000).await;
 
         let (row, used) = walk_flaky_candidate(&mut connection, account, |payment| {
-            payment.serves_left = Some(1);
-            payment.fail_blocks = 1;
+            payment.serves_left = Some(Arc::new(AtomicU32::new(1)));
+            payment.fail_blocks = Arc::new(AtomicU32::new(1));
         })
         .await
         .map_err(anyhow::Error::from)
@@ -5184,8 +6694,8 @@ mod tests {
 
         let (row, _) = walk_flaky_candidate(&mut connection, account, |payment| {
             payment.fail_wider_than = Some(1_500);
-            payment.serves_left = Some(2);
-            payment.fail_blocks = 1;
+            payment.serves_left = Some(Arc::new(AtomicU32::new(2)));
+            payment.fail_blocks = Arc::new(AtomicU32::new(1));
         })
         .await
         .map_err(anyhow::Error::from)
@@ -5227,9 +6737,9 @@ mod tests {
 
         let mut call = tokio::spawn(async move {
             let mut client: Client = Box::new(EmptyStreams {
-                calls: 0,
+                calls: Arc::new(AtomicU32::new(0)),
                 fail_at_call: None,
-                stream_failures: 0,
+                stream_failures: Arc::new(AtomicU32::new(0)),
                 block_time: None,
                 fail_block: false,
             });
@@ -5242,6 +6752,7 @@ mod tests {
                 account + 1,
                 2_000_100,
                 0,
+                1,
                 |_| {},
                 CancellationToken::new(),
             )
@@ -5305,6 +6816,7 @@ mod tests {
             account,
             2_003_000,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5350,6 +6862,7 @@ mod tests {
             account,
             2_003_000,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5393,6 +6906,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5438,6 +6952,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5506,6 +7021,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5582,6 +7098,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5632,6 +7149,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5680,6 +7198,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -5702,6 +7221,7 @@ mod tests {
     /// Sends a funding transaction for `target` immediately, then blocks on a `Notify` this test
     /// never releases before sending a second — a genuine remainder stays pending so
     /// cancellation is the only branch of the walk's `select!` that can ever become ready.
+    #[derive(Clone)]
     struct GatedFundedStream {
         target: String,
         value: u64,
@@ -5710,6 +7230,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for GatedFundedStream {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -5814,6 +7338,7 @@ mod tests {
                 account,
                 2_000_100,
                 0,
+                1,
                 |_| {},
                 token_for_walk,
             )
@@ -5873,9 +7398,9 @@ mod tests {
             .await
             .expect("restore");
         let mut client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: Some(12345),
             fail_block: false,
         });
@@ -5889,6 +7414,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             cancellation_token,
         )
@@ -5996,6 +7522,7 @@ mod tests {
             2_000_000,
             2_000_100,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -6058,6 +7585,7 @@ mod tests {
             2_000_000,
             2_000_100,
             &CancellationToken::new(),
+            None,
         )
         .await
         .map_err(anyhow::Error::from)
@@ -6117,6 +7645,7 @@ mod tests {
             2_000_000,
             2_000_100,
             &CancellationToken::new(),
+            None,
         )
         .await
         .map_err(anyhow::Error::from)
@@ -6200,9 +7729,9 @@ mod tests {
                 .expect("default address exists");
 
         let mut sync_client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: None,
             fail_block: false,
         });
@@ -6241,6 +7770,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6280,9 +7810,9 @@ mod tests {
         .expect("other account transaction");
 
         let mut client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: None,
             fail_block: true,
         });
@@ -6292,6 +7822,7 @@ mod tests {
             &mut client,
             account,
             2_000_100,
+            1,
             1,
             |_| {},
             CancellationToken::new(),
@@ -6327,9 +7858,9 @@ mod tests {
         set_pool_sync_height_for_account(&mut connection, other_account, 0, 5_000_000).await;
 
         let mut client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: None,
             fail_block: true,
         });
@@ -6339,6 +7870,7 @@ mod tests {
             &mut client,
             account,
             2_000_100,
+            1,
             1,
             |_| {},
             CancellationToken::new(),
@@ -6391,6 +7923,7 @@ mod tests {
             &mut client,
             account,
             2_010_000,
+            1,
             1,
             |_| {},
             CancellationToken::new(),
@@ -6469,6 +8002,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6570,6 +8104,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6626,6 +8161,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6679,6 +8215,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6739,6 +8276,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6828,6 +8366,7 @@ mod tests {
             account,
             2_000_080,
             20,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6883,6 +8422,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6927,6 +8467,7 @@ mod tests {
             account,
             2_002_999,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -6989,6 +8530,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7107,6 +8649,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7149,6 +8692,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7220,6 +8764,7 @@ mod tests {
             account,
             seam,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7239,9 +8784,9 @@ mod tests {
         );
 
         let mut sync_client: Client = Box::new(EmptyStreams {
-            calls: 0,
+            calls: Arc::new(AtomicU32::new(0)),
             fail_at_call: None,
-            stream_failures: 0,
+            stream_failures: Arc::new(AtomicU32::new(0)),
             block_time: None,
             fail_block: false,
         });
@@ -7285,6 +8830,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7309,6 +8855,7 @@ mod tests {
     /// Pays `target` and then fails the same stream, so the failure lands after rows were already
     /// staged — the shape a rollback has to survive, which a fake that fails before its first item
     /// never exercises.
+    #[derive(Clone)]
     struct PaysThenFails {
         target: String,
         value: u64,
@@ -7317,6 +8864,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for PaysThenFails {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -7414,6 +8965,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7450,6 +9002,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7505,6 +9058,7 @@ mod tests {
             account,
             2_004_000,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7547,6 +9101,7 @@ mod tests {
             account,
             2_004_000,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7563,6 +9118,7 @@ mod tests {
     /// Pays every address in `targets` — the two-funded-index shape the single-target
     /// `FundedAddress` cannot express, and which a call-number fake cannot express either once the
     /// second index sits past the scope's own last call.
+    #[derive(Clone)]
     struct FundedAddresses {
         targets: Vec<String>,
         value: u64,
@@ -7571,6 +9127,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for FundedAddresses {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -7677,6 +9237,7 @@ mod tests {
             account,
             2_000_100,
             20,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7748,6 +9309,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7778,6 +9340,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -7824,6 +9387,7 @@ mod tests {
     /// A server that lets the wallet change under the walk. After the chosen call's stream is
     /// handed over — the walk still holding `SYNCING` — a task is queued behind that guard, so it
     /// changes the wallet in the gap before the next window.
+    #[derive(Clone)]
     struct TrimUnderWalk {
         taddress: String,
         calls: Arc<AtomicU32>,
@@ -7853,6 +9417,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for TrimUnderWalk {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -8024,6 +9592,7 @@ mod tests {
             2_000_000,
             2_003_000,
             &CancellationToken::new(),
+            None,
         )
         .await;
         // A refused walk has nothing to inspect, and its candidate may not even exist any more.
@@ -8078,6 +9647,7 @@ mod tests {
             account,
             2_000_100,
             1,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -8125,6 +9695,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -8163,6 +9734,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -8214,6 +9786,7 @@ mod tests {
                 account,
                 TIP,
                 0,
+                1,
                 |_| {},
                 CancellationToken::new(),
             )
@@ -8450,6 +10023,7 @@ mod tests {
             account,
             2_003_000,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -8494,6 +10068,7 @@ mod tests {
             account,
             2_003_000,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -8626,6 +10201,7 @@ mod tests {
     /// from a script — one entry per read, the last one repeated — so a fork between the two
     /// reads of one tick is a single differing entry. `off_window` payments are served whatever
     /// the range, the way a lying server answers.
+    #[derive(Clone)]
     struct AnchoredPayments {
         payments: Vec<(String, u32, u64)>,
         off_window: Vec<(String, u32, u64)>,
@@ -8657,6 +10233,10 @@ mod tests {
 
     #[async_trait]
     impl LwdServer for AnchoredPayments {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
         async fn latest_height(&mut self) -> Result<u32> {
             unimplemented!()
         }
@@ -8885,6 +10465,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -8935,6 +10516,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -8983,6 +10565,7 @@ mod tests {
             account,
             2_000_100,
             2,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -9046,6 +10629,7 @@ mod tests {
             account,
             2_000_100,
             0,
+            1,
             |_| {},
             CancellationToken::new(),
         )
@@ -9108,6 +10692,7 @@ mod tests {
                 &mut client,
                 account,
                 2_000_100,
+                1,
                 1,
                 |_| {},
                 CancellationToken::new(),

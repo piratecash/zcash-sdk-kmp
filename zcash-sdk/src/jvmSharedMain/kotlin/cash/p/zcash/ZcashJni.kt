@@ -67,6 +67,7 @@ internal object ZcashJni {
         account: Int,
         endHeight: Int,
         gapLimit: Int,
+        concurrency: Int,
     ): Int
 
     /** Conservative lower bound on what is spendable using only the pools in [poolMask], in zatoshi. */

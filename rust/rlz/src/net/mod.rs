@@ -5,7 +5,7 @@ use zcash_primitives::transaction::Transaction;
 
 use tonic::async_trait;
 
-use crate::{api::coin::Network, lwd::*};
+use crate::{api::coin::Network, lwd::*, Client};
 
 pub mod lwd;
 #[cfg(feature = "nym")]
@@ -23,7 +23,16 @@ pub(crate) async fn forward_stream<T>(
     sender: Sender<Result<T>>,
 ) {
     pin_mut!(source);
-    while let Some(item) = source.next().await {
+    loop {
+        // A dropped receiver must end the upstream request now, not whenever the next item lands:
+        // a stalled stream would otherwise stay open on the server after its reader is gone.
+        // Biased so an item already in hand is still forwarded, exactly as before.
+        let item = tokio::select! {
+            biased;
+            item = source.next() => item,
+            _ = sender.closed() => break,
+        };
+        let Some(item) = item else { break };
         let failed = item.is_err();
         if sender.send(item).await.is_err() {
             break;
@@ -54,6 +63,10 @@ pub struct BroadcastOutcome {
 
 #[async_trait]
 pub trait LwdServer: Send {
+    /// A second handle on the *same* connection, so concurrent requests multiplex over it
+    /// instead of opening one connection each.
+    fn duplicate(&self) -> Client;
+
     async fn latest_height(&mut self) -> Result<u32>;
     async fn block(&mut self, network: &Network, height: u32) -> Result<CompactBlock>;
 
@@ -135,5 +148,19 @@ mod tests {
             .expect_err("source error")
             .to_string()
             .contains("stream failed"));
+    }
+
+    #[tokio::test]
+    async fn forward_stream_ends_when_the_receiver_is_dropped() {
+        let source = futures::stream::pending::<Result<u32>>();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_stream(source, sender));
+
+        drop(receiver);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), forwarder)
+            .await
+            .expect("the forwarder must end as soon as its receiver is dropped")
+            .expect("forwarder task");
     }
 }

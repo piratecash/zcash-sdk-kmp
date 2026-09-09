@@ -18,6 +18,7 @@ private const val DEFAULT_ACTIONS_PER_SYNC = 10_000
 private const val DEFAULT_TRANSPARENT_LIMIT = 100
 private const val DEFAULT_CHECKPOINT_AGE = 10_000
 private const val DEFAULT_GAP_LIMIT = 20
+private const val DEFAULT_DISCOVERY_CONCURRENCY = 8
 private const val PROGRESS_SAMPLE_MS = 250L
 private const val MEMPOOL_POLL_MS = 500L
 private val logger = Logger.withTag("ZEC")
@@ -367,10 +368,19 @@ public class ZcashWallet private constructor(
      * the server knows a transaction for. A restore keeps the keys but not the address rows, so
      * money received on a one-time address stays invisible until this runs. Returns how many
      * addresses were added; it stops once it passes [gapLimit] unused addresses in a row.
+     *
+     * [concurrency] is how many candidates are probed at once over the one server connection;
+     * values outside `1..32` are brought into range by the SDK.
      */
-    public suspend fun discoverTransparentAddresses(id: Int, gapLimit: Int = DEFAULT_GAP_LIMIT): Int {
+    public suspend fun discoverTransparentAddresses(
+        id: Int,
+        gapLimit: Int = DEFAULT_GAP_LIMIT,
+        concurrency: Int = DEFAULT_DISCOVERY_CONCURRENCY,
+    ): Int {
         val endHeight = latestHeight()
-        return withNative { ZcashJni.discoverTransparentAddresses(handle, id, endHeight, gapLimit) }
+        return withNative {
+            ZcashJni.discoverTransparentAddresses(handle, id, endHeight, gapLimit, concurrency)
+        }
     }
 
     /**

@@ -1,8 +1,13 @@
 package cash.p.zcash
 
+import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.absolutePathString
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -24,6 +29,66 @@ private const val TEST_PHRASE =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
 private const val BIRTH_HEIGHT = 2_000_000
+
+/** No server listens here: the suite is offline unless a test starts its own. */
+private const val UNREACHABLE_URL = "http://127.0.0.1:1"
+
+/** Tip [LoopbackZebra] reports, high enough that every discovery window ends above [BIRTH_HEIGHT]. */
+private const val LOOPBACK_TIP = 2_000_100
+
+/** Long enough that a whole batch is on the wire before the first probe is answered. */
+private const val PROBE_HOLD_MILLIS = 150L
+
+private val JSONRPC_METHOD = Regex(""""method"\s*:\s*"([^"]*)"""")
+private val JSONRPC_ID = Regex(""""id"\s*:\s*("[^"]*"|[0-9]+)""")
+
+/**
+ * A Zebra stand-in on loopback that answers the JSON-RPC calls a discovery walk makes and records
+ * how many address probes were ever on the wire at once.
+ */
+private class LoopbackZebra : AutoCloseable {
+    private val inFlight = AtomicInteger()
+    private val peakSeen = AtomicInteger()
+    private val executor = Executors.newCachedThreadPool()
+    private val server: HttpServer =
+        HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            executor = this@LoopbackZebra.executor
+            createContext("/") { exchange -> exchange.answer() }
+            start()
+        }
+
+    val url: String get() = "http://127.0.0.1:${server.address.port}"
+
+    val peak: Int get() = peakSeen.get()
+
+    override fun close() {
+        server.stop(0)
+        executor.shutdownNow()
+    }
+
+    private fun HttpExchange.answer() {
+        val body = requestBody.use { it.readBytes() }.decodeToString()
+        val method = JSONRPC_METHOD.find(body)?.groupValues?.get(1).orEmpty()
+        val id = JSONRPC_ID.find(body)?.groupValues?.get(1) ?: "\"1\""
+        val payload = when (method) {
+            "getblockcount" -> """{"result":$LOOPBACK_TIP,"error":null,"id":$id}"""
+            "getaddresstxids" -> {
+                peakSeen.accumulateAndGet(inFlight.incrementAndGet(), ::maxOf)
+                Thread.sleep(PROBE_HOLD_MILLIS)
+                inFlight.decrementAndGet()
+                """{"result":[],"error":null,"id":$id}"""
+            }
+            // Printed so a failing run names whatever else the path needs before it is answered.
+            else -> {
+                println("LoopbackZebra: unanswered JSON-RPC method '$method'")
+                """{"result":null,"error":{"code":-32601,"message":"unanswered"},"id":$id}"""
+            }
+        }.encodeToByteArray()
+        responseHeaders.add("Content-Type", "application/json")
+        sendResponseHeaders(200, payload.size.toLong())
+        responseBody.use { it.write(payload) }
+    }
+}
 
 /**
  * A v6 transaction spending outpoint `01..01:0` — an input no wallet in this suite owns.
@@ -1012,6 +1077,46 @@ class ZcashWalletIntegrationTest {
             )
         }
 
+    @Test
+    fun discoverTransparentAddresses_withAnExplicitConcurrency_probesThatManyAtOnce() {
+        val zebra = LoopbackZebra()
+        try {
+            withWallet(ServerType.ZEBRA, zebra.url) { wallet ->
+                val account = wallet.restoreAccount(
+                    name = "vector",
+                    key = TEST_PHRASE,
+                    birthHeight = BIRTH_HEIGHT,
+                )
+
+                wallet.discoverTransparentAddresses(account, gapLimit = 8, concurrency = 3)
+
+                assertEquals(3, zebra.peak)
+            }
+        } finally {
+            zebra.close()
+        }
+    }
+
+    @Test
+    fun discoverTransparentAddresses_withTheConcurrencyOmitted_usesTheSdkDefault() {
+        val zebra = LoopbackZebra()
+        try {
+            withWallet(ServerType.ZEBRA, zebra.url) { wallet ->
+                val account = wallet.restoreAccount(
+                    name = "vector",
+                    key = TEST_PHRASE,
+                    birthHeight = BIRTH_HEIGHT,
+                )
+
+                wallet.discoverTransparentAddresses(account, gapLimit = 8)
+
+                assertEquals(8, zebra.peak)
+            }
+        } finally {
+            zebra.close()
+        }
+    }
+
     private suspend fun writeEncryptedDatabase(directory: Path): Path {
         val dbFile = directory.resolve("wallet.db")
         val wallet = openWallet(dbFile.absolutePathString(), TEST_DB_KEY)
@@ -1028,10 +1133,14 @@ class ZcashWalletIntegrationTest {
 
     private fun withWallet(
         serverType: ServerType = ServerType.LIGHTWALLETD,
+        url: String = UNREACHABLE_URL,
         block: suspend (ZcashWallet) -> Unit,
     ) = withTempDir { directory ->
-        val wallet =
-            openWallet(directory.resolve("wallet.db").absolutePathString(), serverType = serverType)
+        val wallet = openWallet(
+            directory.resolve("wallet.db").absolutePathString(),
+            serverType = serverType,
+            url = url,
+        )
         try {
             block(wallet)
         } finally {
@@ -1054,10 +1163,11 @@ class ZcashWalletIntegrationTest {
         dbKey: ByteArray? = null,
         serverType: ServerType = ServerType.LIGHTWALLETD,
         network: ZcashNetwork = ZcashNetwork.MAIN,
+        url: String = UNREACHABLE_URL,
     ) = ZcashWallet.open(
         dbPath = dbPath,
         network = network,
-        server = ServerConfig(url = "http://127.0.0.1:1", type = serverType),
+        server = ServerConfig(url = url, type = serverType),
         dbKey = dbKey,
     )
 }
