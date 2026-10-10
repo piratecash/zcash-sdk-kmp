@@ -1,6 +1,7 @@
 package cash.p.zcash
 
 import co.touchlab.kermit.Logger
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
@@ -56,9 +57,12 @@ internal fun syncFlow(
     emit(SyncState.Connecting)
     val target = try {
         backend.latestHeight()
-    } catch (error: Throwable) {
-        logSyncFailure(stage = "target", error)
+    } catch (error: CancellationException) {
         throw error
+    } catch (error: Throwable) {
+        val failure = error.withStage(SyncStage.TARGET)
+        logSyncFailure(failure)
+        throw failure
     }
     mutex.withLock {
         backend.onStart()
@@ -107,7 +111,7 @@ private suspend fun FlowCollector<SyncState>.runNativeSync(
         native.await()
         null
     } catch (error: ZcashException) {
-        error
+        error.withStage(SyncStage.SCAN)
     }
     NativeSyncResult(error, madeProgress)
 }
@@ -131,7 +135,7 @@ private suspend fun FlowCollector<SyncState>.emitTerminalState(
     val height = try {
         backend.syncedHeight(accountIds)
     } catch (error: ZcashException) {
-        return SyncState.Failed(error).also { emit(it) }
+        return SyncState.Failed(error.withStage(SyncStage.ACCOUNT_HEIGHT)).also { emit(it) }
     }
     height?.let { emit(SyncState.Syncing(boundedSyncHeight(it, target), target)) }
     return completedSyncState(height, target).also { emit(it) }
@@ -143,33 +147,34 @@ private fun logSyncTerminal(state: SyncState, target: Int, madeProgress: Boolean
     when (state) {
         SyncState.Stopped -> logger.d { "sync cancelled target=$target" }
         SyncState.Synced -> if (madeProgress) logger.d { "sync completed target=$target" }
-        is SyncState.Failed -> logSyncFailure(stage = "sync", state.error, target)
+        is SyncState.Failed -> logSyncFailure(state.error, target)
         SyncState.Connecting,
         is SyncState.Syncing,
             -> Unit
     }
 }
 
-private fun logSyncFailure(stage: String, error: Throwable, target: Int? = null) {
+private fun logSyncFailure(error: Throwable, target: Int? = null) {
+    val failure = error as? ZcashException
     val targetField = target?.let { " target=$it" }.orEmpty()
-    logger.e { "sync failed stage=$stage category=${error.syncFailureCategory()}$targetField" }
+    logger.e { "sync failed stage=${failure?.stage} category=${failure?.category}$targetField" }
 }
 
-private fun Throwable.syncFailureCategory(): String {
-    val detail = message.orEmpty().lowercase()
-    return when {
-        "tls" in detail || "handshake" in detail -> "tls"
-        "timeout" in detail || "timed out" in detail -> "timeout"
-        "eof" in detail || "connection" in detail || "network" in detail || "socket" in detail -> "network"
-        "sqlite" in detail || "database" in detail -> "database"
-        else -> "other"
+private fun Throwable.withStage(stage: SyncStage): ZcashException =
+    if (this is ZcashException && this.stage != null) {
+        this
+    } else {
+        ZcashException(message ?: toString(), cause = this, stage = stage)
     }
-}
 
 private fun completedSyncState(height: Int?, target: Int): SyncState = when {
-    height == null -> SyncState.Failed(ZcashException("Sync completed without the requested accounts"))
+    height == null -> SyncState.Failed(
+        ZcashException("Sync completed without the requested accounts", stage = SyncStage.SCAN)
+    )
     height >= target -> SyncState.Synced
-    else -> SyncState.Failed(ZcashException("Sync ended at block $height before target $target"))
+    else -> SyncState.Failed(
+        ZcashException("Sync ended at block $height before target $target", stage = SyncStage.SCAN)
+    )
 }
 
 /**

@@ -10,7 +10,9 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 use crate::{
     api::{coin::Network, network::LWDInfo},
     lwd::*,
-    net::{forward_stream, BroadcastOutcome, LwdServer},
+    net::{
+        bounded, forward_stream_with_idle, BroadcastOutcome, LwdServer, STREAM_IDLE, UNARY_DEADLINE,
+    },
     Client, GRPCClient,
 };
 
@@ -21,21 +23,27 @@ impl LwdServer for GRPCClient {
     }
 
     async fn latest_height(&mut self) -> Result<u32> {
-        let block_id = self
-            .get_latest_block(Request::new(ChainSpec {}))
-            .await?
-            .into_inner();
+        let block_id = bounded(
+            "get_latest_block",
+            UNARY_DEADLINE,
+            self.get_latest_block(Request::new(ChainSpec {})),
+        )
+        .await?
+        .into_inner();
         Ok(block_id.height as u32)
     }
 
     async fn block(&mut self, _network: &Network, height: u32) -> Result<CompactBlock> {
-        let block = self
-            .get_block(Request::new(BlockId {
+        let block = bounded(
+            "get_block",
+            UNARY_DEADLINE,
+            self.get_block(Request::new(BlockId {
                 height: height as u64,
                 hash: vec![],
-            }))
-            .await?
-            .into_inner();
+            })),
+        )
+        .await?
+        .into_inner();
         Ok(block)
     }
 
@@ -47,8 +55,10 @@ impl LwdServer for GRPCClient {
         end: u32,
     ) -> Result<Self::CompactBlockStream> {
         debug!("Fetching block range from {} to {}", start, end);
-        let blocks = self
-            .get_block_range(Request::new(BlockRange {
+        let blocks = bounded(
+            "get_block_range open",
+            UNARY_DEADLINE,
+            self.get_block_range(Request::new(BlockRange {
                 start: Some(BlockId {
                     height: start as u64,
                     hash: vec![],
@@ -58,25 +68,30 @@ impl LwdServer for GRPCClient {
                     hash: vec![],
                 }),
                 spam_filter_threshold: 0,
-            }))
-            .await?
-            .into_inner();
+            })),
+        )
+        .await?
+        .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<CompactBlock>>(10);
-        tokio::spawn(forward_stream(
+        tokio::spawn(forward_stream_with_idle(
             blocks.map(|block| block.map_err(anyhow::Error::new)),
             tx,
+            Some(STREAM_IDLE),
         ));
         Ok(ReceiverStream::new(rx))
     }
 
     async fn transaction(&mut self, network: &Network, txid: &[u8]) -> Result<(u32, Transaction)> {
-        let rtx = self
-            .get_transaction(Request::new(TxFilter {
+        let rtx = bounded(
+            "get_transaction",
+            UNARY_DEADLINE,
+            self.get_transaction(Request::new(TxFilter {
                 hash: txid.to_vec(),
                 ..Default::default()
-            }))
-            .await?
-            .into_inner();
+            })),
+        )
+        .await?
+        .into_inner();
         let height = rtx.height as u32;
         let branch_id = BranchId::for_height(network, BlockHeight::from_u32(height));
         let tx = Transaction::read(&mut &rtx.data[..], branch_id)?;
@@ -84,13 +99,16 @@ impl LwdServer for GRPCClient {
     }
 
     async fn post_transaction(&mut self, height: u32, tx: &[u8]) -> Result<BroadcastOutcome> {
-        let rep = self
-            .send_transaction(Request::new(RawTransaction {
+        let rep = bounded(
+            "send_transaction",
+            UNARY_DEADLINE,
+            self.send_transaction(Request::new(RawTransaction {
                 data: tx.to_vec(),
                 height: height as u64,
-            }))
-            .await?
-            .into_inner();
+            })),
+        )
+        .await?
+        .into_inner();
         let message = if rep.error_code == 0 {
             rep.error_message.trim_matches('"').to_string()
         } else {
@@ -110,8 +128,10 @@ impl LwdServer for GRPCClient {
         start: u32,
         end: u32,
     ) -> Result<Self::TransactionStream> {
-        let txs = self
-            .get_taddress_txids(Request::new(TransparentAddressBlockFilter {
+        let txs = bounded(
+            "get_taddress_txids open",
+            UNARY_DEADLINE,
+            self.get_taddress_txids(Request::new(TransparentAddressBlockFilter {
                 address: taddress.to_string(),
                 range: Some(BlockRange {
                     start: Some(BlockId {
@@ -124,12 +144,13 @@ impl LwdServer for GRPCClient {
                     }),
                     spam_filter_threshold: 0,
                 }),
-            }))
-            .await?
-            .into_inner();
+            })),
+        )
+        .await?
+        .into_inner();
         let network = *network;
         let (sender, rx) = tokio::sync::mpsc::channel::<Result<(u32, Transaction, usize)>>(10);
-        tokio::spawn(forward_stream(
+        tokio::spawn(forward_stream_with_idle(
             txs.map(move |rtx| {
                 let rtx = rtx.map_err(anyhow::Error::new)?;
                 let len = rtx.data.len();
@@ -156,6 +177,7 @@ impl LwdServer for GRPCClient {
                 Ok((rtx.height as u32, tx, len))
             }),
             sender,
+            Some(STREAM_IDLE),
         ));
         Ok(ReceiverStream::new(rx))
     }
@@ -168,7 +190,7 @@ impl LwdServer for GRPCClient {
             .into_inner();
         let network = *network;
         let (sender, rx) = tokio::sync::mpsc::channel::<Result<(u32, Transaction, usize)>>(10);
-        tokio::spawn(forward_stream(
+        tokio::spawn(forward_stream_with_idle(
             txs.map(move |rtx| {
                 let rtx = rtx.map_err(anyhow::Error::new)?;
                 let len = rtx.data.len();
@@ -178,18 +200,24 @@ impl LwdServer for GRPCClient {
                 Ok((rtx.height as u32, tx, len))
             }),
             sender,
+            // lightwalletd sends headers with the first tx, so a quiet, healthy mempool must time out
+            // neither at the open nor here; the subscription ends through its cancel token instead.
+            None,
         ));
         Ok(ReceiverStream::new(rx))
     }
 
     async fn tree_state(&mut self, height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-        let state = self
-            .get_tree_state(Request::new(BlockId {
+        let state = bounded(
+            "get_tree_state",
+            UNARY_DEADLINE,
+            self.get_tree_state(Request::new(BlockId {
                 height: height as u64,
                 hash: vec![],
-            }))
-            .await?
-            .into_inner();
+            })),
+        )
+        .await?
+        .into_inner();
         let sapling_tree =
             hex::decode(&state.sapling_tree).expect("Failed to decode sapling tree hex");
         let orchard_tree =
@@ -199,13 +227,16 @@ impl LwdServer for GRPCClient {
     }
 
     async fn chain_anchor(&mut self, height: u32) -> Result<Vec<u8>> {
-        let state = self
-            .get_tree_state(Request::new(BlockId {
+        let state = bounded(
+            "get_tree_state",
+            UNARY_DEADLINE,
+            self.get_tree_state(Request::new(BlockId {
                 height: height as u64,
                 hash: vec![],
-            }))
-            .await?
-            .into_inner();
+            })),
+        )
+        .await?
+        .into_inner();
         anyhow::ensure!(
             !state.hash.is_empty(),
             "tree state at {height} carries no block hash"

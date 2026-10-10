@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::time::Duration;
+
 use anyhow::Result;
 use futures::{pin_mut, Stream, StreamExt};
 use tokio::sync::mpsc::Sender;
@@ -18,9 +21,58 @@ pub mod zebra;
 
 pub const NYM_URL_SCHEME: &str = "nym://";
 
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const UNARY_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const STREAM_IDLE: Duration = Duration::from_secs(60);
+
+/// Bounds one network await, so a server that goes silent cannot hold the caller forever.
+pub(crate) async fn bounded<T, E: Into<anyhow::Error>>(
+    what: &str,
+    deadline: Duration,
+    fut: impl Future<Output = Result<T, E>>,
+) -> Result<T> {
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(deadline_exceeded(format!(
+            "{what} timed out after {} s",
+            deadline.as_secs()
+        ))),
+    }
+}
+
+fn deadline_exceeded(message: String) -> anyhow::Error {
+    anyhow::Error::new(tonic::Status::deadline_exceeded(message))
+}
+
+async fn next_within<T>(
+    source: &mut (impl Stream<Item = Result<T>> + Unpin),
+    idle: Option<Duration>,
+) -> Option<Result<T>> {
+    match idle {
+        None => source.next().await,
+        Some(idle) => tokio::time::timeout(idle, source.next())
+            .await
+            .unwrap_or_else(|_| {
+                Some(Err(deadline_exceeded(format!(
+                    "stream timed out: no data for {} s",
+                    idle.as_secs()
+                ))))
+            }),
+    }
+}
+
 pub(crate) async fn forward_stream<T>(
     source: impl Stream<Item = Result<T>>,
     sender: Sender<Result<T>>,
+) {
+    forward_stream_with_idle(source, sender, None).await
+}
+
+/// With `idle`, a source that yields nothing for that long ends with a terminal error.
+pub(crate) async fn forward_stream_with_idle<T>(
+    source: impl Stream<Item = Result<T>>,
+    sender: Sender<Result<T>>,
+    idle: Option<Duration>,
 ) {
     pin_mut!(source);
     loop {
@@ -29,7 +81,7 @@ pub(crate) async fn forward_stream<T>(
         // Biased so an item already in hand is still forwarded, exactly as before.
         let item = tokio::select! {
             biased;
-            item = source.next() => item,
+            item = next_within(&mut source, idle) => item,
             _ = sender.closed() => break,
         };
         let Some(item) = item else { break };
@@ -148,6 +200,71 @@ mod tests {
             .expect_err("source error")
             .to_string()
             .contains("stream failed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forward_stream_idle_source_fails_with_timeout() {
+        let source = futures::stream::pending::<Result<u32>>();
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+
+        tokio::time::timeout(
+            STREAM_IDLE * 2,
+            forward_stream_with_idle(source, sender, Some(STREAM_IDLE)),
+        )
+        .await
+        .expect("an idle source must end the stream");
+
+        let items = ReceiverStream::new(receiver).collect::<Vec<_>>().await;
+        assert_eq!(1, items.len());
+        let error = items[0].as_ref().expect_err("idle timeout");
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forward_stream_without_idle_waits_forever_on_a_quiet_source() {
+        let source = futures::stream::pending::<Result<u32>>();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut forwarder = tokio::spawn(forward_stream_with_idle(source, sender, None));
+
+        let still_running = tokio::time::timeout(Duration::from_secs(600), &mut forwarder).await;
+
+        assert!(
+            still_running.is_err(),
+            "a quiet source must not end the stream"
+        );
+        drop(receiver);
+        forwarder.await.expect("forwarder task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_pending_future_fails_with_deadline_exceeded() {
+        let pending = futures::future::pending::<Result<u32, tonic::Status>>();
+
+        let error = tokio::time::timeout(
+            UNARY_DEADLINE * 2,
+            bounded("get_latest_block", UNARY_DEADLINE, pending),
+        )
+        .await
+        .expect("bounded must give up at its deadline")
+        .expect_err("deadline");
+
+        let status = error
+            .downcast_ref::<tonic::Status>()
+            .expect("a gRPC status");
+        assert_eq!(tonic::Code::DeadlineExceeded, status.code());
+        assert!(status.message().contains("get_latest_block"), "{status}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_ready_future_passes_the_value_through() {
+        let ready = futures::future::ready(Ok::<_, tonic::Status>(7));
+
+        assert_eq!(
+            7,
+            bounded("get_block", UNARY_DEADLINE, ready)
+                .await
+                .expect("value")
+        );
     }
 
     #[tokio::test]

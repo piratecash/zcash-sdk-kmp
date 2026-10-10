@@ -4,8 +4,11 @@ import co.touchlab.kermit.LogWriter
 import co.touchlab.kermit.Logger
 import co.touchlab.kermit.Severity
 import kotlin.test.Test
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.toList
@@ -84,6 +87,75 @@ class ZcashSyncFlowTest {
         val failure = assertIs<SyncState.Failed>(states.last())
         assertEquals(readFailure.message, failure.error.message)
         assertTrue(SyncState.Synced !in states)
+    }
+
+    @Test
+    fun syncFlow_targetFails_rethrowsWithTargetStage() = runTest {
+        val failure = ZcashException("transport error: dns error")
+
+        val thrown = assertFailsWith<ZcashException> {
+            syncFlowOf(FakeSyncBackend(targetFailure = failure)).toList()
+        }
+
+        assertEquals(SyncStage.TARGET, thrown.stage)
+        assertEquals(failure.message, thrown.message)
+        assertSame(failure, thrown.cause)
+    }
+
+    @Test
+    fun syncFlow_targetFailsWithForeignThrowable_wrapsItWithTargetStage() = runTest {
+        val failure = IllegalStateException("socket closed")
+
+        val thrown = assertFailsWith<ZcashException> {
+            syncFlowOf(FakeSyncBackend(targetFailure = failure)).toList()
+        }
+
+        assertEquals(SyncStage.TARGET, thrown.stage)
+        assertEquals(failure.message, thrown.message)
+        assertSame(failure, thrown.cause)
+    }
+
+    @Test
+    fun syncFlow_targetCancelled_rethrowsCancellationUnwrapped() = runTest {
+        val cancellation = CancellationException("collector cancelled")
+
+        val thrown = assertFailsWith<CancellationException> {
+            syncFlowOf(FakeSyncBackend(targetFailure = cancellation)).toList()
+        }
+
+        assertSame(cancellation, thrown)
+    }
+
+    @Test
+    fun syncFlow_nativeFails_emitsFailedWithScanStage() = runTest {
+        val failure = ZcashException("compact block stream failed")
+
+        val states = syncFlowOf(FakeSyncBackend(syncFailure = failure)).toList()
+
+        val error = assertIs<ZcashException>(assertIs<SyncState.Failed>(states.last()).error)
+        assertEquals(SyncStage.SCAN, error.stage)
+        assertEquals(failure.message, error.message)
+    }
+
+    @Test
+    fun syncFlow_accountHeightFails_emitsFailedWithAccountHeightStage() = runTest {
+        val failure = ZcashException("account height read failed")
+
+        val states = syncFlowOf(FakeSyncBackend(heightFailure = failure)).toList()
+
+        val error = assertIs<ZcashException>(assertIs<SyncState.Failed>(states.last()).error)
+        assertEquals(SyncStage.ACCOUNT_HEIGHT, error.stage)
+        assertEquals(failure.message, error.message)
+    }
+
+    @Test
+    fun syncFlow_completesShortOfTarget_emitsFailedWithScanStage() = runTest {
+        listOf(LOCAL_HEIGHT, null).forEach { localHeight ->
+            val states = syncFlowOf(FakeSyncBackend(localHeight = localHeight)).toList()
+
+            val error = assertIs<ZcashException>(assertIs<SyncState.Failed>(states.last()).error)
+            assertEquals(SyncStage.SCAN, error.stage, "localHeight=$localHeight")
+        }
     }
 
     @Test
@@ -236,6 +308,15 @@ class ZcashSyncFlowTest {
         assertTrue(records.none { it.message.contains(secret) || it.throwable?.message.orEmpty().contains(secret) })
     }
 
+    private fun syncFlowOf(backend: FakeSyncBackend) = syncFlow(
+        accountIds = listOf(ACCOUNT_ID),
+        actionsPerSync = 1,
+        transparentLimit = 1,
+        checkpointAge = 1,
+        mutex = Mutex(),
+        backend = backend,
+    )
+
     private suspend fun captureLogs(block: suspend () -> Unit): List<LogRecord> {
         val previousWriters = Logger.config.logWriterList
         val previousSeverity = Logger.config.minSeverity
@@ -254,6 +335,7 @@ class ZcashSyncFlowTest {
 
 private class FakeSyncBackend(
     private val localHeight: Int? = TARGET_HEIGHT,
+    private val targetFailure: Throwable? = null,
     private val syncFailure: ZcashException? = null,
     private val heightFailure: ZcashException? = null,
     private val progress: SyncProgress? = null,
@@ -264,7 +346,10 @@ private class FakeSyncBackend(
     var receivedActionsPerSync: Int? = null
         private set
 
-    override suspend fun latestHeight(): Int = TARGET_HEIGHT
+    override suspend fun latestHeight(): Int {
+        targetFailure?.let { throw it }
+        return TARGET_HEIGHT
+    }
 
     override suspend fun synchronize(
         accountIds: List<Int>,

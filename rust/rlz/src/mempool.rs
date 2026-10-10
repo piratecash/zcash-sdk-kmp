@@ -3,7 +3,10 @@ use crate::api::mempool::{MempoolAmount, MempoolMsg, MempoolNote, MempoolTx};
 use crate::keys::{orchard_scope_to_u8, scope_to_u8};
 use anyhow::{Context as _, Result};
 use itertools::Itertools;
-use orchard::{keys::Scope, note_encryption::{IronwoodDomain, OrchardDomain}};
+use orchard::{
+    keys::Scope,
+    note_encryption::{IronwoodDomain, OrchardDomain},
+};
 use sapling_crypto::{
     keys::PreparedIncomingViewingKey, note_encryption::SaplingDomain,
     zip32::DiversifiableFullViewingKey,
@@ -80,7 +83,12 @@ pub async fn run_mempool_impl<S: Sink<MempoolMsg> + Send + 'static>(
         let height = client.latest_height().await?;
         mempool_tx.send(MempoolMsg::BlockHeight(height)).await;
 
-        let mut mempool_txs = client.mempool_stream(network).await?;
+        // lightwalletd sends the open's headers only with the first tx, so a quiet mempool would
+        // hold the open, and with it stop(), until something arrives.
+        let mut mempool_txs = tokio::select! {
+            _ = cancel_token.cancelled() => break 'outer,
+            opened = client.mempool_stream(network) => opened?,
+        };
 
         loop {
             tokio::select! {
@@ -223,8 +231,8 @@ pub async fn decode_raw_transaction(
                             try_note_decryption(&domain, &pivk, v)
                         {
                             let diversifier = recipient.diversifier().as_array().to_vec();
-                            let ua =
-                                UnifiedAddress::from_receivers(Some(recipient), None, None).unwrap();
+                            let ua = UnifiedAddress::from_receivers(Some(recipient), None, None)
+                                .unwrap();
                             let address = ua.encode(network);
                             let diversifier_index = ivk
                                 .diversifier_index(&recipient)

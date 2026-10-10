@@ -24,6 +24,7 @@ use crate::db::{
 };
 use crate::lwd::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::net::zebra::ZebraClient;
+use crate::net::{bounded, CONNECT_TIMEOUT};
 use crate::{Client, IntoAnyhow};
 
 /// Pings make a connection that went dark fail within the keepalive window instead of waiting
@@ -268,7 +269,10 @@ impl Coin {
                 return Ok(Box::new(client) as Client);
             }
             #[cfg(not(feature = "nym"))]
-            anyhow::bail!("nym feature disabled: refusing nym service address {}", self.url);
+            anyhow::bail!(
+                "nym feature disabled: refusing nym service address {}",
+                self.url
+            );
         }
 
         #[cfg(not(feature = "nym"))]
@@ -280,15 +284,18 @@ impl Coin {
             // lightwalletd (gRPC): transport chosen explicitly by the enum.
             0 => {
                 let endpoint = lightwalletd_endpoint(&self.url, ping_interval)?;
-                let channel = match self.transport {
-                    1 => connect_over_tor(endpoint, &self.url).await?,
-                    #[cfg(feature = "nym")]
-                    2 => connect_over_nym(&self.url).await?,
-                    3 if !self.proxy.is_empty() => {
-                        connect_over_proxy(endpoint, &self.url, &self.proxy).await?
-                    }
-                    _ => endpoint.connect().await?,
+                let connect = async {
+                    Ok::<_, anyhow::Error>(match self.transport {
+                        1 => connect_over_tor(endpoint, &self.url).await?,
+                        #[cfg(feature = "nym")]
+                        2 => connect_over_nym(&self.url).await?,
+                        3 if !self.proxy.is_empty() => {
+                            connect_over_proxy(endpoint, &self.url, &self.proxy).await?
+                        }
+                        _ => endpoint.connect().await?,
+                    })
                 };
+                let channel = bounded("connect", CONNECT_TIMEOUT, connect).await?;
                 let client = CompactTxStreamerClient::new(channel);
                 Ok(Box::new(client) as Client)
             }
