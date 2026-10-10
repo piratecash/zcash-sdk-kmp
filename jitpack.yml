@@ -4,6 +4,13 @@ jdk:
 before_install:
   - |
     (
+      echo "== wrapper diagnostics"; pwd; ls -la gradle/wrapper; sha256sum gradle/wrapper/gradle-wrapper.jar || true
+      unzip -l gradle/wrapper/gradle-wrapper.jar 2>&1 | head -5 || true; file gradle/wrapper/gradle-wrapper.jar || true
+      which java; java -version 2>&1; env | grep -iE '^(CLASSPATH|JAVA|GRADLE|SDKMAN)' || true
+      git status --short | head -5; git ls-files gradle/wrapper; sh -x ./gradlew --version 2>&1 | tail -15 || true
+    )
+  - |
+    (
       set -eu
       fail() { echo "INVALID NATIVE SET: $*" >&2; exit 1; }
       case "${VERSION:-}" in
