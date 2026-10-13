@@ -26,10 +26,10 @@ pub fn get(handle: i64) -> Option<Coin> {
     handles().get(&handle).cloned()
 }
 
-/// Replaces an open wallet's state. A handle closed meanwhile is not resurrected.
-pub fn replace(handle: i64, coin: Coin) {
+/// Changes an open wallet in place, under the registry lock. A closed handle is left closed.
+pub fn update(handle: i64, change: impl FnOnce(&mut Coin)) {
     if let Some(slot) = handles().get_mut(&handle) {
-        *slot = coin;
+        change(slot);
     }
 }
 
@@ -78,13 +78,34 @@ mod tests {
     }
 
     #[test]
-    fn replace_updates_an_open_wallet_and_ignores_a_closed_one() {
-        let handle = insert(coin("e.db"));
-        replace(handle, coin("e2.db"));
-        assert_eq!(get(handle).unwrap().db_filepath, "e2.db");
+    fn update_open_wallet_changes_the_live_slot() {
+        let handle = insert(coin("f.db"));
 
+        update(handle, |coin| coin.url = "https://a.example".to_string());
+
+        assert_eq!(get(handle).unwrap().url, "https://a.example");
+    }
+
+    #[test]
+    fn update_account_landing_after_a_server_update_keeps_the_new_server() {
+        let handle = insert(coin("g.db"));
+        let account = get(handle).unwrap().account + 1;
+
+        update(handle, |coin| coin.url = "https://b.example".to_string());
+        update(handle, |coin| coin.account = account);
+
+        let coin = get(handle).unwrap();
+        assert_eq!(coin.url, "https://b.example");
+        assert_eq!(coin.account, account);
+    }
+
+    #[test]
+    fn update_closed_handle_does_nothing() {
+        let handle = insert(coin("h.db"));
         remove(handle);
-        replace(handle, coin("e3.db"));
+
+        update(handle, |coin| coin.url = "https://c.example".to_string());
+
         assert!(get(handle).is_none());
     }
 }

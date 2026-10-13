@@ -46,6 +46,34 @@ public object ZcashSdk {
         NativeLibrary.ensureLoadedBlocking()
         return mapNativeError { parseDatabaseStats(ZcashJni.databaseStats()) }
     }
+
+    /** Process-wide compact-block stream counters, for diagnostics. An in-memory read. */
+    public fun networkStats(): NetworkStats {
+        NativeLibrary.ensureLoadedBlocking()
+        return mapNativeError { parseNetworkStats(ZcashJni.networkStats()) }
+    }
+}
+
+/**
+ * Measures the mainnet lightwalletd server at [url] over a fresh connection, fetching the last
+ * [rangeBlocks] blocks. The native call itself gives up after [timeoutMs], with a
+ * [FailureCategory.TIMEOUT] [ZcashException]. [ZcashSdk.initialize] must have run first.
+ */
+public suspend fun ZcashSdk.probeServer(
+    url: String,
+    transport: Transport,
+    rangeBlocks: Int,
+    timeoutMs: Long,
+    proxy: String = "",
+): ServerProbe {
+    require(rangeBlocks > 0) { "Range must hold at least one block" }
+    require(timeoutMs > 0) { "Timeout must be positive" }
+    NativeLibrary.ensureLoaded()
+    return withContext(Dispatchers.IO) {
+        mapNativeError {
+            parseServerProbe(ZcashJni.probeServer(url, transport.id, proxy, rangeBlocks, timeoutMs))
+        }
+    }
 }
 
 /**

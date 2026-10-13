@@ -989,6 +989,7 @@ pub async fn shielded_sync(
     // Key derivations happen once upfront — no per-note DB queries in the hot path.
     let key_cache = preload_account_key_cache(&mut writer_connection).await?;
     let network = *network;
+    let reopen_client = client.duplicate();
     let error_sender = tx_messages.clone();
     let sync = async move {
         debug!("Start sync");
@@ -999,6 +1000,7 @@ pub async fn shielded_sync(
             end,
             &accounts,
             blocks,
+            reopen_client,
             heights_without_time,
             actions_per_sync,
             &s,

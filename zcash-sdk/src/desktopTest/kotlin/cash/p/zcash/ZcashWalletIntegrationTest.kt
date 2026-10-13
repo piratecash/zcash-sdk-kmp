@@ -2,7 +2,9 @@ package cash.p.zcash
 
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
@@ -1141,6 +1143,105 @@ class ZcashWalletIntegrationTest {
         } finally {
             zebra.close()
         }
+    }
+
+    @Test
+    fun setServer_fromAnUnreachableServerToLoopbackZebra_latestHeightSucceeds() =
+        LoopbackZebra().use { zebra ->
+            withWallet { wallet ->
+                assertFailsWith<ZcashException> { wallet.latestHeight() }
+
+                wallet.setServer(ServerConfig(zebra.url, ServerType.ZEBRA))
+
+                assertEquals(LOOPBACK_TIP, wallet.latestHeight())
+            }
+        }
+
+    @Test
+    fun setServer_malformedUrl_throwsAndKeepsThePreviousServer() =
+        LoopbackZebra().use { zebra ->
+            withWallet(ServerType.ZEBRA, zebra.url) { wallet ->
+                assertFailsWith<ZcashException> { wallet.setServer(ServerConfig("not a url")) }
+
+                assertEquals(LOOPBACK_TIP, wallet.latestHeight())
+            }
+        }
+
+    @Test
+    fun selectAccount_afterSetServer_keepsTheNewServer() =
+        LoopbackZebra().use { zebra ->
+            withWallet { wallet ->
+                val account = wallet.restoreAccount(
+                    name = "vector",
+                    key = TEST_PHRASE,
+                    birthHeight = BIRTH_HEIGHT,
+                )
+                wallet.setServer(ServerConfig(zebra.url, ServerType.ZEBRA))
+
+                wallet.selectAccount(account)
+
+                assertEquals(LOOPBACK_TIP, wallet.latestHeight())
+            }
+        }
+
+    @Test
+    fun probeServer_unreachableServer_throwsANetworkFailure() = withTempDir {
+        val failure = assertFailsWith<ZcashException> {
+            ZcashSdk.probeServer(UNREACHABLE_URL, Transport.DIRECT, rangeBlocks = 10, timeoutMs = 10_000)
+        }
+
+        assertEquals(FailureCategory.NETWORK, failure.category, failure.message)
+    }
+
+    @Test
+    fun probeServer_serverNeverAnswers_failsWithATimeoutByTheDeadline() = withTempDir {
+        // Accepted by the kernel backlog and never read: the connection opens, nothing answers.
+        ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use { silent ->
+            val started = System.nanoTime()
+
+            val failure = assertFailsWith<ZcashException> {
+                ZcashSdk.probeServer(
+                    "http://127.0.0.1:${silent.localPort}",
+                    Transport.DIRECT,
+                    rangeBlocks = 10,
+                    timeoutMs = 500,
+                )
+            }
+
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            assertEquals(FailureCategory.TIMEOUT, failure.category, failure.message)
+            assertTrue(elapsedMs < 5_000, "the probe took $elapsedMs ms")
+        }
+    }
+
+    @Test
+    fun networkStats_offlineSuite_readsZeros() {
+        // No test here ever opens a compact-block stream, so nothing can have broken one.
+        assertEquals(NetworkStats(streamBreaks = 0, streamResumed = 0), ZcashSdk.networkStats())
+    }
+
+    @Test
+    fun parseServerProbe_fullPayload_mapsEveryField() {
+        val probe = parseServerProbe(
+            """{"chainName":"main","saplingActivationHeight":419200,"consensusBranchId":"c8e71055",""" +
+                """"blockHeight":2800000,"estimatedHeight":2800001,"branchIdMatches":true,""" +
+                """"infoMs":30,"rangeMs":20,"rangeBlocksReceived":10}"""
+        )
+
+        assertEquals(
+            ServerProbe(
+                chainName = "main",
+                saplingActivationHeight = 419_200,
+                consensusBranchId = "c8e71055",
+                blockHeight = 2_800_000,
+                estimatedHeight = 2_800_001,
+                branchIdMatches = true,
+                infoMs = 30,
+                rangeMs = 20,
+                rangeBlocksReceived = 10,
+            ),
+            probe,
+        )
     }
 
     private suspend fun writeEncryptedDatabase(directory: Path): Path {

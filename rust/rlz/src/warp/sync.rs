@@ -16,7 +16,9 @@ use orchard::note::AssetId;
 
 use crate::{
     lwd::CompactBlock,
+    net::{StreamStats, STREAM_STATS},
     warp::hasher::{OrchardHasher, SaplingHasher},
+    Client,
 };
 use zcash_trees::types::{BlockHeader, Issuance, WarpSyncMessage};
 
@@ -27,6 +29,13 @@ pub use zcash_trees::types::SyncError;
 mod shielded;
 
 const MAX_BLOCKS_PER_CHUNK: usize = 1000;
+
+/// Waits before each reopen of a broken compact-block stream; once they run out the scan fails.
+const STREAM_RESUME_DELAYS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
 
 pub type SaplingSync = Synchronizer<shielded::sapling::SaplingProtocol>;
 pub type OrchardSync = Synchronizer<shielded::orchard::OrchardProtocol>;
@@ -62,6 +71,7 @@ pub async fn warp_sync(
     end_height: u32,
     accounts: &[(u32, bool)],
     blocks: ReceiverStream<Result<CompactBlock>>,
+    client: Client,
     heights_without_time: HashSet<u32>,
     actions_per_sync: u32,
     sapling_state: &CommitmentTreeFrontier,
@@ -132,10 +142,17 @@ pub async fn warp_sync(
 
     let account_ids = accounts.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let (tx_blocks, mut rx_blocks) = tokio::sync::mpsc::channel::<BlockMessage>(2);
-    let block_reader = read_block_stream(
+    let source = ResumableBlocks {
         blocks,
-        start_height,
+        client,
+        network: *network,
         end_height,
+        failures: 0,
+        stats: &STREAM_STATS,
+    };
+    let block_reader = read_block_stream(
+        source,
+        start_height,
         prev_hash,
         account_ids,
         heights_without_time,
@@ -217,11 +234,67 @@ pub async fn warp_sync(
     reader_result
 }
 
+/// The compact-block stream of one scan, reopened where it broke.
+struct ResumableBlocks {
+    blocks: ReceiverStream<Result<CompactBlock>>,
+    client: Client,
+    network: Network,
+    end_height: u32,
+    failures: usize,
+    stats: &'static StreamStats,
+}
+
+impl ResumableBlocks {
+    /// Replaces the broken stream with one starting at `from`, or fails once the delays run out.
+    async fn resume(
+        &mut self,
+        mut error: anyhow::Error,
+        from: u32,
+        rx_cancel: &mut broadcast::Receiver<()>,
+    ) -> Result<(), SyncError> {
+        loop {
+            self.stats.record_break();
+            self.failures += 1;
+            let Some(delay) = STREAM_RESUME_DELAYS.get(self.failures - 1) else {
+                return Err(SyncError::Other(anyhow::anyhow!(
+                    "network: compact block stream broke {} times: {error:#}",
+                    self.failures
+                )));
+            };
+            debug!("compact block stream broke ({error:#}), reopening at {from} in {delay:?}");
+            let reopen = async {
+                tokio::time::sleep(*delay).await;
+                self.client
+                    .block_range(&self.network, from, self.end_height)
+                    .await
+            };
+            let reopened = tokio::select! {
+                biased;
+                _ = rx_cancel.recv() => return Err(SyncError::Cancelled),
+                reopened = reopen => reopened,
+            };
+            match reopened {
+                Ok(blocks) => {
+                    self.blocks = blocks;
+                    return Ok(());
+                }
+                Err(reopen_error) => error = reopen_error,
+            }
+        }
+    }
+
+    fn delivered_block(&mut self) {
+        if self.failures > 0 {
+            self.stats.record_resumed();
+            self.failures = 0;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn read_block_stream(
-    mut blocks: ReceiverStream<Result<CompactBlock>>,
+    mut source: ResumableBlocks,
     start_height: u32,
-    end_height: u32,
     mut prev_hash: Option<Vec<u8>>,
     account_ids: Vec<u32>,
     mut heights_without_time: HashSet<u32>,
@@ -230,6 +303,7 @@ async fn read_block_stream(
     mut rx_cancel: broadcast::Receiver<()>,
     stall_timeout: Duration,
 ) -> Result<(), SyncError> {
+    let end_height = source.end_height as u64;
     let mut chunk = vec![];
     let mut interval = tokio::time::interval(stall_timeout);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -239,7 +313,7 @@ async fn read_block_stream(
     let mut actions = 0;
 
     loop {
-        tokio::select! {
+        let error = tokio::select! {
             biased;
             _ = rx_cancel.recv() => {
                 debug!("Sync cancelled");
@@ -247,16 +321,13 @@ async fn read_block_stream(
             }
             _ = interval.tick() => {
                 debug!("Syncing at height {}", current_height);
-                if previous_height == current_height {
-                    debug!("Connection stalled. Aborting...");
-                    flush_chunk(&tx_blocks, &mut chunk).await?;
-                    return Err(SyncError::Other(anyhow::anyhow!(
-                        "compact block stream stalled at height {current_height}"
-                    )));
+                if previous_height != current_height {
+                    previous_height = current_height;
+                    continue;
                 }
-                previous_height = current_height;
+                anyhow::anyhow!("compact block stream stalled at height {current_height}")
             }
-            message = blocks.next() => {
+            message = source.blocks.next() => {
                 match message {
                 Some(Ok(block)) => {
                     if block.height != expected_height {
@@ -281,6 +352,7 @@ async fn read_block_stream(
                     }
                     prev_hash = Some(block.hash.clone());
                     expected_height += 1;
+                    source.delivered_block();
 
                     if heights_without_time.remove(&current_height) {
                         let header = BlockHeader {
@@ -304,26 +376,28 @@ async fn read_block_stream(
                         flush_chunk(&tx_blocks, &mut chunk).await?;
                         actions = 0;
                     }
+                    continue;
                 }
-                Some(Err(error)) => {
-                    flush_chunk(&tx_blocks, &mut chunk).await?;
-                    return Err(SyncError::Other(error));
-                }
-                None => {
-                    debug!("no more blocks to process");
-                    flush_chunk(&tx_blocks, &mut chunk).await?;
-                    if expected_height <= end_height as u64 {
-                        return Err(SyncError::Other(anyhow::anyhow!(
-                            "compact block stream ended before height {expected_height}"
-                        )));
-                    }
-                    break;
-                }
+                Some(Err(error)) => error,
+                None if expected_height > end_height => break,
+                None => anyhow::anyhow!(
+                    "compact block stream ended before height {expected_height}"
+                ),
                 }
             }
+        };
+        flush_chunk(&tx_blocks, &mut chunk).await?;
+        if expected_height > end_height {
+            return Err(SyncError::Other(error));
         }
+        source
+            .resume(error, expected_height as u32, &mut rx_cancel)
+            .await?;
+        interval.reset();
     }
 
+    debug!("no more blocks to process");
+    flush_chunk(&tx_blocks, &mut chunk).await?;
     debug!("warp_sync completed");
     Ok(())
 }
@@ -345,6 +419,14 @@ async fn flush_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::tests::{restore, TEST_PHRASE};
+    use crate::api::sync::file_backed_coin;
+    use crate::net::{BroadcastOutcome, LwdServer, NetworkStats};
+    use crate::sync::shielded_sync;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tonic::async_trait;
+    use zcash_primitives::transaction::Transaction;
 
     fn block(height: u32, previous_hash: &[u8], hash: &[u8]) -> CompactBlock {
         CompactBlock {
@@ -355,24 +437,168 @@ mod tests {
         }
     }
 
-    async fn read(
-        items: Vec<Result<CompactBlock>>,
+    fn chained(height: u32) -> CompactBlock {
+        block(height, &[height as u8 - 1], &[height as u8])
+    }
+
+    fn broken() -> Result<CompactBlock> {
+        Err(anyhow::anyhow!("unexpected EOF"))
+    }
+
+    enum Reply {
+        Refused,
+        Ends(Vec<Result<CompactBlock>>),
+        Stalls(Vec<Result<CompactBlock>>),
+        Late(Duration, CompactBlock),
+    }
+
+    /// Answers each `block_range` with the next scripted reply; one more request than scripted panics.
+    #[derive(Clone)]
+    struct ScriptedRanges {
+        replies: Arc<Mutex<VecDeque<Reply>>>,
+        starts: Arc<Mutex<Vec<u32>>>,
+        stalled: Arc<Mutex<Vec<Sender<Result<CompactBlock>>>>>,
+    }
+
+    impl ScriptedRanges {
+        fn new(replies: Vec<Reply>) -> Self {
+            ScriptedRanges {
+                replies: Arc::new(Mutex::new(replies.into())),
+                starts: Arc::new(Mutex::new(vec![])),
+                stalled: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn starts(&self) -> Vec<u32> {
+            self.starts.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LwdServer for ScriptedRanges {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
+        async fn latest_height(&mut self) -> Result<u32> {
+            unimplemented!()
+        }
+
+        async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {
+            unimplemented!()
+        }
+
+        type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
+        async fn block_range(
+            &mut self,
+            _network: &Network,
+            start: u32,
+            _end: u32,
+        ) -> Result<Self::CompactBlockStream> {
+            self.starts.lock().expect("lock").push(start);
+            let reply = self.replies.lock().expect("lock").pop_front();
+            let (items, stalls) = match reply.expect("an unscripted block range request") {
+                Reply::Refused => anyhow::bail!("connection refused"),
+                Reply::Ends(items) => (items, false),
+                Reply::Stalls(items) => (items, true),
+                Reply::Late(delay, block) => {
+                    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = sender.send(Ok(block)).await;
+                    });
+                    return Ok(ReceiverStream::new(receiver));
+                }
+            };
+            let (sender, receiver) = tokio::sync::mpsc::channel(items.len().max(1));
+            for item in items {
+                sender.send(item).await.expect("queue item");
+            }
+            if stalls {
+                self.stalled.lock().expect("lock").push(sender);
+            }
+            Ok(ReceiverStream::new(receiver))
+        }
+
+        async fn transaction(
+            &mut self,
+            _network: &Network,
+            _txid: &[u8],
+        ) -> Result<(u32, Transaction)> {
+            unimplemented!()
+        }
+
+        async fn post_transaction(&mut self, _height: u32, _tx: &[u8]) -> Result<BroadcastOutcome> {
+            unimplemented!()
+        }
+
+        type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn taddress_txs(
+            &mut self,
+            _network: &Network,
+            _taddress: &str,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::TransactionStream> {
+            unimplemented!()
+        }
+
+        type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn mempool_stream(&mut self, _network: &Network) -> Result<Self::MempoolStream> {
+            unimplemented!()
+        }
+
+        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            Ok((vec![], vec![], vec![]))
+        }
+
+        async fn chain_anchor(&mut self, _height: u32) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+    }
+
+    fn resumable(
+        blocks: ReceiverStream<Result<CompactBlock>>,
+        server: &ScriptedRanges,
+        end_height: u32,
+        stats: &'static StreamStats,
+    ) -> ResumableBlocks {
+        ResumableBlocks {
+            blocks,
+            client: Box::new(server.clone()),
+            network: Network::Main,
+            end_height,
+            failures: 0,
+            stats,
+        }
+    }
+
+    struct Read {
+        result: Result<(), SyncError>,
+        messages: Vec<BlockMessage>,
+        starts: Vec<u32>,
+    }
+
+    /// The first reply is the stream the scan opens; the rest answer its reopens.
+    async fn read_scripted(
+        replies: Vec<Reply>,
         start: u32,
         end: u32,
         previous_hash: Option<Vec<u8>>,
-    ) -> (Result<(), SyncError>, Vec<BlockMessage>) {
-        let (source, receiver) = tokio::sync::mpsc::channel(items.len().max(1));
-        for item in items {
-            source.send(item).await.expect("source item");
-        }
-        drop(source);
+        stats: &'static StreamStats,
+    ) -> Read {
+        let server = ScriptedRanges::new(replies);
+        let blocks = server
+            .clone()
+            .block_range(&Network::Main, start, end)
+            .await
+            .expect("first stream");
         let (messages, mut output) = tokio::sync::mpsc::channel(10);
         let (_cancel, cancellation) = broadcast::channel(1);
 
-        let result = read_block_stream(
-            ReceiverStream::new(receiver),
+        let reader = read_block_stream(
+            resumable(blocks, &server, end, stats),
             start,
-            end,
             previous_hash,
             vec![7],
             HashSet::new(),
@@ -380,28 +606,75 @@ mod tests {
             messages,
             cancellation,
             Duration::from_secs(60),
-        )
-        .await;
-        let mut collected = vec![];
-        while let Some(message) = output.recv().await {
-            collected.push(message);
+        );
+        let collector = async {
+            let mut collected = vec![];
+            while let Some(message) = output.recv().await {
+                collected.push(message);
+            }
+            collected
+        };
+        let (result, messages) = tokio::join!(reader, collector);
+        Read {
+            result,
+            messages,
+            starts: server.starts(),
         }
-        (result, collected)
     }
 
-    #[tokio::test]
-    async fn read_block_stream_source_fails_returns_the_source_error() {
-        let (result, _) = read(vec![Err(anyhow::anyhow!("stream failed"))], 10, 10, None).await;
+    async fn read(
+        items: Vec<Result<CompactBlock>>,
+        start: u32,
+        end: u32,
+        previous_hash: Option<Vec<u8>>,
+    ) -> (Result<(), SyncError>, Vec<BlockMessage>) {
+        static STATS: StreamStats = StreamStats::new();
+        let read = read_scripted(vec![Reply::Ends(items)], start, end, previous_hash, &STATS).await;
+        (read.result, read.messages)
+    }
 
-        let error = result.expect_err("source failure").to_string();
+    fn chunked_heights(messages: &[BlockMessage]) -> Vec<u64> {
+        messages
+            .iter()
+            .flat_map(|message| match message {
+                BlockMessage::Chunk(blocks) => blocks.iter().map(|b| b.height).collect(),
+                _ => vec![],
+            })
+            .collect()
+    }
+
+    fn stats(stream_breaks: u64, stream_resumed: u64) -> NetworkStats {
+        NetworkStats {
+            stream_breaks,
+            stream_resumed,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_source_fails_returns_the_source_error() {
+        static STATS: StreamStats = StreamStats::new();
+        let fails = || Reply::Ends(vec![Err(anyhow::anyhow!("stream failed"))]);
+        let read = read_scripted(
+            vec![fails(), fails(), fails(), fails()],
+            10,
+            10,
+            None,
+            &STATS,
+        )
+        .await;
+
+        let error = read.result.expect_err("source failure").to_string();
         assert!(error.contains("stream failed"), "{error}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_block_stream_ends_early_rejects_the_incomplete_range() {
-        let (result, _) = read(vec![Ok(block(10, &[], &[10]))], 10, 11, None).await;
+        static STATS: StreamStats = StreamStats::new();
+        let mut replies = vec![Reply::Ends(vec![Ok(block(10, &[], &[10]))])];
+        replies.extend((0..3).map(|_| Reply::Ends(vec![])));
+        let read = read_scripted(replies, 10, 11, None, &STATS).await;
 
-        let error = result.expect_err("incomplete range").to_string();
+        let error = read.result.expect_err("incomplete range").to_string();
         assert!(error.contains("11"), "{error}");
     }
 
@@ -464,14 +737,19 @@ mod tests {
 
     #[tokio::test]
     async fn read_block_stream_is_cancelled_returns_cancelled() {
+        static STATS: StreamStats = StreamStats::new();
         let (source, receiver) = tokio::sync::mpsc::channel(1);
         let (messages, _output) = tokio::sync::mpsc::channel(1);
         let (cancel, cancellation) = broadcast::channel(1);
         cancel.send(()).expect("cancel");
 
         let result = read_block_stream(
-            ReceiverStream::new(receiver),
-            10,
+            resumable(
+                ReceiverStream::new(receiver),
+                &ScriptedRanges::new(vec![]),
+                10,
+                &STATS,
+            ),
             10,
             None,
             vec![7],
@@ -489,6 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_block_stream_cancelled_with_pending_block_discards_the_block() {
+        static STATS: StreamStats = StreamStats::new();
         let (source, receiver) = tokio::sync::mpsc::channel(1);
         source
             .send(Ok(block(10, &[], &[10])))
@@ -497,9 +776,13 @@ mod tests {
         let (messages, mut output) = tokio::sync::mpsc::channel(1);
         let (cancel, cancellation) = broadcast::channel(1);
         let reader = tokio::spawn(read_block_stream(
-            ReceiverStream::new(receiver),
+            resumable(
+                ReceiverStream::new(receiver),
+                &ScriptedRanges::new(vec![]),
+                11,
+                &STATS,
+            ),
             10,
-            11,
             None,
             vec![7],
             HashSet::new(),
@@ -524,6 +807,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_block_stream_block_and_cancel_ready_never_flushes_the_block() {
+        static STATS: StreamStats = StreamStats::new();
         for _ in 0..32 {
             let (source, receiver) = tokio::sync::mpsc::channel(1);
             source
@@ -535,8 +819,12 @@ mod tests {
             cancel.send(()).expect("cancel");
 
             let result = read_block_stream(
-                ReceiverStream::new(receiver),
-                10,
+                resumable(
+                    ReceiverStream::new(receiver),
+                    &ScriptedRanges::new(vec![]),
+                    10,
+                    &STATS,
+                ),
                 10,
                 None,
                 vec![7],
@@ -553,27 +841,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_block_stream_stalls_returns_an_error() {
-        let (_source, receiver) = tokio::sync::mpsc::channel(1);
-        let (messages, _output) = tokio::sync::mpsc::channel(1);
-        let (_cancel, cancellation) = broadcast::channel(1);
+        static STATS: StreamStats = StreamStats::new();
+        let replies = (0..4).map(|_| Reply::Stalls(vec![])).collect();
+        let read = read_scripted(replies, 10, 10, None, &STATS).await;
 
-        let result = read_block_stream(
-            ReceiverStream::new(receiver),
-            10,
-            10,
-            None,
-            vec![7],
-            HashSet::new(),
-            100,
-            messages,
-            cancellation,
-            Duration::from_millis(1),
-        )
-        .await;
-
-        assert!(result.expect_err("stall").to_string().contains("stalled"));
+        assert!(read
+            .result
+            .expect_err("stall")
+            .to_string()
+            .contains("stalled"));
     }
 
     #[tokio::test]
@@ -585,5 +863,211 @@ mod tests {
         assert!(
             matches!(messages.as_slice(), [BlockMessage::Reorg(accounts, 9)] if accounts == &[7])
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_breaks_then_resumes_processes_every_block_once() {
+        static STATS: StreamStats = StreamStats::new();
+        let replies = vec![
+            Reply::Ends(vec![Ok(chained(10)), Ok(chained(11)), broken()]),
+            Reply::Ends(vec![Ok(chained(12)), Ok(chained(13))]),
+        ];
+
+        let read = read_scripted(replies, 10, 13, Some(vec![9]), &STATS).await;
+
+        read.result.expect("resumed scan");
+        assert_eq!(chunked_heights(&read.messages), vec![10, 11, 12, 13]);
+        assert_eq!(read.starts, vec![10, 12]);
+        assert_eq!(STATS.snapshot(), stats(1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_three_failed_reopens_fails_with_a_network_error() {
+        static STATS: StreamStats = StreamStats::new();
+        let replies = vec![
+            Reply::Ends(vec![Ok(chained(10)), broken()]),
+            Reply::Refused,
+            Reply::Refused,
+            Reply::Refused,
+        ];
+
+        let read = read_scripted(replies, 10, 12, Some(vec![9]), &STATS).await;
+
+        let error = read.result.expect_err("retries run out").to_string();
+        assert!(
+            error.starts_with("network: compact block stream broke 4 times: connection refused"),
+            "{error}"
+        );
+        assert_eq!(chunked_heights(&read.messages), vec![10]);
+        assert_eq!(read.starts, vec![10, 11, 11, 11]);
+        assert_eq!(STATS.snapshot(), stats(4, 0));
+    }
+
+    // Real time: the file-backed pool does I/O on other threads, which paused time would race.
+    #[tokio::test]
+    async fn shielded_sync_three_failed_reopens_keeps_the_blocks_read_before_the_break() {
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let mut client: Client = Box::new(ScriptedRanges::new(vec![
+            Reply::Ends(vec![
+                Ok(chained(2_000_001)),
+                Ok(chained(2_000_002)),
+                broken(),
+            ]),
+            Reply::Refused,
+            Reply::Refused,
+            Reply::Refused,
+        ]));
+        let (progress, _progress) = tokio::sync::mpsc::channel(100);
+        let (_cancel, cancellation) = broadcast::channel(1);
+
+        let error = shielded_sync(
+            &Network::Main,
+            &coin.get_pool().expect("pool"),
+            &mut client,
+            &[(account, false)],
+            2_000_001,
+            2_000_004,
+            u32::MAX,
+            progress,
+            cancellation,
+        )
+        .await
+        .expect_err("retries run out")
+        .to_string();
+
+        assert!(
+            error.starts_with("network: compact block stream broke 4 times"),
+            "{error}"
+        );
+        let header: Option<u32> = sqlx::query_scalar("SELECT MAX(height) FROM headers")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("headers");
+        let shielded: Vec<u32> =
+            sqlx::query_scalar("SELECT height FROM sync_heights WHERE pool IN (1, 2)")
+                .fetch_all(&mut *connection)
+                .await
+                .expect("sync heights");
+        assert_eq!(header, Some(2_000_002));
+        assert_eq!(shielded, vec![2_000_002, 2_000_002]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_progress_after_each_break_resets_the_attempts() {
+        static STATS: StreamStats = StreamStats::new();
+        let mut replies: Vec<Reply> = (10..14)
+            .map(|height| Reply::Ends(vec![Ok(chained(height)), broken()]))
+            .collect();
+        replies.push(Reply::Ends(vec![Ok(chained(14))]));
+
+        let read = read_scripted(replies, 10, 14, Some(vec![9]), &STATS).await;
+
+        read.result.expect("every break was followed by progress");
+        assert_eq!(chunked_heights(&read.messages), vec![10, 11, 12, 13, 14]);
+        assert_eq!(STATS.snapshot(), stats(4, 4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_stalled_stream_is_reopened_where_it_stalled() {
+        static STATS: StreamStats = StreamStats::new();
+        let replies = vec![
+            Reply::Stalls(vec![Ok(chained(10))]),
+            Reply::Ends(vec![Ok(chained(11))]),
+        ];
+
+        let read = read_scripted(replies, 10, 11, Some(vec![9]), &STATS).await;
+
+        read.result.expect("resumed after the stall");
+        assert_eq!(chunked_heights(&read.messages), vec![10, 11]);
+        assert_eq!(read.starts, vec![10, 11]);
+        assert_eq!(STATS.snapshot(), stats(1, 1));
+    }
+
+    /// The stall is seen by the tick at 60 s and the reopen lands at 60.5 s; the old tick schedule
+    /// would fire at 120 s, before the reopened stream's block at 120.25 s.
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_reopened_stream_gets_a_full_stall_window() {
+        static STATS: StreamStats = StreamStats::new();
+        let replies = vec![
+            Reply::Stalls(vec![Ok(chained(10))]),
+            Reply::Late(Duration::from_millis(59_750), chained(11)),
+        ];
+
+        let read = read_scripted(replies, 10, 11, Some(vec![9]), &STATS).await;
+
+        read.result.expect("a slow reopened stream is not a stall");
+        assert_eq!(read.starts, vec![10, 11]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_ends_early_is_reopened_where_it_ended() {
+        static STATS: StreamStats = StreamStats::new();
+        let replies = vec![
+            Reply::Ends(vec![Ok(chained(10))]),
+            Reply::Ends(vec![Ok(chained(11))]),
+        ];
+
+        let read = read_scripted(replies, 10, 11, Some(vec![9]), &STATS).await;
+
+        read.result.expect("resumed after the early end");
+        assert_eq!(chunked_heights(&read.messages), vec![10, 11]);
+        assert_eq!(read.starts, vec![10, 11]);
+        assert_eq!(STATS.snapshot(), stats(1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_breaks_after_the_last_block_fails_without_reopening() {
+        static STATS: StreamStats = StreamStats::new();
+        let replies = vec![Reply::Ends(vec![Ok(chained(10)), broken()])];
+
+        let read = read_scripted(replies, 10, 10, Some(vec![9]), &STATS).await;
+
+        let error = read.result.expect_err("source failure").to_string();
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert_eq!(chunked_heights(&read.messages), vec![10]);
+        assert_eq!(read.starts, vec![10]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_block_stream_cancelled_during_the_backoff_returns_cancelled_without_reopening() {
+        static STATS: StreamStats = StreamStats::new();
+        let server = ScriptedRanges::new(vec![Reply::Ends(vec![broken()])]);
+        let blocks = server
+            .clone()
+            .block_range(&Network::Main, 10, 10)
+            .await
+            .expect("first stream");
+        let (messages, _output) = tokio::sync::mpsc::channel(1);
+        let (cancel, cancellation) = broadcast::channel(1);
+        let reader = tokio::spawn(read_block_stream(
+            resumable(blocks, &server, 10, &STATS),
+            10,
+            None,
+            vec![7],
+            HashSet::new(),
+            100,
+            messages,
+            cancellation,
+            Duration::from_secs(60),
+        ));
+
+        // Busy-yielding keeps the paused clock from auto-advancing past the backoff.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while STATS.snapshot().stream_breaks == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream never broke"
+            );
+            tokio::task::yield_now().await;
+        }
+        let _ = cancel.send(());
+        let result = reader.await.expect("reader task");
+
+        assert!(matches!(result, Err(SyncError::Cancelled)));
+        assert_eq!(server.starts(), vec![10]);
     }
 }

@@ -344,3 +344,68 @@ internal data class DatabaseStatsDto(
 
 internal fun parseDatabaseStats(json: String): DatabaseStats =
     nativeJson.decodeFromString<DatabaseStatsDto>(json).toDatabaseStats()
+
+/**
+ * Process-wide: [streamBreaks] counts every failure of a sync's compact-block stream, a failed
+ * reopen included; [streamResumed] counts reopens that then delivered a block.
+ */
+public data class NetworkStats(
+    public val streamBreaks: Long,
+    public val streamResumed: Long,
+)
+
+@Serializable
+internal data class NetworkStatsDto(
+    val streamBreaks: Long,
+    val streamResumed: Long,
+) {
+    fun toNetworkStats(): NetworkStats = NetworkStats(streamBreaks, streamResumed)
+}
+
+internal fun parseNetworkStats(json: String): NetworkStats =
+    nativeJson.decodeFromString<NetworkStatsDto>(json).toNetworkStats()
+
+/**
+ * One measurement of a mainnet lightwalletd server. [infoMs] covers a fresh connect plus
+ * `GetLightdInfo`; [rangeMs] the block range that ends at [blockHeight].
+ */
+public data class ServerProbe(
+    public val chainName: String,
+    public val saplingActivationHeight: Int,
+    public val consensusBranchId: String,
+    public val blockHeight: Int,
+    public val estimatedHeight: Int,
+    /** The server's branch id is the one mainnet has at [blockHeight]. */
+    public val branchIdMatches: Boolean,
+    public val infoMs: Long,
+    public val rangeMs: Long,
+    public val rangeBlocksReceived: Int,
+)
+
+@Serializable
+internal data class ServerProbeDto(
+    val chainName: String,
+    val saplingActivationHeight: Int,
+    val consensusBranchId: String,
+    val blockHeight: Int,
+    val estimatedHeight: Int,
+    val branchIdMatches: Boolean,
+    val infoMs: Long,
+    val rangeMs: Long,
+    val rangeBlocksReceived: Int,
+) {
+    fun toServerProbe(): ServerProbe = ServerProbe(
+        chainName = chainName,
+        saplingActivationHeight = saplingActivationHeight,
+        consensusBranchId = consensusBranchId,
+        blockHeight = blockHeight,
+        estimatedHeight = estimatedHeight,
+        branchIdMatches = branchIdMatches,
+        infoMs = infoMs,
+        rangeMs = rangeMs,
+        rangeBlocksReceived = rangeBlocksReceived,
+    )
+}
+
+internal fun parseServerProbe(json: String): ServerProbe =
+    nativeJson.decodeFromString<ServerProbeDto>(json).toServerProbe()

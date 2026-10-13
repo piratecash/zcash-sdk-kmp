@@ -8,7 +8,8 @@ use rlz::api::account::{Account, Addresses, Receivers, Tx};
 use rlz::api::coin::DatabaseStats;
 use rlz::api::mempool::{MempoolAmount, MempoolMsg, MempoolNote};
 use rlz::api::migrate::{MigrationEvent, MigrationStatus};
-use rlz::net::BroadcastOutcome;
+use rlz::api::network::ServerProbe;
+use rlz::net::{BroadcastOutcome, NetworkStats};
 use rlz::pay::{Recipient, TxPlan, TxPlanIn, TxPlanOut};
 use serde::{Deserialize, Serialize};
 
@@ -251,6 +252,52 @@ impl From<DatabaseStats> for DatabaseStatsDto {
     }
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStatsDto {
+    pub stream_breaks: u64,
+    pub stream_resumed: u64,
+}
+
+impl From<NetworkStats> for NetworkStatsDto {
+    fn from(stats: NetworkStats) -> Self {
+        NetworkStatsDto {
+            stream_breaks: stats.stream_breaks,
+            stream_resumed: stats.stream_resumed,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerProbeDto {
+    pub chain_name: String,
+    pub sapling_activation_height: u64,
+    pub consensus_branch_id: String,
+    pub block_height: u64,
+    pub estimated_height: u64,
+    pub branch_id_matches: bool,
+    pub info_ms: u64,
+    pub range_ms: u64,
+    pub range_blocks_received: u32,
+}
+
+impl From<ServerProbe> for ServerProbeDto {
+    fn from(probe: ServerProbe) -> Self {
+        ServerProbeDto {
+            chain_name: probe.chain_name,
+            sapling_activation_height: probe.sapling_activation_height,
+            consensus_branch_id: probe.consensus_branch_id,
+            block_height: probe.block_height,
+            estimated_height: probe.estimated_height,
+            branch_id_matches: probe.branch_id_matches,
+            info_ms: probe.info_ms,
+            range_ms: probe.range_ms,
+            range_blocks_received: probe.range_blocks_received,
+        }
+    }
+}
+
 /// The net value an unconfirmed transaction moves for one account, in zatoshi.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -477,6 +524,49 @@ mod tests {
                 "recoveredByRetry": 2,
                 "lastError": "14: open(*.sqlite3) - No such file",
                 "recent": ["14: open(*.sqlite3) - No such file"],
+            }),
+            serde_json::to_value(&dto).unwrap()
+        );
+    }
+
+    #[test]
+    fn network_stats_dto_uses_the_field_names_kotlin_reads() {
+        let dto = NetworkStatsDto::from(NetworkStats {
+            stream_breaks: 3,
+            stream_resumed: 2,
+        });
+
+        assert_eq!(
+            serde_json::json!({ "streamBreaks": 3, "streamResumed": 2 }),
+            serde_json::to_value(&dto).unwrap()
+        );
+    }
+
+    #[test]
+    fn server_probe_dto_uses_the_field_names_kotlin_reads() {
+        let dto = ServerProbeDto::from(ServerProbe {
+            chain_name: "main".to_string(),
+            sapling_activation_height: 419_200,
+            consensus_branch_id: "c8e71055".to_string(),
+            block_height: 2_800_000,
+            estimated_height: 2_800_001,
+            branch_id_matches: true,
+            info_ms: 30,
+            range_ms: 20,
+            range_blocks_received: 10,
+        });
+
+        assert_eq!(
+            serde_json::json!({
+                "chainName": "main",
+                "saplingActivationHeight": 419_200,
+                "consensusBranchId": "c8e71055",
+                "blockHeight": 2_800_000,
+                "estimatedHeight": 2_800_001,
+                "branchIdMatches": true,
+                "infoMs": 30,
+                "rangeMs": 20,
+                "rangeBlocksReceived": 10,
             }),
             serde_json::to_value(&dto).unwrap()
         );

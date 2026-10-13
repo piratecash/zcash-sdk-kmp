@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -24,6 +25,49 @@ pub const NYM_URL_SCHEME: &str = "nym://";
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const UNARY_DEADLINE: Duration = Duration::from_secs(60);
 pub(crate) const STREAM_IDLE: Duration = Duration::from_secs(60);
+
+pub(crate) struct StreamStats {
+    breaks: AtomicU64,
+    resumed: AtomicU64,
+}
+
+impl StreamStats {
+    pub(crate) const fn new() -> Self {
+        StreamStats {
+            breaks: AtomicU64::new(0),
+            resumed: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn record_break(&self) {
+        self.breaks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_resumed(&self) {
+        self.resumed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> NetworkStats {
+        NetworkStats {
+            stream_breaks: self.breaks.load(Ordering::Relaxed),
+            stream_resumed: self.resumed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) static STREAM_STATS: StreamStats = StreamStats::new();
+
+/// Process-wide: `stream_breaks` counts every failure of a scan's compact-block stream, a failed
+/// reopen included; `stream_resumed` counts reopens that then delivered a block.
+#[derive(Debug, PartialEq)]
+pub struct NetworkStats {
+    pub stream_breaks: u64,
+    pub stream_resumed: u64,
+}
+
+pub fn network_stats() -> NetworkStats {
+    STREAM_STATS.snapshot()
+}
 
 /// Bounds one network await, so a server that goes silent cannot hold the caller forever.
 pub(crate) async fn bounded<T, E: Into<anyhow::Error>>(
@@ -153,6 +197,11 @@ pub trait LwdServer: Send {
     /// serves from the node rather than from its compact-block cache, so two equal answers bracket
     /// a transparent walk against one and the same chain.
     async fn chain_anchor(&mut self, height: u32) -> Result<Vec<u8>>;
+
+    /// Only lightwalletd serves it.
+    async fn lightd_info(&mut self) -> Result<LightdInfo> {
+        anyhow::bail!("lightd info is not available on this server")
+    }
 }
 
 #[cfg(test)]

@@ -313,6 +313,14 @@ public class ZcashWallet private constructor(
     public suspend fun selectAccount(id: Int): Unit = withNative { ZcashJni.setAccount(handle, id) }
 
     /**
+     * Later calls use [server]; calls already running keep the old one until they end. An invalid
+     * URL throws [ZcashException] and the wallet keeps its previous server.
+     */
+    public suspend fun setServer(server: ServerConfig): Unit = withNative {
+        ZcashJni.setServer(handle, server.url, server.type.id, server.transport.id, server.proxy)
+    }
+
+    /**
      * Balance of [id], split into spendable and pending value.
      *
      * A note counts as available once it is [confirmations] blocks deep in the locally

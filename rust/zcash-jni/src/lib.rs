@@ -11,7 +11,7 @@ mod sqlite_log;
 
 use dto::{
     AccountDto, AddressesDto, BroadcastResultDto, DatabaseStatsDto, MigrationStatusDto,
-    MigrationStepDto, RecipientDto, TxDto, TxPlanDto,
+    MigrationStepDto, NetworkStatsDto, RecipientDto, ServerProbeDto, TxDto, TxPlanDto,
 };
 use jni::errors::ErrorPolicy;
 use jni::objects::{JByteArray, JIntArray, JLongArray, JObject, JObjectArray, JString};
@@ -31,7 +31,7 @@ use rlz::api::key::{
     generate_seed, get_key_pools, import_spending_key, is_spending_key,
 };
 use rlz::api::migrate::{migration_status, migration_step};
-use rlz::api::network::get_current_height;
+use rlz::api::network::{get_current_height, probe_server};
 use rlz::api::pay::{
     apply_transparent_signatures, broadcast, extract_transaction, pack_transaction, prepare,
     reserve_for_broadcast, sign_transaction_with_key, to_plan, transaction_id,
@@ -41,6 +41,7 @@ use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sqlite_log::{describe, record};
 use rlz::api::sweep::discover_transparent_addresses;
 use rlz::api::sync::{balance_breakdown, cancel_sync, max_spendable_from_pools};
+use rlz::net::network_stats;
 use rlz::pay::pool::ALL_POOLS;
 use rlz::pay::reserve::OwnInputs;
 use rlz::pay::Recipient;
@@ -129,6 +130,18 @@ fn panic_message(payload: &Box<dyn Any + Send + 'static>) -> String {
 
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("tokio runtime"))
+}
+
+fn with_server(
+    coin: Coin,
+    url: String,
+    server_type: jbyte,
+    transport: jbyte,
+    proxy: String,
+) -> anyhow::Result<Coin> {
+    coin.set_lwd(server_type as u8, url)?
+        .set_transport(transport as u8)?
+        .set_proxy(proxy)
 }
 
 fn wallet(handle: jlong) -> Result<Coin, BridgeError> {
@@ -270,12 +283,10 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_open<'local>(
             let proxy = proxy.try_to_string(env)?;
 
             let opened = runtime().block_on(async {
-                Coin::new(Some(coin as u8))
+                let coin = Coin::new(Some(coin as u8))
                     .open_database_with_key(db_path, db_key)
-                    .await?
-                    .set_lwd(server_type as u8, url)?
-                    .set_transport(transport as u8)?
-                    .set_proxy(proxy)
+                    .await?;
+                with_server(coin, url, server_type, transport, proxy)
             })?;
             Ok(registry::insert(opened))
         })
@@ -291,6 +302,46 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_databaseStats<'local>(
     unowned_env
         .with_env(|env| -> Result<JString<'local>, BridgeError> {
             to_json(env, &DatabaseStatsDto::from(database_stats()))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Process-wide: needs no open wallet, and reads only in-memory counters.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_networkStats<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            to_json(env, &NetworkStatsDto::from(network_stats()))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Returns by `timeout_ms` even when the server never answers.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_probeServer<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    url: JString<'local>,
+    transport: jbyte,
+    proxy: JString<'local>,
+    range_blocks: jint,
+    timeout_ms: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let url = url.try_to_string(env)?;
+            let proxy = proxy.try_to_string(env)?;
+            let probe = runtime().block_on(probe_server(
+                &url,
+                transport as u8,
+                &proxy,
+                range_blocks as u32,
+                Duration::from_millis(timeout_ms as u64),
+            ))?;
+            to_json(env, &ServerProbeDto::from(probe))
         })
         .resolve::<ThrowNativeError>()
 }
@@ -393,8 +444,37 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_setAccount<'local>(
 ) {
     unowned_env
         .with_env(|_env| -> Result<(), BridgeError> {
-            let coin = runtime().block_on(wallet(handle)?.set_account(account as u32))?;
-            registry::replace(handle, coin);
+            runtime().block_on(wallet(handle)?.set_account(account as u32))?;
+            registry::update(handle, |coin| coin.account = account as u32);
+            Ok(())
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Validated before anything is stored. A sync or mempool stream already running keeps the
+/// server it started on.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_setServer<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    url: JString<'local>,
+    server_type: jbyte,
+    transport: jbyte,
+    proxy: JString<'local>,
+) {
+    unowned_env
+        .with_env(|env| -> Result<(), BridgeError> {
+            let url = url.try_to_string(env)?;
+            let proxy = proxy.try_to_string(env)?;
+            let server = with_server(wallet(handle)?, url, server_type, transport, proxy)?;
+            server.check_server()?;
+            registry::update(handle, |coin| {
+                coin.url = server.url;
+                coin.server_type = server.server_type;
+                coin.transport = server.transport;
+                coin.proxy = server.proxy;
+            });
             Ok(())
         })
         .resolve::<ThrowNativeError>()

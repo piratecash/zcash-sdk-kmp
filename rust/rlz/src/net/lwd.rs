@@ -243,6 +243,17 @@ impl LwdServer for GRPCClient {
         );
         Ok(hex::decode(&state.hash)?)
     }
+
+    async fn lightd_info(&mut self) -> Result<LightdInfo> {
+        let info = bounded(
+            "get_lightd_info",
+            UNARY_DEADLINE,
+            self.get_lightd_info(Request::new(Empty {})),
+        )
+        .await?
+        .into_inner();
+        Ok(info)
+    }
 }
 
 pub async fn query_lwd_list(coin: u8) -> Result<Vec<LWDInfo>> {

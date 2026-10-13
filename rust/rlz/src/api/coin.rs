@@ -334,6 +334,11 @@ impl Coin {
         Ok(Coin { proxy, ..self })
     }
 
+    /// Rejects, without touching the network, every server configuration `connect` would reject.
+    pub fn check_server(&self) -> Result<()> {
+        self.server_target(KEEP_ALIVE_INTERVAL).map(|_| ())
+    }
+
     pub(crate) async fn client(&self) -> Result<Client> {
         self.connect(KEEP_ALIVE_INTERVAL).await
     }
@@ -344,7 +349,7 @@ impl Coin {
         self.connect(MEMPOOL_KEEP_ALIVE_INTERVAL).await
     }
 
-    async fn connect(&self, ping_interval: Duration) -> Result<Client> {
+    fn server_target(&self, ping_interval: Duration) -> Result<ServerTarget> {
         // Mixnet-native endpoint (nym:// URL, a nym-rpc service): bypasses the
         // transport enum entirely — the mixnet IS the transport. Classified by
         // scheme before parsing, so a malformed recipient errors out instead of
@@ -357,9 +362,7 @@ impl Coin {
                 }
                 let recipient = crate::net::nym_service::parse_nym_url(&self.url)
                     .ok_or_else(|| anyhow::anyhow!("invalid nym service address: {}", self.url))?;
-                let channel = crate::net::nym_service::grpc_channel(recipient).await?;
-                let client = CompactTxStreamerClient::new(channel);
-                return Ok(Box::new(client) as Client);
+                return Ok(ServerTarget::Nym(recipient));
             }
             #[cfg(not(feature = "nym"))]
             anyhow::bail!(
@@ -374,9 +377,29 @@ impl Coin {
         }
 
         match self.server_type {
+            0 => Ok(ServerTarget::Lightwalletd(lightwalletd_endpoint(
+                &self.url,
+                ping_interval,
+            )?)),
+            1 => Ok(ServerTarget::Zebra(ZebraClient::new(
+                &self.network(),
+                &self.url,
+                self.transport,
+                &self.proxy,
+            )?)),
+            other => anyhow::bail!("unknown server type {other}"),
+        }
+    }
+
+    async fn connect(&self, ping_interval: Duration) -> Result<Client> {
+        match self.server_target(ping_interval)? {
+            #[cfg(feature = "nym")]
+            ServerTarget::Nym(recipient) => {
+                let channel = crate::net::nym_service::grpc_channel(recipient).await?;
+                Ok(Box::new(CompactTxStreamerClient::new(channel)) as Client)
+            }
             // lightwalletd (gRPC): transport chosen explicitly by the enum.
-            0 => {
-                let endpoint = lightwalletd_endpoint(&self.url, ping_interval)?;
+            ServerTarget::Lightwalletd(endpoint) => {
                 let connect = async {
                     Ok::<_, anyhow::Error>(match self.transport {
                         1 => connect_over_tor(endpoint, &self.url).await?,
@@ -392,16 +415,17 @@ impl Coin {
                 let client = CompactTxStreamerClient::new(channel);
                 Ok(Box::new(client) as Client)
             }
-
-            1 => {
-                let client =
-                    ZebraClient::new(&self.network(), &self.url, self.transport, &self.proxy)?;
-                Ok(Box::new(client) as Client)
-            }
-
-            _ => unreachable!(),
+            ServerTarget::Zebra(client) => Ok(Box::new(client) as Client),
         }
     }
+}
+
+/// What `connect` dials, resolved from the configuration alone.
+enum ServerTarget {
+    #[cfg(feature = "nym")]
+    Nym(nym_sdk::mixnet::Recipient),
+    Lightwalletd(Endpoint),
+    Zebra(ZebraClient),
 }
 
 /// Pings make a connection that went dark fail within the keepalive window instead of TCP's
@@ -902,6 +926,47 @@ mod tests {
             transport,
             proxy: String::new(),
         }
+    }
+
+    fn coin_on(server_type: u8, url: &str) -> Coin {
+        Coin {
+            server_type,
+            ..coin_with(url, 0)
+        }
+    }
+
+    #[test]
+    fn check_server_well_formed_urls_accepts_both_server_types() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for server_type in [0, 1] {
+            coin_on(server_type, "https://zec.rocks:443")
+                .check_server()
+                .expect("a well-formed URL");
+        }
+    }
+
+    #[test]
+    fn check_server_malformed_url_rejects_both_server_types() {
+        for server_type in [0, 1] {
+            assert!(
+                coin_on(server_type, "not a url").check_server().is_err(),
+                "server type {server_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_server_unknown_server_type_is_rejected() {
+        let err = coin_on(2, "https://zec.rocks:443")
+            .check_server()
+            .expect_err("server type 2")
+            .to_string();
+        assert!(err.contains("server type 2"), "{err}");
+    }
+
+    #[test]
+    fn check_server_malformed_nym_url_is_rejected() {
+        assert!(coin_on(0, "nym://not-a-recipient").check_server().is_err());
     }
 
     #[tokio::test]

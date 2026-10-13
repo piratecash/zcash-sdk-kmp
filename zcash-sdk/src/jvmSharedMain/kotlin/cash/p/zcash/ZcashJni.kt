@@ -14,6 +14,17 @@ internal object ZcashJni {
     /** Process-wide database open counters and SQLite's recent log, as JSON. Needs no wallet. */
     external fun databaseStats(): String
 
+    /** Process-wide compact-block stream counters, as JSON. Needs no wallet. */
+    external fun networkStats(): String
+
+    external fun probeServer(
+        url: String,
+        transport: Byte,
+        proxy: String,
+        rangeBlocks: Int,
+        timeoutMs: Long,
+    ): String
+
     external fun open(
         dbPath: String,
         dbKey: ByteArray?,
@@ -41,6 +52,8 @@ internal object ZcashJni {
     external fun deleteAccount(handle: Long, account: Int)
 
     external fun setAccount(handle: Long, account: Int)
+
+    external fun setServer(handle: Long, url: String, serverType: Byte, transport: Byte, proxy: String)
 
     external fun accountAddresses(handle: Long, account: Int): String
 
