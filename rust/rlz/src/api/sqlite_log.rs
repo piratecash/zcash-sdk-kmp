@@ -24,6 +24,9 @@ const DB_SUFFIXES: [&str; 4] = [
 /// Ends the path in SQLite's os-layer format `%s(%s) - %s`. The last one is taken: errno text never
 /// holds it, while a directory name may.
 const OS_ERROR_DELIMITER: &str = ") - ";
+/// Ends a path SQLite quotes, as in `attempt to open "%s" as file descriptor %d`; the last quote,
+/// since a directory name may hold one.
+const QUOTE: &str = "\"";
 const MIN_HEX_RUN: usize = 16;
 
 static RING: Mutex<LogRing> = Mutex::new(LogRing::new());
@@ -182,10 +185,15 @@ fn flush_hex_run(out: &mut String, run: &mut String) {
 pub fn redact_paths(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
-    while let Some(start) = path_start(rest) {
+    while let Some((start, opener)) = path_start(rest) {
         out.push_str(&rest[..start]);
         let path = &rest[start..];
-        let len = path.rfind(OS_ERROR_DELIMITER).unwrap_or(path.len());
+        let end = if opener == Some('"') {
+            QUOTE
+        } else {
+            OS_ERROR_DELIMITER
+        };
+        let len = path.rfind(end).unwrap_or(path.len());
         out.push_str(&redacted(&path[..len]));
         rest = &path[len..];
     }
@@ -193,15 +201,20 @@ pub fn redact_paths(message: &str) -> String {
     out
 }
 
-fn path_start(s: &str) -> Option<usize> {
+/// A root counts after anything that cannot continue a path word, so no SQLite format is missed.
+fn path_start(s: &str) -> Option<(usize, Option<char>)> {
     let mut previous = None;
     for (i, c) in s.char_indices() {
-        if matches!(previous, None | Some('(' | ' ' | ':')) && is_path_root(&s[i..]) {
-            return Some(i);
+        if !previous.is_some_and(is_path_word_char) && is_path_root(&s[i..]) {
+            return Some((i, previous));
         }
         previous = Some(c);
     }
     None
+}
+
+fn is_path_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '~' | '/' | '\\')
 }
 
 fn is_path_root(s: &str) -> bool {
@@ -308,6 +321,35 @@ mod tests {
                 "open(/tmp/Personal) - Alice/wallet_7.sqlite3) - No such file or directory"
             )
         );
+    }
+
+    #[test]
+    fn redact_paths_quoted_path_keeps_only_the_suffix_and_the_rest_of_the_message() {
+        assert_eq!(
+            "attempt to open \"*.sqlite3\" as file descriptor 0",
+            redact_paths(
+                "attempt to open \"/data/user/0/cash.p.terminal/no_backup/zcash/wallet_7.sqlite3\" as file descriptor 0"
+            )
+        );
+    }
+
+    #[test]
+    fn redact_paths_quoted_directory_containing_a_quote_leaks_nothing() {
+        assert_eq!(
+            "attempt to open \"*.sqlite3\" as file descriptor 1",
+            redact_paths("attempt to open \"/tmp/Alice\"s/wallet_7.sqlite3\" as file descriptor 1")
+        );
+    }
+
+    #[test]
+    fn redact_paths_path_after_any_separator_is_redacted() {
+        for (message, expected) in [
+            ("path=/home/alice/notes", "path=<path>"),
+            ("'/home/alice/notes'", "'<path>"),
+            ("[/home/alice/notes]", "[<path>"),
+        ] {
+            assert_eq!(expected, redact_paths(message));
+        }
     }
 
     #[test]
