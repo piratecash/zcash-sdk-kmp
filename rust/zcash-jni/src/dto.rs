@@ -5,6 +5,7 @@
 //! the native side at all.
 
 use rlz::api::account::{Account, Addresses, Receivers, Tx};
+use rlz::api::coin::DatabaseStats;
 use rlz::api::mempool::{MempoolAmount, MempoolMsg, MempoolNote};
 use rlz::api::migrate::{MigrationEvent, MigrationStatus};
 use rlz::net::BroadcastOutcome;
@@ -226,6 +227,30 @@ impl From<BroadcastOutcome> for BroadcastResultDto {
     }
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseStatsDto {
+    pub opens: u64,
+    pub native_cantopen: u64,
+    pub cantopen_failures: u64,
+    pub recovered_by_retry: u64,
+    pub last_error: Option<String>,
+    pub recent: Vec<String>,
+}
+
+impl From<DatabaseStats> for DatabaseStatsDto {
+    fn from(stats: DatabaseStats) -> Self {
+        DatabaseStatsDto {
+            opens: stats.opens,
+            native_cantopen: stats.native_cantopen,
+            cantopen_failures: stats.cantopen_failures,
+            recovered_by_retry: stats.recovered_by_retry,
+            last_error: stats.last_error,
+            recent: stats.recent,
+        }
+    }
+}
+
 /// The net value an unconfirmed transaction moves for one account, in zatoshi.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -431,6 +456,30 @@ mod tests {
 
         let dto: MigrationStepDto = serde_json::from_str(&json).unwrap();
         assert_eq!(None, dto.txid);
+    }
+
+    #[test]
+    fn database_stats_dto_uses_the_field_names_kotlin_reads() {
+        let dto = DatabaseStatsDto::from(DatabaseStats {
+            opens: 5,
+            native_cantopen: 4,
+            cantopen_failures: 3,
+            recovered_by_retry: 2,
+            last_error: Some("14: open(*.sqlite3) - No such file".to_string()),
+            recent: vec!["14: open(*.sqlite3) - No such file".to_string()],
+        });
+
+        assert_eq!(
+            serde_json::json!({
+                "opens": 5,
+                "nativeCantopen": 4,
+                "cantopenFailures": 3,
+                "recoveredByRetry": 2,
+                "lastError": "14: open(*.sqlite3) - No such file",
+                "recent": ["14: open(*.sqlite3) - No such file"],
+            }),
+            serde_json::to_value(&dto).unwrap()
+        );
     }
 
     #[test]

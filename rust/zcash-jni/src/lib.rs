@@ -7,10 +7,11 @@ mod dto;
 mod mempool;
 mod progress;
 mod registry;
+mod sqlite_log;
 
 use dto::{
-    AccountDto, AddressesDto, BroadcastResultDto, MigrationStatusDto, MigrationStepDto,
-    RecipientDto, TxDto, TxPlanDto,
+    AccountDto, AddressesDto, BroadcastResultDto, DatabaseStatsDto, MigrationStatusDto,
+    MigrationStepDto, RecipientDto, TxDto, TxPlanDto,
 };
 use jni::errors::ErrorPolicy;
 use jni::objects::{JByteArray, JIntArray, JLongArray, JObject, JObjectArray, JString};
@@ -24,7 +25,7 @@ use rlz::api::account::{
     transparent_address_balance, transparent_coverage, ua_from_ufvk, unified_address, AddressKind,
     NewAccount,
 };
-use rlz::api::coin::{init_datadir, Coin};
+use rlz::api::coin::{database_stats, init_datadir, Coin};
 use rlz::api::key::{
     derive_sapling_viewing_key, derive_spending_key, derive_transparent_account_key, derive_ufvk,
     generate_seed, get_key_pools, import_spending_key, is_spending_key,
@@ -37,6 +38,7 @@ use rlz::api::pay::{
     transparent_signing_request, unpack_transaction, PaymentOptions, PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
+use rlz::api::sqlite_log::{describe, record};
 use rlz::api::sweep::discover_transparent_addresses;
 use rlz::api::sync::{balance_breakdown, cancel_sync, max_spendable_from_pools};
 use rlz::pay::pool::ALL_POOLS;
@@ -67,7 +69,7 @@ impl std::error::Error for BridgeError {}
 
 impl From<anyhow::Error> for BridgeError {
     fn from(e: anyhow::Error) -> Self {
-        BridgeError(format!("{e:#}"))
+        BridgeError(describe(&e))
     }
 }
 
@@ -232,6 +234,12 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_initDataDir<'local>(
         .with_env(|env| -> Result<(), BridgeError> {
             let directory = directory.try_to_string(env)?;
 
+            // Before any open, so SQLite's own log covers the very first one.
+            let rc = sqlite_log::install();
+            if rc != libsqlite3_sys::SQLITE_OK {
+                record(rc, "sqlite log not installed");
+            }
+
             // rustls picks no provider by itself; without this any TLS call to lightwalletd panics.
             let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -270,6 +278,19 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_open<'local>(
                     .set_proxy(proxy)
             })?;
             Ok(registry::insert(opened))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Process-wide: needs no open wallet, and reads only in-memory counters.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_databaseStats<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            to_json(env, &DatabaseStatsDto::from(database_stats()))
         })
         .resolve::<ThrowNativeError>()
 }
@@ -1261,6 +1282,17 @@ mod tests {
             3,
             2,
         )
+    }
+
+    #[test]
+    fn bridge_error_from_database_error_carries_sqlite_tail() {
+        let error = sqlite_log::cantopen_error();
+        rlz::api::sqlite_log::record(14, "bridge-error-marker");
+
+        let BridgeError(message) = BridgeError::from(error);
+
+        assert!(message.contains(" [sqlite: "), "{message}");
+        assert!(message.contains("bridge-error-marker"), "{message}");
     }
 
     #[test]

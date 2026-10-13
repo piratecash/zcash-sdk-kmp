@@ -17,6 +17,7 @@ pub mod plugin;
 #[cfg(feature = "raptor")]
 pub mod raptor;
 pub mod sapling;
+pub mod sqlite_log;
 pub mod sweep;
 pub mod sync;
 pub mod transaction;

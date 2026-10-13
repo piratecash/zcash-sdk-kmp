@@ -3,6 +3,7 @@
 //! `synchronize_impl` returns `Ok(current_height)` whatever happens inside and routes every failure
 //! — including cancellation — through the sink, so the error slot is what decides the outcome.
 
+use rlz::api::sqlite_log::describe;
 use rlz::api::sync::SyncProgress;
 use rlz::Sink;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,7 +53,7 @@ impl Sink<SyncProgress> for ProgressSink {
     }
 
     async fn send_error(&self, e: anyhow::Error) {
-        *self.slot() = Some(format!("{e:#}"));
+        *self.slot() = Some(describe(&e));
     }
 }
 
@@ -99,6 +100,19 @@ mod tests {
         block_on(sink.send_error(anyhow::anyhow!("Sync canceled")));
 
         assert_eq!(Err("Sync canceled".to_string()), sink.outcome());
+    }
+
+    #[test]
+    fn send_error_database_error_carries_sqlite_tail() {
+        let sink = ProgressSink::default();
+        let error = crate::sqlite_log::cantopen_error();
+        rlz::api::sqlite_log::record(14, "progress-marker");
+
+        block_on(sink.send_error(error));
+
+        let outcome = sink.outcome().expect_err("a database error fails the sync");
+        assert!(outcome.contains(" [sqlite: "), "{outcome}");
+        assert!(outcome.contains("progress-marker"), "{outcome}");
     }
 
     #[test]

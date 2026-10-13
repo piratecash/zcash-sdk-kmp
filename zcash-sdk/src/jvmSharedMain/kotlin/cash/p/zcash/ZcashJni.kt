@@ -11,6 +11,9 @@ internal object ZcashJni {
 
     external fun initDataDir(directory: String)
 
+    /** Process-wide database open counters and SQLite's recent log, as JSON. Needs no wallet. */
+    external fun databaseStats(): String
+
     external fun open(
         dbPath: String,
         dbKey: ByteArray?,

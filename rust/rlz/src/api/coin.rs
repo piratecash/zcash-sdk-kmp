@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use arti_client::TorClient;
 #[cfg(feature = "flutter")]
 use flutter_rust_bridge::frb;
 use hyper_util::rt::TokioIo;
+use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Sqlite, SqlitePool};
@@ -18,6 +20,7 @@ use tower::service_fn;
 use zcash_protocol::consensus::{BlockHeight, OrchardMode};
 use zcash_protocol::local_consensus::LocalNetwork;
 
+use crate::api::sqlite_log::{self, SQLITE_CANTOPEN};
 use crate::db::{
     backfill_diversifier_index, create_schema, migrate_sapling_addresses, put_prop,
     scrub_spending_keys,
@@ -25,7 +28,7 @@ use crate::db::{
 use crate::lwd::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::net::zebra::ZebraClient;
 use crate::net::{bounded, CONNECT_TIMEOUT};
-use crate::{Client, IntoAnyhow};
+use crate::Client;
 
 /// Pings make a connection that went dark fail within the keepalive window instead of waiting
 /// out TCP's retransmit backoff. Request/response channels ping fast; `MEMPOOL_KEEP_ALIVE_INTERVAL`
@@ -47,6 +50,101 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_millis(300);
 
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Long enough that the 30 s sync keeps its connections warm instead of reopening them.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Waits between acquire attempts after a code-14 open failure.
+const CANTOPEN_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
+
+pub(crate) struct OpenStats {
+    opens: AtomicU64,
+    cantopen_failures: AtomicU64,
+    recovered_by_retry: AtomicU64,
+}
+
+impl OpenStats {
+    const fn new() -> Self {
+        OpenStats {
+            opens: AtomicU64::new(0),
+            cantopen_failures: AtomicU64::new(0),
+            recovered_by_retry: AtomicU64::new(0),
+        }
+    }
+}
+
+pub(crate) static DB_STATS: OpenStats = OpenStats::new();
+
+/// Process-wide diagnostics of native database opens. `cantopen_failures` and
+/// `recovered_by_retry` count acquire attempts; `native_cantopen` counts SQLite's own reports.
+pub struct DatabaseStats {
+    pub opens: u64,
+    pub native_cantopen: u64,
+    pub cantopen_failures: u64,
+    pub recovered_by_retry: u64,
+    pub last_error: Option<String>,
+    pub recent: Vec<String>,
+}
+
+pub fn database_stats() -> DatabaseStats {
+    DatabaseStats {
+        opens: DB_STATS.opens.load(Ordering::Relaxed),
+        native_cantopen: sqlite_log::native_cantopen(),
+        cantopen_failures: DB_STATS.cantopen_failures.load(Ordering::Relaxed),
+        recovered_by_retry: DB_STATS.recovered_by_retry.load(Ordering::Relaxed),
+        last_error: sqlite_log::last_error(),
+        recent: sqlite_log::snapshot(),
+    }
+}
+
+/// Retries only `SQLITE_CANTOPEN`; any other error, and the last code-14 one, is returned as is.
+pub(crate) async fn acquire_with_retry(
+    pool: &SqlitePool,
+    stats: &OpenStats,
+) -> Result<PoolConnection<Sqlite>> {
+    let attempts = CANTOPEN_RETRY_DELAYS.len() + 1;
+    let mut failed = 0;
+    loop {
+        let error = match pool.acquire().await {
+            Ok(connection) => {
+                record_recovery(failed, stats);
+                return Ok(connection);
+            }
+            Err(error) if is_cantopen(&error) => error,
+            Err(error) => return Err(error.into()),
+        };
+        failed += 1;
+        stats.cantopen_failures.fetch_add(1, Ordering::Relaxed);
+        sqlite_log::record(
+            SQLITE_CANTOPEN,
+            &format!("acquire attempt {failed}/{attempts} failed: {error}"),
+        );
+        match CANTOPEN_RETRY_DELAYS.get(failed - 1) {
+            Some(delay) => tokio::time::sleep(*delay).await,
+            None => return Err(error.into()),
+        }
+    }
+}
+
+fn record_recovery(failed: usize, stats: &OpenStats) {
+    if failed == 0 {
+        return;
+    }
+    stats.recovered_by_retry.fetch_add(1, Ordering::Relaxed);
+    sqlite_log::record(
+        SQLITE_CANTOPEN,
+        &format!("acquire recovered after {failed} failed attempts"),
+    );
+}
+
+fn is_cantopen(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(e)
+        if e.code().is_some_and(|code| code.parse() == Ok(SQLITE_CANTOPEN)))
+}
 
 #[cfg_attr(feature = "flutter", frb(dart_metadata = ("freezed")))]
 #[derive(Clone)]
@@ -142,13 +240,8 @@ impl Coin {
         } else {
             None
         };
-        let pool = try_open(&db_filepath, &key_pragma, hint_coin).await?;
-        {
-            let mut pools = POOLS.lock().unwrap();
-            pools.insert(db_filepath.clone(), pool.clone());
-        }
-
-        let mut connection = pool.acquire().await?;
+        let pool = open_pool(&db_filepath, &key_pragma, hint_coin).await?;
+        let mut connection = acquire_with_retry(&pool, &DB_STATS).await?;
 
         let mut default_coin = self.coin;
         if default_coin == 2 && self.db_filepath.to_lowercase().contains("zsa") {
@@ -191,14 +284,14 @@ impl Coin {
 
     pub(crate) fn get_pool(&self) -> Result<SqlitePool> {
         let pools = POOLS.lock().unwrap();
-        let pool = pools.get(&self.db_filepath).expect("Database not opened");
-        Ok(pool.clone())
+        let entry = pools.get(&self.db_filepath).expect("Database not opened");
+        Ok(entry.pool.clone())
     }
 
     pub(crate) async fn get_connection(&self) -> Result<PoolConnection<Sqlite>> {
         let pool = self.get_pool()?;
         let start = std::time::Instant::now();
-        let result = pool.acquire().await.anyhow();
+        let result = acquire_with_retry(&pool, &DB_STATS).await;
         let elapsed = start.elapsed();
         if elapsed > std::time::Duration::from_secs(2) {
             tracing::warn!(
@@ -325,21 +418,106 @@ fn lightwalletd_endpoint(url: &str, ping_interval: Duration) -> Result<Endpoint>
     Ok(endpoint)
 }
 
+/// `min_connections` stays 0: with 1 the reaper reopens the last idle connection on its own,
+/// outside any retry and uncounted.
+fn pool_options(stats: &'static OpenStats) -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(5)
+        .idle_timeout(POOL_IDLE_TIMEOUT)
+        .max_lifetime(None)
+        .after_connect(move |_, _| {
+            Box::pin(async move {
+                stats.opens.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        })
+}
+
+#[cfg(unix)]
+type FileId = (u64, u64);
+#[cfg(not(unix))]
+type FileId = std::time::SystemTime;
+
+fn file_id(path: &str) -> Option<FileId> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.created().ok()
+    }
+}
+
+fn key_digest(key_pragma: &Option<String>) -> [u8; 32] {
+    Sha256::digest(key_pragma.as_deref().unwrap_or("").as_bytes()).into()
+}
+
+struct OpenPool {
+    pool: SqlitePool,
+    key_digest: [u8; 32],
+    file_id: Option<FileId>,
+    /// Lets tests tell whether an open reused the pool or built a new one.
+    #[cfg(test)]
+    id: u64,
+}
+
+impl OpenPool {
+    /// Never serves a pool bound to a deleted or replaced file, or opened with another key.
+    fn serves(&self, key_digest: &[u8; 32], db_filepath: &str) -> bool {
+        !self.pool.is_closed()
+            && self.key_digest == *key_digest
+            && self.file_id.is_some()
+            && file_id(db_filepath) == self.file_id
+    }
+}
+
+static OPEN_LOCK: Mutex<()> = Mutex::const_new(());
+#[cfg(test)]
+static POOL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Serialised, so parallel opens of one file share a pool instead of each building its own.
+async fn open_pool(
+    db_filepath: &str,
+    key_pragma: &Option<String>,
+    hint_coin: Option<u8>,
+) -> Result<SqlitePool> {
+    let _open = OPEN_LOCK.lock().await;
+    let key_digest = key_digest(key_pragma);
+    if let Some(pool) = reusable_pool(db_filepath, &key_digest) {
+        return Ok(pool);
+    }
+    let pool = try_open(db_filepath, key_pragma, hint_coin).await?;
+    let entry = OpenPool {
+        pool: pool.clone(),
+        key_digest,
+        file_id: file_id(db_filepath),
+        #[cfg(test)]
+        id: POOL_SEQ.fetch_add(1, Ordering::Relaxed),
+    };
+    POOLS.lock().unwrap().insert(db_filepath.to_string(), entry);
+    Ok(pool)
+}
+
+fn reusable_pool(db_filepath: &str, key_digest: &[u8; 32]) -> Option<SqlitePool> {
+    let pools = POOLS.lock().unwrap();
+    let entry = pools.get(db_filepath)?;
+    entry
+        .serves(key_digest, db_filepath)
+        .then(|| entry.pool.clone())
+}
+
 async fn try_open(
     db_filepath: &str,
     key_pragma: &Option<String>,
     hint_coin: Option<u8>,
 ) -> Result<SqlitePool> {
-    // Create a connection pool
     let options = get_connect_options(db_filepath, key_pragma);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .idle_timeout(std::time::Duration::from_secs(30))
-        .max_lifetime(std::time::Duration::from_secs(60 * 60))
-        .connect_with(options)
-        .await?;
+    let pool = pool_options(&DB_STATS).connect_lazy_with(options);
 
-    let mut connection = pool.acquire().await?;
+    let mut connection = acquire_with_retry(&pool, &DB_STATS).await?;
     create_schema(&mut connection).await?;
     if sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='props'")
         .fetch_optional(&mut *connection)
@@ -632,7 +810,7 @@ pub async fn get_tor_client() -> &'static Mutex<TorClient<PreferredRuntime>> {
 
 pub static TOR: OnceCell<Mutex<TorClient<PreferredRuntime>>> = OnceCell::const_new();
 pub static DATADIR: OnceLock<String> = OnceLock::new();
-pub static POOLS: LazyLock<std::sync::Mutex<HashMap<String, SqlitePool>>> =
+static POOLS: LazyLock<std::sync::Mutex<HashMap<String, OpenPool>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 pub fn close_pool(db_filepath: &str) {
@@ -644,6 +822,7 @@ pub fn close_pool(db_filepath: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqliteJournalMode;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -831,5 +1010,212 @@ mod tests {
             0,
             "the mempool channel must not have pinged yet"
         );
+    }
+
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rlz-pool-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn unique_db_path(tag: &str) -> String {
+        format!("{}.sqlite3", unique_temp_path(tag).display())
+    }
+
+    fn pool_id(path: &str) -> Option<u64> {
+        POOLS.lock().unwrap().get(path).map(|entry| entry.id)
+    }
+
+    async fn open_with_key(path: &str, key: u8) -> Result<Coin> {
+        Coin::new(None)
+            .open_database_with_key(path.to_string(), Some(vec![key; 32]))
+            .await
+    }
+
+    fn lazy_pool(path: &str, stats: &'static OpenStats) -> SqlitePool {
+        pool_options(stats).connect_lazy_with(get_connect_options(path, &None))
+    }
+
+    fn database_code(error: &anyhow::Error) -> Option<String> {
+        match error.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::Database(e)) => e.code().map(|code| code.into_owned()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn open_with_key_pragma_same_path_and_key_reuses_the_pool() {
+        let path = unique_db_path("reuse");
+        open_with_key(&path, 1).await.expect("first open");
+        let first = pool_id(&path);
+
+        open_with_key(&path, 1).await.expect("second open");
+
+        assert!(first.is_some());
+        assert_eq!(first, pool_id(&path));
+    }
+
+    #[tokio::test]
+    async fn open_with_key_pragma_different_key_does_not_reuse_the_pool() {
+        let path = unique_db_path("rekey");
+        open_with_key(&path, 1)
+            .await
+            .expect("open with the first key");
+        let stored = pool_id(&path);
+
+        let Err(error) = open_with_key(&path, 2).await else {
+            panic!("another key must not be served the open pool")
+        };
+
+        assert_eq!(Some("26".to_string()), database_code(&error), "{error:#}");
+        assert_eq!(stored, pool_id(&path));
+
+        // Same file, no content yet: the other key opens it, so only the key check can refuse.
+        std::fs::File::create(&path).expect("truncate the database file");
+        open_with_key(&path, 2)
+            .await
+            .expect("an empty database opens with any key");
+        assert_ne!(stored, pool_id(&path));
+    }
+
+    // Windows cannot delete a database a pool holds open, and its FileId is the creation time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_with_key_pragma_file_deleted_and_recreated_builds_a_new_pool() {
+        let path = unique_db_path("recreate");
+        let coin = open_with_key(&path, 1).await.expect("first open");
+        put_prop(
+            &mut *coin.get_connection().await.expect("connection"),
+            "marker",
+            "old",
+        )
+        .await
+        .expect("write the marker");
+        let first = pool_id(&path);
+
+        std::fs::remove_file(&path).expect("delete the database file");
+        std::fs::File::create(&path).expect("recreate the database file");
+        let coin = open_with_key(&path, 1).await.expect("reopen");
+
+        assert_ne!(first, pool_id(&path));
+        let marker = crate::db::get_prop(
+            &mut *coin.get_connection().await.expect("connection"),
+            "marker",
+        )
+        .await
+        .expect("read the marker");
+        assert_eq!(None, marker, "the new pool must read the new file");
+    }
+
+    #[tokio::test]
+    async fn open_with_key_pragma_after_close_pool_builds_a_new_pool() {
+        let path = unique_db_path("close");
+        open_with_key(&path, 1).await.expect("first open");
+        let first = pool_id(&path);
+
+        close_pool(&path);
+        open_with_key(&path, 1).await.expect("reopen");
+
+        assert!(first.is_some());
+        assert_ne!(first, pool_id(&path));
+    }
+
+    #[tokio::test]
+    async fn open_with_key_pragma_parallel_opens_share_one_pool() {
+        let path = unique_db_path("parallel");
+
+        let ids: std::collections::HashSet<_> = futures::future::join_all((0..5).map(|_| async {
+            open_with_key(&path, 1).await.expect("open");
+            pool_id(&path)
+        }))
+        .await
+        .into_iter()
+        .collect();
+
+        assert_eq!(1, ids.len(), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn acquire_with_retry_cantopen_then_directory_appears_recovers() {
+        static STATS: OpenStats = OpenStats::new();
+        let directory = unique_temp_path("late-dir");
+        let path = directory.join("wallet.sqlite3");
+        let pool = lazy_pool(&path.to_string_lossy(), &STATS);
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            std::fs::create_dir_all(&directory)
+        });
+
+        let connection = acquire_with_retry(&pool, &STATS).await;
+
+        creator.await.expect("join").expect("create the directory");
+        assert!(connection.is_ok(), "{:#}", connection.err().expect("error"));
+        assert_eq!(1, STATS.recovered_by_retry.load(Ordering::Relaxed));
+        assert!(STATS.cantopen_failures.load(Ordering::Relaxed) >= 1);
+        let log = sqlite_log::snapshot();
+        assert!(
+            log.iter().any(|e| e.contains("acquire attempt 1/4 failed")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|e| e.contains("acquire recovered after")),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_with_retry_cantopen_persists_returns_error_after_four_attempts() {
+        static STATS: OpenStats = OpenStats::new();
+        let path = unique_temp_path("missing-dir").join("wallet.sqlite3");
+        let pool = lazy_pool(&path.to_string_lossy(), &STATS);
+
+        let error = acquire_with_retry(&pool, &STATS)
+            .await
+            .expect_err("a missing directory never opens");
+
+        assert_eq!(Some("14".to_string()), database_code(&error), "{error:#}");
+        assert_eq!(4, STATS.cantopen_failures.load(Ordering::Relaxed));
+        assert_eq!(0, STATS.recovered_by_retry.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn acquire_with_retry_non_cantopen_error_is_not_retried() {
+        static STATS: OpenStats = OpenStats::new();
+        let path = unique_db_path("not-a-database");
+        std::fs::write(&path, [0x5a; 4096]).expect("write a non-database file");
+        // Plain connect pragmas never read a page; this one does, so the open itself fails.
+        let options = get_connect_options(&path, &None).journal_mode(SqliteJournalMode::Delete);
+        let pool = pool_options(&STATS).connect_lazy_with(options);
+
+        let error = acquire_with_retry(&pool, &STATS)
+            .await
+            .expect_err("a non-database file never opens");
+
+        assert_eq!(Some("26".to_string()), database_code(&error), "{error:#}");
+        assert_eq!(0, STATS.cantopen_failures.load(Ordering::Relaxed));
+        assert_eq!(0, STATS.recovered_by_retry.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn pool_options_idle_pool_never_reconnects_in_background() {
+        static STATS: OpenStats = OpenStats::new();
+        let path = unique_db_path("idle");
+        let pool = pool_options(&STATS)
+            .idle_timeout(Duration::from_millis(100))
+            .connect_lazy_with(get_connect_options(&path, &None));
+        drop(pool.acquire().await.expect("acquire"));
+        assert_eq!(1, STATS.opens.load(Ordering::Relaxed));
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert_eq!(0, pool.size());
+        assert_eq!(1, STATS.opens.load(Ordering::Relaxed));
     }
 }

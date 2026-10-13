@@ -9,7 +9,8 @@ public class ZcashException(
     /** A best-effort guess from the native message. Order matters: "connect timed out" is a timeout. */
     public val category: FailureCategory
         get() {
-            val detail = message.orEmpty().lowercase()
+            // SQLite's appended log is diagnostics, not the failure: its wording must not reclassify it.
+            val detail = message.orEmpty().substringBefore(SQLITE_LOG_MARKER).lowercase()
             fun mentions(vararg markers: String) = markers.any { it in detail }
             return when {
                 mentions("tls", "handshake") -> FailureCategory.TLS
@@ -21,6 +22,9 @@ public class ZcashException(
             }
         }
 }
+
+/** Starts the tail the native side appends to a database error. */
+private const val SQLITE_LOG_MARKER = " [sqlite: "
 
 /** The step of a sync pass that failed. */
 public enum class SyncStage { TARGET, SCAN, ACCOUNT_HEIGHT }

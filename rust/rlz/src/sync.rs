@@ -9,7 +9,7 @@ use tracing::debug;
 use zcash_transparent::address::TransparentAddress;
 
 use crate::api::account::get_ledger;
-use crate::api::coin::{Coin, Network};
+use crate::api::coin::{acquire_with_retry, Coin, Network, DB_STATS};
 use crate::api::sync::{CANCEL_SYNC, SYNCING};
 use crate::budget::merge_pending_txs;
 
@@ -980,12 +980,12 @@ pub async fn shielded_sync(
     debug!("got streaming blocks");
     let (tx_messages, rx_messages) = channel::<WarpSyncMessage>(100);
 
-    let mut connection = pool.acquire().await?;
+    let mut connection = acquire_with_retry(pool, &DB_STATS).await?;
     // get the list of transaction heights for which the time is 0
     // because raw transactions do not have timestamp (it comes from the block header)
     let heights_without_time = get_heights_without_time(&mut connection, start, end).await?;
 
-    let mut writer_connection = pool.acquire().await?;
+    let mut writer_connection = acquire_with_retry(pool, &DB_STATS).await?;
     // Key derivations happen once upfront — no per-note DB queries in the hot path.
     let key_cache = preload_account_key_cache(&mut writer_connection).await?;
     let network = *network;

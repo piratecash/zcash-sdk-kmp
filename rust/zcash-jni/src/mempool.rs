@@ -7,6 +7,7 @@ use crate::dto::MempoolEventDto;
 use crate::runtime;
 use rlz::api::coin::Coin;
 use rlz::api::mempool::{observe_mempool, CancellationToken, MempoolMsg};
+use rlz::api::sqlite_log::describe;
 use rlz::Sink;
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -57,7 +58,7 @@ impl Drop for Verdict {
 
 fn ended(error: Option<anyhow::Error>) -> MempoolEventDto {
     MempoolEventDto::Ended {
-        error: error.map(|e| format!("{e:#}")),
+        error: error.map(|e| describe(&e)),
     }
 }
 
@@ -185,6 +186,22 @@ mod tests {
             },
             events.try_recv().expect("queued event")
         );
+    }
+
+    #[test]
+    fn ended_database_error_carries_sqlite_tail() {
+        let error = crate::sqlite_log::cantopen_error();
+        rlz::api::sqlite_log::record(14, "mempool-marker");
+
+        let MempoolEventDto::Ended {
+            error: Some(message),
+        } = ended(Some(error))
+        else {
+            panic!("expected a failed end")
+        };
+
+        assert!(message.contains(" [sqlite: "), "{message}");
+        assert!(message.contains("mempool-marker"), "{message}");
     }
 
     #[test]

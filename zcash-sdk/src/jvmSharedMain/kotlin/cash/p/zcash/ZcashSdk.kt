@@ -37,6 +37,15 @@ public object ZcashSdk {
             initialized = true
         }
     }
+
+    /**
+     * Process-wide counters of native database opens and SQLite's own recent error log, for
+     * diagnostics. An in-memory read: no database is touched.
+     */
+    public fun databaseStats(): DatabaseStats {
+        NativeLibrary.ensureLoadedBlocking()
+        return mapNativeError { parseDatabaseStats(ZcashJni.databaseStats()) }
+    }
 }
 
 /**

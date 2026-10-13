@@ -416,6 +416,32 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun databaseStats_afterOpeningWallet_countsAtLeastOneOpen() = withTempDir { directory ->
+        val before = ZcashSdk.databaseStats().opens
+
+        openWallet(directory.resolve("wallet.db").absolutePathString()).close()
+
+        assertTrue(ZcashSdk.databaseStats().opens > before)
+    }
+
+    @Test
+    fun open_inMissingDirectory_messageCarriesSqliteLogWithoutPath() = withTempDir { directory ->
+        val dbPath = directory.resolve("missing").resolve("wallet_7.sqlite3").absolutePathString()
+
+        val failure = assertFailsWith<ZcashException> { openWallet(dbPath) }
+
+        val message = failure.message.orEmpty()
+        assertEquals(FailureCategory.DATABASE, failure.category, message)
+        assertTrue(message.contains("[sqlite: "), message)
+        // SQLite's own os-layer entry, which only the installed log callback records: unix `open(`,
+        // Windows `winOpen(`.
+        assertTrue(message.contains("open(", ignoreCase = true), message)
+        assertFalse(message.contains(directory.absolutePathString()), message)
+        assertFalse(message.contains(directory.fileName.toString()), message)
+        assertFalse(message.contains("wallet_7"), message)
+    }
+
+    @Test
     fun deleteAccount_afterRestore_leavesNoAccounts() = withWallet { wallet ->
         val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
 

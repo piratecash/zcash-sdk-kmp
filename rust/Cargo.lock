@@ -14253,10 +14253,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "jni",
+ "libsqlite3-sys",
  "rlz",
  "rustls 0.23.43",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio 1.53.1",
  "zeroize",
 ]

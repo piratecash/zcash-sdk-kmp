@@ -110,6 +110,39 @@ class DtoTest {
     }
 
     @Test
+    fun parseDatabaseStats_fullPayload_mapsEveryField() {
+        val stats = parseDatabaseStats(
+            """
+            {"opens":5,"nativeCantopen":4,"cantopenFailures":3,"recoveredByRetry":2,
+             "lastError":"14: open(*.sqlite3) - No such file",
+             "recent":["14: cannot open file at line 1 of <sql>","14: open(*.sqlite3) - No such file"]}
+            """
+        )
+
+        assertEquals(
+            DatabaseStats(
+                opens = 5L,
+                nativeCantOpen = 4L,
+                cantOpenFailures = 3L,
+                recoveredByRetry = 2L,
+                lastError = "14: open(*.sqlite3) - No such file",
+                recent = listOf("14: cannot open file at line 1 of <sql>", "14: open(*.sqlite3) - No such file"),
+            ),
+            stats,
+        )
+    }
+
+    @Test
+    fun parseDatabaseStats_noErrorYet_lastErrorIsNull() {
+        val stats = parseDatabaseStats(
+            """{"opens":1,"nativeCantopen":0,"cantopenFailures":0,"recoveredByRetry":0,"lastError":null,"recent":[]}"""
+        )
+
+        assertNull(stats.lastError)
+        assertEquals(emptyList<String>(), stats.recent)
+    }
+
+    @Test
     fun toPoolBalance_shortNativeArray_missingPoolsAreZero() {
         val balance = longArrayOf(1L, 2L).toPoolBalance()
 

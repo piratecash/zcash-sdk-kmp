@@ -48,6 +48,15 @@ class ZcashExceptionTest {
     }
 
     @Test
+    fun category_databaseErrorWithSqliteTailMentioningTimeout_isDatabase() {
+        assertCategory(
+            FailureCategory.DATABASE,
+            "error returned from database: (code: 14) unable to open database file " +
+                "[sqlite: 14: os_unix.c:44000: (110) open(*.sqlite3) - Connection timed out]",
+        )
+    }
+
+    @Test
     fun category_unrecognisedMessage_isOther() {
         assertCategory(FailureCategory.OTHER, "Invalid Key", "Sync ended at block 1 before target 2")
     }

@@ -1,5 +1,7 @@
 package cash.p.zcash
 
+import kotlinx.serialization.Serializable
+
 /**
  * One pool's unspent value in zatoshi, split by whether it can be spent yet.
  *
@@ -312,3 +314,33 @@ public data class MempoolNote(
     val pool: Pool,
     val memo: String?,
 )
+
+/**
+ * Process-wide diagnostics of the SDK's native database opens. [cantOpenFailures] and
+ * [recoveredByRetry] count acquire attempts; [nativeCantOpen] counts SQLite's own reports (one
+ * failure can emit two), so compare it by growth. [recent] is SQLite's log, paths and SQL removed.
+ */
+public data class DatabaseStats(
+    public val opens: Long,
+    public val nativeCantOpen: Long,
+    public val cantOpenFailures: Long,
+    public val recoveredByRetry: Long,
+    public val lastError: String?,
+    public val recent: List<String>,
+)
+
+@Serializable
+internal data class DatabaseStatsDto(
+    val opens: Long,
+    val nativeCantopen: Long,
+    val cantopenFailures: Long,
+    val recoveredByRetry: Long,
+    val lastError: String? = null,
+    val recent: List<String> = emptyList(),
+) {
+    fun toDatabaseStats(): DatabaseStats =
+        DatabaseStats(opens, nativeCantopen, cantopenFailures, recoveredByRetry, lastError, recent)
+}
+
+internal fun parseDatabaseStats(json: String): DatabaseStats =
+    nativeJson.decodeFromString<DatabaseStatsDto>(json).toDatabaseStats()
