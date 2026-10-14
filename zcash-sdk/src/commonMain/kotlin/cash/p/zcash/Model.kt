@@ -327,6 +327,16 @@ public data class DatabaseStats(
     public val recoveredByRetry: Long,
     public val lastError: String?,
     public val recent: List<String>,
+    public val pools: List<DatabasePool> = emptyList(),
+    public val lastSeq: Long = 0,
+)
+
+/** One connection pool's current footprint, as the native side samples it. */
+public data class DatabasePool(
+    public val id: Long,
+    public val path: String,
+    public val size: Int,
+    public val idle: Int,
 )
 
 @Serializable
@@ -337,9 +347,30 @@ internal data class DatabaseStatsDto(
     val recoveredByRetry: Long,
     val lastError: String? = null,
     val recent: List<String> = emptyList(),
+    val lastSeq: Long = 0,
+    val pools: List<DatabasePoolDto> = emptyList(),
 ) {
     fun toDatabaseStats(): DatabaseStats =
-        DatabaseStats(opens, nativeCantopen, cantopenFailures, recoveredByRetry, lastError, recent)
+        DatabaseStats(
+            opens,
+            nativeCantopen,
+            cantopenFailures,
+            recoveredByRetry,
+            lastError,
+            recent,
+            pools.map { it.toDatabasePool() },
+            lastSeq,
+        )
+}
+
+@Serializable
+internal data class DatabasePoolDto(
+    val id: Long,
+    val path: String,
+    val size: Int,
+    val idle: Int,
+) {
+    fun toDatabasePool(): DatabasePool = DatabasePool(id, path, size, idle)
 }
 
 internal fun parseDatabaseStats(json: String): DatabaseStats =

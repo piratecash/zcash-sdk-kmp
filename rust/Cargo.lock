@@ -14252,6 +14252,7 @@ name = "zcash-jni"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "errno",
  "jni",
  "libsqlite3-sys",
  "rlz",

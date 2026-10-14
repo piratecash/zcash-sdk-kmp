@@ -427,6 +427,17 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun databaseStats_afterOpeningWallet_listsItsPoolAndNonNegativeLastSeq() = withTempDir { directory ->
+        val path = directory.resolve("wallet.db").absolutePathString()
+
+        openWallet(path).close()
+
+        val stats = ZcashSdk.databaseStats()
+        assertTrue(stats.pools.any { it.path == path }, stats.pools.toString())
+        assertTrue(stats.lastSeq >= 0L)
+    }
+
+    @Test
     fun open_inMissingDirectory_messageCarriesSqliteLogWithoutPath() = withTempDir { directory ->
         val dbPath = directory.resolve("missing").resolve("wallet_7.sqlite3").absolutePathString()
 

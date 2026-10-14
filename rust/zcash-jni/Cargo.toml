@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 rlz = { path = "../rlz", default-features = false }
 anyhow = "1.0.97"
+errno = "0.3"
 jni = "0.22"
 # No features of its own: Cargo unifies it with rlz's bundled SQLCipher, the one linked SQLite.
 libsqlite3-sys = "0.30"

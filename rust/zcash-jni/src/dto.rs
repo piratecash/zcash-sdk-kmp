@@ -5,7 +5,7 @@
 //! the native side at all.
 
 use rlz::api::account::{Account, Addresses, Receivers, Tx};
-use rlz::api::coin::DatabaseStats;
+use rlz::api::coin::{DatabaseStats, PoolStats};
 use rlz::api::mempool::{MempoolAmount, MempoolMsg, MempoolNote};
 use rlz::api::migrate::{MigrationEvent, MigrationStatus};
 use rlz::api::network::ServerProbe;
@@ -237,6 +237,28 @@ pub struct DatabaseStatsDto {
     pub recovered_by_retry: u64,
     pub last_error: Option<String>,
     pub recent: Vec<String>,
+    pub last_seq: u64,
+    pub pools: Vec<PoolStatsDto>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolStatsDto {
+    pub id: u64,
+    pub path: String,
+    pub size: u32,
+    pub idle: usize,
+}
+
+impl From<PoolStats> for PoolStatsDto {
+    fn from(stats: PoolStats) -> Self {
+        PoolStatsDto {
+            id: stats.id,
+            path: stats.path,
+            size: stats.size,
+            idle: stats.idle,
+        }
+    }
 }
 
 impl From<DatabaseStats> for DatabaseStatsDto {
@@ -248,6 +270,8 @@ impl From<DatabaseStats> for DatabaseStatsDto {
             recovered_by_retry: stats.recovered_by_retry,
             last_error: stats.last_error,
             recent: stats.recent,
+            last_seq: stats.last_seq,
+            pools: stats.pools.into_iter().map(PoolStatsDto::from).collect(),
         }
     }
 }
@@ -514,6 +538,13 @@ mod tests {
             recovered_by_retry: 2,
             last_error: Some("14: open(*.sqlite3) - No such file".to_string()),
             recent: vec!["14: open(*.sqlite3) - No such file".to_string()],
+            last_seq: 9,
+            pools: vec![PoolStats {
+                id: 7,
+                path: "/data/wallet_1.sqlite3".to_string(),
+                size: 2,
+                idle: 1,
+            }],
         });
 
         assert_eq!(
@@ -524,6 +555,8 @@ mod tests {
                 "recoveredByRetry": 2,
                 "lastError": "14: open(*.sqlite3) - No such file",
                 "recent": ["14: open(*.sqlite3) - No such file"],
+                "lastSeq": 9,
+                "pools": [{ "id": 7, "path": "/data/wallet_1.sqlite3", "size": 2, "idle": 1 }],
             }),
             serde_json::to_value(&dto).unwrap()
         );

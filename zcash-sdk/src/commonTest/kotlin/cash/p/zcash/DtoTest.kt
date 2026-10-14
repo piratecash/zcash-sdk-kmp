@@ -143,6 +143,33 @@ class DtoTest {
     }
 
     @Test
+    fun parseDatabaseStats_withLastSeqAndPools_mapsThem() {
+        val stats = parseDatabaseStats(
+            """
+            {"opens":5,"nativeCantopen":4,"cantopenFailures":3,"recoveredByRetry":2,
+             "lastError":null,"recent":[],"lastSeq":9,
+             "pools":[{"id":7,"path":"/data/wallet_1.sqlite3","size":2,"idle":1}]}
+            """
+        )
+
+        assertEquals(9L, stats.lastSeq)
+        assertEquals(
+            listOf(DatabasePool(id = 7L, path = "/data/wallet_1.sqlite3", size = 2, idle = 1)),
+            stats.pools,
+        )
+    }
+
+    @Test
+    fun parseDatabaseStats_withoutLastSeqAndPools_defaultsToZeroAndEmpty() {
+        val stats = parseDatabaseStats(
+            """{"opens":1,"nativeCantopen":0,"cantopenFailures":0,"recoveredByRetry":0,"lastError":null,"recent":[]}"""
+        )
+
+        assertEquals(0L, stats.lastSeq)
+        assertEquals(emptyList(), stats.pools)
+    }
+
+    @Test
     fun toPoolBalance_shortNativeArray_missingPoolsAreZero() {
         val balance = longArrayOf(1L, 2L).toPoolBalance()
 

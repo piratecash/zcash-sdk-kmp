@@ -18,6 +18,7 @@ pub mod plugin;
 pub mod raptor;
 pub mod sapling;
 pub mod sqlite_log;
+pub(crate) mod sqlite_probe;
 pub mod sweep;
 pub mod sync;
 pub mod transaction;

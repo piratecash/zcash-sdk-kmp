@@ -4,14 +4,21 @@
 //! each message is sanitized before it is stored.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-const CAPACITY: usize = 16;
+use crate::api::sqlite_probe;
+
+const CAPACITY: usize = 64;
+const SQLITE_ERROR: i32 = 1;
 pub(crate) const SQLITE_CANTOPEN: i32 = 14;
-const SQLITE_NOTICE: i32 = 27;
+pub(crate) const SQLITE_NOTICE: i32 = 27;
 const SQLITE_WARNING: i32 = 28;
+const SQLITE_WARNING_AUTOINDEX: i32 = SQLITE_WARNING | (1 << 8);
+/// Every idempotent `ADD COLUMN` migration logs it on each open.
+const DUPLICATE_COLUMN: &str = "duplicate column name: ";
 /// Text of `sqlite3CantopenError`, which every `SQLITE_CANTOPEN_BKPT` goes through.
 const CANTOPEN_BREAKPOINT: &str = "cannot open file at line";
 const DESCRIBE_WINDOW: Duration = Duration::from_secs(10);
@@ -27,6 +34,8 @@ const OS_ERROR_DELIMITER: &str = ") - ";
 /// Ends a path SQLite quotes, as in `attempt to open "%s" as file descriptor %d`; the last quote,
 /// since a directory name may hold one.
 const QUOTE: &str = "\"";
+/// Starts the path in the os-layer line of a failed `open`.
+const OS_OPEN: &str = ") open(";
 const MIN_HEX_RUN: usize = 16;
 
 static RING: Mutex<LogRing> = Mutex::new(LogRing::new());
@@ -46,12 +55,14 @@ impl Entry {
 
 struct LogRing {
     entries: VecDeque<Entry>,
+    pushed: u64,
 }
 
 impl LogRing {
     const fn new() -> Self {
         LogRing {
             entries: VecDeque::new(),
+            pushed: 0,
         }
     }
 
@@ -60,6 +71,7 @@ impl LogRing {
             self.entries.pop_front();
         }
         self.entries.push_back(Entry { at, code, text });
+        self.pushed += 1;
     }
 
     fn recent(&self, now: Instant, window: Duration) -> Vec<String> {
@@ -72,6 +84,10 @@ impl LogRing {
 
     fn snapshot(&self) -> Vec<String> {
         self.entries.iter().map(Entry::render).collect()
+    }
+
+    fn snapshot_with_seq(&self) -> (Vec<String>, u64) {
+        (self.snapshot(), self.pushed)
     }
 
     fn last_error(&self) -> Option<String> {
@@ -90,11 +106,32 @@ fn ring() -> MutexGuard<'static, LogRing> {
 
 /// The single entry point, called from SQLite's log callback on any thread.
 pub fn record(code: i32, message: &str) {
+    if is_noise(code, message) {
+        return;
+    }
     if code & 0xff == SQLITE_CANTOPEN && message.starts_with(CANTOPEN_BREAKPOINT) {
         NATIVE_CANTOPEN.fetch_add(1, Ordering::Relaxed);
     }
     let text = sanitize(message);
     ring().push(Instant::now(), code, text);
+    if let Some(path) = failed_open_path(code, message) {
+        sqlite_probe::after_failed_open(path);
+    }
+}
+
+/// The path of SQLite's os-layer `(<errno>) open(<path>) - <text>` line for a code-14 failure.
+fn failed_open_path(code: i32, message: &str) -> Option<&Path> {
+    if code & 0xff != SQLITE_CANTOPEN {
+        return None;
+    }
+    let start = message.find(OS_OPEN)? + OS_OPEN.len();
+    let len = message[start..].rfind(OS_ERROR_DELIMITER)?;
+    Some(Path::new(&message[start..start + len]))
+}
+
+fn is_noise(code: i32, message: &str) -> bool {
+    code == SQLITE_WARNING_AUTOINDEX
+        || (code & 0xff == SQLITE_ERROR && message.starts_with(DUPLICATE_COLUMN))
 }
 
 /// `SQLITE_CANTOPEN_BKPT` emissions, not distinct failures: an `lstat` failure emits twice.
@@ -108,7 +145,12 @@ pub fn recent(window: Duration) -> Vec<String> {
 }
 
 pub fn snapshot() -> Vec<String> {
-    ring().snapshot()
+    snapshot_with_seq().0
+}
+
+/// The ring and the number of entries ever pushed, read together: the last entry is number `seq`.
+pub fn snapshot_with_seq() -> (Vec<String>, u64) {
+    ring().snapshot_with_seq()
 }
 
 /// The latest entry that is neither `SQLITE_NOTICE` nor `SQLITE_WARNING`.
@@ -457,6 +499,52 @@ mod tests {
         assert_eq!(format!("14: entry {CAPACITY}"), snapshot[CAPACITY - 1]);
     }
 
+    #[test]
+    fn log_ring_snapshot_with_seq_after_eviction_last_entry_is_number_seq() {
+        let now = Instant::now();
+        let mut ring = LogRing::new();
+        for i in 1..=70 {
+            ring.push(now, 14, format!("entry {i}"));
+        }
+
+        let (entries, seq) = ring.snapshot_with_seq();
+
+        assert_eq!(70, seq);
+        assert_eq!(64, entries.len());
+        assert_eq!("14: entry 7", entries[0]);
+        assert_eq!("14: entry 70", entries[63]);
+    }
+
+    #[test]
+    fn record_noise_is_not_recorded_but_similar_entries_are() {
+        record(284, "noise-autoindex-marker automatic index on t(c)");
+        record(1, "duplicate column name: noise-duplicate-marker");
+        record(28, "kept-warning-marker automatic index on t(c)");
+        record(1, "kept-error-marker duplicate column name: c");
+
+        let log = snapshot();
+
+        for marker in ["noise-autoindex-marker", "noise-duplicate-marker"] {
+            assert!(!log.iter().any(|e| e.contains(marker)), "{log:?}");
+        }
+        for marker in ["kept-warning-marker", "kept-error-marker"] {
+            assert!(log.iter().any(|e| e.contains(marker)), "{log:?}");
+        }
+    }
+
+    #[test]
+    fn record_noise_does_not_advance_seq() {
+        // Other tests push to the shared ring concurrently; one undisturbed round proves it.
+        let unchanged = (0..50).any(|_| {
+            let (_, before) = snapshot_with_seq();
+            record(284, "noise-seq-marker automatic index on t(c)");
+            record(1, "duplicate column name: noise-seq-marker");
+            snapshot_with_seq().1 == before
+        });
+
+        assert!(unchanged);
+    }
+
     #[tokio::test]
     async fn describe_database_error_appends_recent_sqlite_log() {
         let error = database_error().await;
@@ -495,6 +583,49 @@ mod tests {
         record(14, "cannot open file at line 44000 of [abcdef0123]");
 
         assert_eq!(before + 1, native_cantopen());
+    }
+
+    #[test]
+    fn record_os_layer_open_cantopen_probes_once_other_messages_do_not() {
+        use crate::api::sqlite_probe::{throttled, unique_dir, OPEN_THREAD};
+        let _serial = COUNTER_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let counted = native_cantopen();
+        // The path ends at the last delimiter, even when a directory name holds one.
+        let failed = unique_dir("trigger) - dir").join("wallet.sqlite3");
+        let lstat = unique_dir("trigger-lstat");
+        let other_code = unique_dir("trigger-code").join("wallet.sqlite3");
+
+        record(
+            14,
+            &format!(
+                "os_unix.c:44576: (2) open({}) - trigger-marker",
+                failed.display()
+            ),
+        );
+        record(
+            14,
+            &format!("os_unix.c:1: (2) lstat({}) - x", lstat.display()),
+        );
+        record(
+            1,
+            &format!("os_unix.c:1: (2) open({}) - x", other_code.display()),
+        );
+
+        assert!(throttled(OPEN_THREAD, &failed));
+        assert!(!throttled(OPEN_THREAD, &lstat));
+        assert!(!throttled(OPEN_THREAD, &other_code));
+        let log = snapshot();
+        let trigger = log
+            .iter()
+            .rposition(|e| e.ends_with(") - trigger-marker"))
+            .expect("the trigger entry");
+        assert!(
+            log[trigger + 1..]
+                .iter()
+                .any(|e| e.starts_with("27: probe site=open-thread ")),
+            "{log:?}"
+        );
+        assert_eq!(counted, native_cantopen());
     }
 
     #[test]

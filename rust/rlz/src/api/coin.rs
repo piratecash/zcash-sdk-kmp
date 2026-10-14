@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
@@ -21,6 +22,7 @@ use zcash_protocol::consensus::{BlockHeight, OrchardMode};
 use zcash_protocol::local_consensus::LocalNetwork;
 
 use crate::api::sqlite_log::{self, SQLITE_CANTOPEN};
+use crate::api::sqlite_probe;
 use crate::db::{
     backfill_diversifier_index, create_schema, migrate_sapling_addresses, put_prop,
     scrub_spending_keys,
@@ -88,17 +90,45 @@ pub struct DatabaseStats {
     pub recovered_by_retry: u64,
     pub last_error: Option<String>,
     pub recent: Vec<String>,
+    /// Sequence number of the last entry of `recent`.
+    pub last_seq: u64,
+    pub pools: Vec<PoolStats>,
+}
+
+pub struct PoolStats {
+    pub id: u64,
+    /// The path the wallet was opened with: for the caller to map, never logged by the kit.
+    pub path: String,
+    pub size: u32,
+    pub idle: usize,
 }
 
 pub fn database_stats() -> DatabaseStats {
+    let (recent, last_seq) = sqlite_log::snapshot_with_seq();
     DatabaseStats {
         opens: DB_STATS.opens.load(Ordering::Relaxed),
         native_cantopen: sqlite_log::native_cantopen(),
         cantopen_failures: DB_STATS.cantopen_failures.load(Ordering::Relaxed),
         recovered_by_retry: DB_STATS.recovered_by_retry.load(Ordering::Relaxed),
         last_error: sqlite_log::last_error(),
-        recent: sqlite_log::snapshot(),
+        recent,
+        last_seq,
+        pools: pool_stats(),
     }
+}
+
+fn pool_stats() -> Vec<PoolStats> {
+    POOLS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(path, entry)| PoolStats {
+            id: entry.id,
+            path: path.clone(),
+            size: entry.pool.size(),
+            idle: entry.pool.num_idle(),
+        })
+        .collect()
 }
 
 /// Retries only `SQLITE_CANTOPEN`; any other error, and the last code-14 one, is returned as is.
@@ -119,10 +149,19 @@ pub(crate) async fn acquire_with_retry(
         };
         failed += 1;
         stats.cantopen_failures.fetch_add(1, Ordering::Relaxed);
+        let options = pool.connect_options();
         sqlite_log::record(
             SQLITE_CANTOPEN,
-            &format!("acquire attempt {failed}/{attempts} failed: {error}"),
+            &format!(
+                "acquire attempt {failed}/{attempts} failed pool={} size={} idle={}: {error}",
+                pool_label(options.get_filename()),
+                pool.size(),
+                pool.num_idle()
+            ),
         );
+        if failed == 1 {
+            sqlite_probe::after_failed_acquire(options.get_filename());
+        }
         match CANTOPEN_RETRY_DELAYS.get(failed - 1) {
             Some(delay) => tokio::time::sleep(*delay).await,
             None => return Err(error.into()),
@@ -483,12 +522,22 @@ struct OpenPool {
     pool: SqlitePool,
     key_digest: [u8; 32],
     file_id: Option<FileId>,
-    /// Lets tests tell whether an open reused the pool or built a new one.
-    #[cfg(test)]
+    /// Names the pool in log entries in place of its path.
     id: u64,
+    canonical: Option<PathBuf>,
 }
 
 impl OpenPool {
+    fn new(pool: SqlitePool, key_digest: [u8; 32], db_filepath: &str) -> Self {
+        OpenPool {
+            pool,
+            key_digest,
+            file_id: file_id(db_filepath),
+            id: POOL_SEQ.fetch_add(1, Ordering::Relaxed),
+            canonical: std::fs::canonicalize(db_filepath).ok(),
+        }
+    }
+
     /// Never serves a pool bound to a deleted or replaced file, or opened with another key.
     fn serves(&self, key_digest: &[u8; 32], db_filepath: &str) -> bool {
         !self.pool.is_closed()
@@ -499,7 +548,6 @@ impl OpenPool {
 }
 
 static OPEN_LOCK: Mutex<()> = Mutex::const_new(());
-#[cfg(test)]
 static POOL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Serialised, so parallel opens of one file share a pool instead of each building its own.
@@ -514,15 +562,29 @@ async fn open_pool(
         return Ok(pool);
     }
     let pool = try_open(db_filepath, key_pragma, hint_coin).await?;
-    let entry = OpenPool {
-        pool: pool.clone(),
-        key_digest,
-        file_id: file_id(db_filepath),
-        #[cfg(test)]
-        id: POOL_SEQ.fetch_add(1, Ordering::Relaxed),
-    };
+    let entry = OpenPool::new(pool.clone(), key_digest, db_filepath);
     POOLS.lock().unwrap().insert(db_filepath.to_string(), entry);
     Ok(pool)
+}
+
+/// Never blocks: SQLite's log callback reaches it.
+pub(crate) fn pool_label(path: &Path) -> String {
+    let Ok(pools) = POOLS.try_lock() else {
+        return "busy".to_string();
+    };
+    let same_file = |(key, entry): &(&String, &OpenPool)| {
+        Path::new(key.as_str()) == path || entry.canonical.as_deref() == Some(path)
+    };
+    if let Some((_, entry)) = pools.iter().find(same_file) {
+        return format!("pool{}", entry.id);
+    }
+    let same_name = |(key, _): &(&String, &OpenPool)| {
+        path.file_name().is_some() && Path::new(key.as_str()).file_name() == path.file_name()
+    };
+    match pools.iter().find(same_name) {
+        Some((_, entry)) => format!("pool{}-otherdir", entry.id),
+        None => "unregistered".to_string(),
+    }
 }
 
 fn reusable_pool(db_filepath: &str, key_digest: &[u8; 32]) -> Option<SqlitePool> {
@@ -1108,6 +1170,25 @@ mod tests {
         pool_options(stats).connect_lazy_with(get_connect_options(path, &None))
     }
 
+    /// `busy` only means another test holds the registry right now, so sample again.
+    fn settled_label(path: &Path) -> String {
+        for _ in 0..5000 {
+            let label = pool_label(path);
+            if label != "busy" {
+                return label;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the pool registry stayed locked")
+    }
+
+    fn register(path: &str, pool: &SqlitePool) -> u64 {
+        let entry = OpenPool::new(pool.clone(), key_digest(&None), path);
+        let id = entry.id;
+        POOLS.lock().unwrap().insert(path.to_string(), entry);
+        id
+    }
+
     fn database_code(error: &anyhow::Error) -> Option<String> {
         match error.downcast_ref::<sqlx::Error>() {
             Some(sqlx::Error::Database(e)) => e.code().map(|code| code.into_owned()),
@@ -1266,6 +1347,153 @@ mod tests {
         assert_eq!(Some("26".to_string()), database_code(&error), "{error:#}");
         assert_eq!(0, STATS.cantopen_failures.load(Ordering::Relaxed));
         assert_eq!(0, STATS.recovered_by_retry.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn acquire_with_retry_cantopen_entry_names_the_pool_and_its_size() {
+        static STATS: OpenStats = OpenStats::new();
+        let path = unique_temp_path("label-missing-dir")
+            .join("label-acquire.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = lazy_pool(&path, &STATS);
+        let id = register(&path, &pool);
+
+        let result = acquire_with_retry(&pool, &STATS).await;
+        close_pool(&path);
+
+        assert!(result.is_err(), "a missing directory never opens");
+        // Any attempt: a parallel test holding the registry turns one label into `busy`.
+        let named = format!(" failed pool=pool{id} size=0 idle=0: error returned from database");
+        let log = sqlite_log::snapshot();
+        assert!(
+            log.iter()
+                .any(|e| e.starts_with("14: acquire attempt ") && e.contains(&named)),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_with_retry_cantopen_probes_the_caller_once_per_window() {
+        static STATS: OpenStats = OpenStats::new();
+        // `file=` may be `busy`, so the line is keyed by a missing depth no other test uses.
+        let existing = (0..12).fold(unique_temp_path("probe-deep"), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&existing).expect("create the directories");
+        let missing = existing.join("missing");
+        let path = missing.join("probe.sqlite3");
+        let pool = lazy_pool(&path.to_string_lossy(), &STATS);
+        let id = register(&path.to_string_lossy(), &pool);
+        assert_eq!(format!("pool{id}"), settled_label(&path));
+
+        let (first, second) = tokio::join!(
+            acquire_with_retry(&pool, &STATS),
+            acquire_with_retry(&pool, &STATS)
+        );
+        close_pool(&path.to_string_lossy());
+
+        assert!(
+            first.is_err() && second.is_err(),
+            "a missing directory never opens"
+        );
+        assert!(sqlite_probe::throttled(sqlite_probe::CALLER, &path));
+        let walk = format!(" walk=d{}:err2 ", sqlite_probe::depth(&missing));
+        let log = sqlite_log::snapshot();
+        let probes: Vec<_> = log
+            .iter()
+            .filter(|e| e.starts_with("27: probe site=caller file=") && e.contains(&walk))
+            .collect();
+        assert_eq!(1, probes.len(), "{log:?}");
+        let labelled = [format!(" file=pool{id} "), " file=busy ".to_string()];
+        assert!(labelled.iter().any(|l| probes[0].contains(l)), "{probes:?}");
+    }
+
+    #[tokio::test]
+    async fn pool_label_registered_path_names_the_pool() {
+        let path = unique_db_path("label-exact");
+        open_with_key(&path, 1).await.expect("open");
+        let id = pool_id(&path).expect("registered");
+
+        assert_eq!(format!("pool{id}"), settled_label(Path::new(&path)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_label_canonical_path_names_the_pool() {
+        let real = unique_temp_path("label-real");
+        std::fs::create_dir_all(&real).expect("create the directory");
+        let link = unique_temp_path("label-link");
+        std::os::unix::fs::symlink(&real, &link).expect("link the directory");
+        let path = link.join("label-canonical.sqlite3");
+        open_with_key(&path.to_string_lossy(), 1)
+            .await
+            .expect("open through the link");
+        let id = pool_id(&path.to_string_lossy()).expect("registered");
+
+        let canonical =
+            std::fs::canonicalize(real.join("label-canonical.sqlite3")).expect("canonicalize");
+        assert_eq!(format!("pool{id}"), settled_label(&canonical));
+    }
+
+    #[tokio::test]
+    async fn pool_label_same_file_name_in_another_directory_is_otherdir() {
+        let path = unique_db_path("label-otherdir");
+        open_with_key(&path, 1).await.expect("open");
+        let id = pool_id(&path).expect("registered");
+        let name = Path::new(&path).file_name().expect("file name");
+
+        let elsewhere = unique_temp_path("label-elsewhere").join(name);
+
+        assert_eq!(format!("pool{id}-otherdir"), settled_label(&elsewhere));
+    }
+
+    #[test]
+    fn pool_label_unknown_path_is_unregistered() {
+        let path = unique_db_path("label-unknown");
+
+        assert_eq!("unregistered", settled_label(Path::new(&path)));
+    }
+
+    #[test]
+    fn pool_label_registry_locked_is_busy() {
+        let path = unique_db_path("label-busy");
+
+        // Asserting while holding the lock would poison it for every other test.
+        let label = {
+            let _pools = POOLS.lock().unwrap();
+            pool_label(Path::new(&path))
+        };
+
+        assert_eq!("busy", label);
+    }
+
+    #[tokio::test]
+    async fn database_stats_lists_an_opened_pool_with_its_size() {
+        let path = unique_db_path("stats");
+        let coin = open_with_key(&path, 1).await.expect("open");
+        let live = coin.get_pool().expect("pool");
+        // A released connection returns to the pool on a spawned task.
+        for _ in 0..100 {
+            if live.num_idle() == live.size() as usize {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let stats = database_stats();
+
+        let listed = stats.pools.iter().find(|p| p.path == path);
+        let listed = listed.expect("the opened pool is listed");
+        assert_eq!(pool_id(&path), Some(listed.id));
+        assert!(listed.idle > 0);
+        assert_eq!((live.size(), live.num_idle()), (listed.size, listed.idle));
+    }
+
+    #[test]
+    fn database_stats_after_a_record_last_seq_counts_it() {
+        let (_, before) = sqlite_log::snapshot_with_seq();
+        sqlite_log::record(14, "stats-seq-marker");
+
+        assert!(database_stats().last_seq > before);
     }
 
     #[tokio::test]
