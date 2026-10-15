@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn record_os_layer_open_cantopen_probes_once_other_messages_do_not() {
-        use crate::api::sqlite_probe::{throttled, unique_dir, OPEN_THREAD};
+        use crate::api::sqlite_probe::{throttled, unique_dir};
         let _serial = COUNTER_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
         let counted = native_cantopen();
         // The path ends at the last delimiter, even when a directory name holds one.
@@ -611,9 +611,9 @@ mod tests {
             &format!("os_unix.c:1: (2) open({}) - x", other_code.display()),
         );
 
-        assert!(throttled(OPEN_THREAD, &failed));
-        assert!(!throttled(OPEN_THREAD, &lstat));
-        assert!(!throttled(OPEN_THREAD, &other_code));
+        assert!(throttled(&failed));
+        assert!(!throttled(&lstat));
+        assert!(!throttled(&other_code));
         let log = snapshot();
         let trigger = log
             .iter()
@@ -622,7 +622,7 @@ mod tests {
         assert!(
             log[trigger + 1..]
                 .iter()
-                .any(|e| e.starts_with("27: probe site=open-thread ")),
+                .any(|e| e.starts_with("27: probe file=")),
             "{log:?}"
         );
         assert_eq!(counted, native_cantopen());

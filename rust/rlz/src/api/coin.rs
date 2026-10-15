@@ -22,7 +22,6 @@ use zcash_protocol::consensus::{BlockHeight, OrchardMode};
 use zcash_protocol::local_consensus::LocalNetwork;
 
 use crate::api::sqlite_log::{self, SQLITE_CANTOPEN};
-use crate::api::sqlite_probe;
 use crate::db::{
     backfill_diversifier_index, create_schema, migrate_sapling_addresses, put_prop,
     scrub_spending_keys,
@@ -159,9 +158,6 @@ pub(crate) async fn acquire_with_retry(
                 pool.num_idle()
             ),
         );
-        if failed == 1 {
-            sqlite_probe::after_failed_acquire(options.get_filename());
-        }
         match CANTOPEN_RETRY_DELAYS.get(failed - 1) {
             Some(delay) => tokio::time::sleep(*delay).await,
             None => return Err(error.into()),
@@ -524,17 +520,18 @@ struct OpenPool {
     file_id: Option<FileId>,
     /// Names the pool in log entries in place of its path.
     id: u64,
-    canonical: Option<PathBuf>,
+    /// Exactly what SQLite was handed, so its own messages map back to the pool.
+    sqlite_path: PathBuf,
 }
 
 impl OpenPool {
     fn new(pool: SqlitePool, key_digest: [u8; 32], db_filepath: &str) -> Self {
         OpenPool {
+            sqlite_path: pool.connect_options().get_filename().to_path_buf(),
             pool,
             key_digest,
             file_id: file_id(db_filepath),
             id: POOL_SEQ.fetch_add(1, Ordering::Relaxed),
-            canonical: std::fs::canonicalize(db_filepath).ok(),
         }
     }
 
@@ -569,21 +566,31 @@ async fn open_pool(
 
 /// Never blocks: SQLite's log callback reaches it.
 pub(crate) fn pool_label(path: &Path) -> String {
+    pool_match(path).0
+}
+
+/// The pool label and, for a matched pool, the path SQLite was handed. Never blocks.
+pub(crate) fn pool_match(path: &Path) -> (String, Option<PathBuf>) {
     let Ok(pools) = POOLS.try_lock() else {
-        return "busy".to_string();
+        return ("busy".to_string(), None);
     };
     let same_file = |(key, entry): &(&String, &OpenPool)| {
-        Path::new(key.as_str()) == path || entry.canonical.as_deref() == Some(path)
+        Path::new(key.as_str()) == path || entry.sqlite_path == path
     };
-    if let Some((_, entry)) = pools.iter().find(same_file) {
-        return format!("pool{}", entry.id);
-    }
     let same_name = |(key, _): &(&String, &OpenPool)| {
         path.file_name().is_some() && Path::new(key.as_str()).file_name() == path.file_name()
     };
-    match pools.iter().find(same_name) {
-        Some((_, entry)) => format!("pool{}-otherdir", entry.id),
-        None => "unregistered".to_string(),
+    let found = pools
+        .iter()
+        .find(same_file)
+        .map(|(_, e)| (e, ""))
+        .or_else(|| pools.iter().find(same_name).map(|(_, e)| (e, "-otherdir")));
+    match found {
+        Some((entry, suffix)) => (
+            format!("pool{}{suffix}", entry.id),
+            Some(entry.sqlite_path.clone()),
+        ),
+        None => ("unregistered".to_string(), None),
     }
 }
 
@@ -600,7 +607,7 @@ async fn try_open(
     key_pragma: &Option<String>,
     hint_coin: Option<u8>,
 ) -> Result<SqlitePool> {
-    let options = get_connect_options(db_filepath, key_pragma);
+    let options = get_connect_options(sqlite_path(db_filepath), key_pragma);
     let pool = pool_options(&DB_STATS).connect_lazy_with(options);
 
     let mut connection = acquire_with_retry(&pool, &DB_STATS).await?;
@@ -852,7 +859,38 @@ impl Coin {
     }
 }
 
-fn get_connect_options(db_filepath: &str, key_pragma: &Option<String>) -> SqliteConnectOptions {
+/// SQLite resolves every symlink in the path itself (lstat+readlink); a resolved path skips that walk.
+#[cfg(unix)]
+fn sqlite_path(db_filepath: &str) -> PathBuf {
+    let input = Path::new(db_filepath);
+    let (Some(parent), Some(name)) = (input.parent(), input.file_name()) else {
+        return PathBuf::from(db_filepath);
+    };
+    match std::fs::canonicalize(parent) {
+        Ok(directory) => resolved_or_input(directory.join(name), db_filepath),
+        Err(_) => PathBuf::from(db_filepath),
+    }
+}
+
+#[cfg(not(unix))]
+fn sqlite_path(db_filepath: &str) -> PathBuf {
+    PathBuf::from(db_filepath)
+}
+
+/// sqlx refuses a filename that is not UTF-8.
+#[cfg(unix)]
+fn resolved_or_input(resolved: PathBuf, input: &str) -> PathBuf {
+    if resolved.to_str().is_some() {
+        resolved
+    } else {
+        PathBuf::from(input)
+    }
+}
+
+fn get_connect_options(
+    db_filepath: impl AsRef<Path>,
+    key_pragma: &Option<String>,
+) -> SqliteConnectOptions {
     let options = SqliteConnectOptions::new()
         .filename(db_filepath)
         .create_if_missing(true)
@@ -908,6 +946,7 @@ pub fn close_pool(db_filepath: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::sqlite_probe;
     use sqlx::sqlite::SqliteJournalMode;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1373,38 +1412,77 @@ mod tests {
         );
     }
 
+    // rlz tests never install SQLite's log callback, so only the caller could have probed.
     #[tokio::test]
-    async fn acquire_with_retry_cantopen_probes_the_caller_once_per_window() {
+    async fn acquire_with_retry_cantopen_does_not_probe_the_caller() {
         static STATS: OpenStats = OpenStats::new();
-        // `file=` may be `busy`, so the line is keyed by a missing depth no other test uses.
-        let existing = (0..12).fold(unique_temp_path("probe-deep"), |dir, _| dir.join("d"));
-        std::fs::create_dir_all(&existing).expect("create the directories");
-        let missing = existing.join("missing");
-        let path = missing.join("probe.sqlite3");
+        let path = unique_temp_path("no-caller-probe").join("wallet.sqlite3");
         let pool = lazy_pool(&path.to_string_lossy(), &STATS);
-        let id = register(&path.to_string_lossy(), &pool);
-        assert_eq!(format!("pool{id}"), settled_label(&path));
 
-        let (first, second) = tokio::join!(
-            acquire_with_retry(&pool, &STATS),
-            acquire_with_retry(&pool, &STATS)
-        );
-        close_pool(&path.to_string_lossy());
+        let result = acquire_with_retry(&pool, &STATS).await;
 
-        assert!(
-            first.is_err() && second.is_err(),
-            "a missing directory never opens"
-        );
-        assert!(sqlite_probe::throttled(sqlite_probe::CALLER, &path));
-        let walk = format!(" walk=d{}:err2 ", sqlite_probe::depth(&missing));
-        let log = sqlite_log::snapshot();
-        let probes: Vec<_> = log
-            .iter()
-            .filter(|e| e.starts_with("27: probe site=caller file=") && e.contains(&walk))
-            .collect();
-        assert_eq!(1, probes.len(), "{log:?}");
-        let labelled = [format!(" file=pool{id} "), " file=busy ".to_string()];
-        assert!(labelled.iter().any(|l| probes[0].contains(l)), "{probes:?}");
+        assert!(result.is_err(), "a missing directory never opens");
+        assert!(!sqlite_probe::throttled(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_path_symlinked_directory_resolves_the_directory_keeps_the_file_name() {
+        let real = unique_temp_path("sqlite-path-real");
+        std::fs::create_dir_all(&real).expect("create the directory");
+        let link = unique_temp_path("sqlite-path-link");
+        std::os::unix::fs::symlink(&real, &link).expect("link the directory");
+
+        let resolved = sqlite_path(&link.join("wallet.sqlite3").to_string_lossy());
+
+        let expected = std::fs::canonicalize(&real)
+            .expect("canonicalize")
+            .join("wallet.sqlite3");
+        assert_eq!(expected, resolved);
+    }
+
+    #[test]
+    fn sqlite_path_missing_directory_returns_the_input() {
+        let path = unique_temp_path("sqlite-path-missing").join("wallet.sqlite3");
+        let input = path.to_string_lossy();
+
+        assert_eq!(PathBuf::from(input.as_ref()), sqlite_path(&input));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_or_input_non_utf8_resolution_keeps_the_input() {
+        use std::os::unix::ffi::OsStrExt;
+        let resolved = PathBuf::from(std::ffi::OsStr::from_bytes(b"/real/\xFF/wallet.sqlite3"));
+
+        let kept = resolved_or_input(resolved, "/link/wallet.sqlite3");
+
+        assert_eq!(PathBuf::from("/link/wallet.sqlite3"), kept);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_pool_symlinked_directory_hands_sqlite_the_resolved_path() {
+        let real = unique_temp_path("open-real");
+        std::fs::create_dir_all(&real).expect("create the directory");
+        let link = unique_temp_path("open-link");
+        std::os::unix::fs::symlink(&real, &link).expect("link the directory");
+        let path = link
+            .join("open-resolved.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+
+        let pool = open_pool(&path, &None, None)
+            .await
+            .expect("open through the link");
+        let filename = pool.connect_options().get_filename().to_path_buf();
+        close_pool(&path);
+
+        let real_file = std::fs::canonicalize(&real)
+            .expect("canonicalize")
+            .join("open-resolved.sqlite3");
+        assert_eq!(real_file, filename);
+        assert!(real_file.exists());
     }
 
     #[tokio::test]

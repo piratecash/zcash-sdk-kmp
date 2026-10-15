@@ -100,7 +100,7 @@ mod tests {
         assert!(
             log[trigger + 1..]
                 .iter()
-                .any(|e| e.starts_with("27: probe site=open-thread ")),
+                .any(|e| e.starts_with("27: probe file=")),
             "{log:?}"
         );
     }

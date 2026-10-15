@@ -4,41 +4,30 @@
 //! opens the database file itself: closing a second descriptor of it drops the process's locks.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt::Display;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::api::coin::pool_label;
+use crate::api::coin::pool_match;
 use crate::api::sqlite_log::{self, SQLITE_NOTICE};
 
-pub(crate) const OPEN_THREAD: &str = "open-thread";
-pub(crate) const CALLER: &str = "caller";
 const WINDOW: Duration = Duration::from_secs(60);
 const USER_HZ: f64 = 100.0;
 const START_TIME_FIELD: usize = 22;
 
-type Throttle = HashMap<(&'static str, PathBuf), Instant>;
+type Throttle = HashMap<PathBuf, Instant>;
 
 static THROTTLE: LazyLock<Mutex<Throttle>> = LazyLock::new(Default::default);
 
 /// On the thread whose native open just failed.
 pub(crate) fn after_failed_open(path: &Path) {
-    probe_throttled(OPEN_THREAD, path);
-}
-
-/// On the long-lived thread that asked the pool for a connection.
-pub(crate) fn after_failed_acquire(path: &Path) {
-    probe_throttled(CALLER, path);
-}
-
-fn probe_throttled(site: &'static str, path: &Path) {
-    let admitted = admit(&mut throttle(), site, path, Instant::now());
+    let admitted = admit(&mut throttle(), path, Instant::now());
     if admitted {
-        sqlite_log::record(SQLITE_NOTICE, &probe(site, path));
+        sqlite_log::record(SQLITE_NOTICE, &probe(path));
     }
 }
 
@@ -47,29 +36,73 @@ fn throttle() -> MutexGuard<'static, Throttle> {
 }
 
 /// Forgets paths older than the window, so the map only holds recent failures.
-fn admit(seen: &mut Throttle, site: &'static str, path: &Path, now: Instant) -> bool {
+fn admit(seen: &mut Throttle, path: &Path, now: Instant) -> bool {
     seen.retain(|_, at| now.saturating_duration_since(*at) < WINDOW);
-    let key = (site, path.to_path_buf());
-    if seen.contains_key(&key) {
+    if seen.contains_key(path) {
         return false;
     }
-    seen.insert(key, now);
+    seen.insert(path.to_path_buf(), now);
     true
 }
 
 /// Numbers only: the path, its file name and the account id never reach the line.
-pub(crate) fn probe(site: &str, path: &Path) -> String {
-    let facts = ProcFacts::read();
+pub(crate) fn probe(path: &Path) -> String {
+    let (file, real) = pool_match(path);
     let (walk, links) = walk(path);
-    let (sibling_rw, sibling_ro) = open_sibling(path, &facts.sibling_tag());
     format!(
-        "probe site={site} file={} stat={} walk={walk} links={links} siblingRw={sibling_rw} \
-         siblingRo={sibling_ro} pid={} {}",
-        pool_label(path),
+        "probe file={file} stat={} walk={walk} links={links} {} pid={} {}",
         outcome(fs::metadata(path)),
+        real_facts(path, real.as_deref()),
         std::process::id(),
-        facts.render()
+        ProcFacts::read().render()
     )
+}
+
+/// Our real path, measured on the same failing thread.
+fn real_facts(built: &Path, real: Option<&Path>) -> String {
+    let Some(real) = real else {
+        return "builtDir=n/a realStat=n/a realWalk=n/a realLinks=n/a".to_string();
+    };
+    let (walk, links) = walk(real);
+    format!(
+        "builtDir={} realStat={} realWalk={walk} realLinks={links}",
+        dir_tokens(built, real),
+        outcome(fs::metadata(real))
+    )
+}
+
+/// Per built directory component: `=` ours at that depth, `r<d>` ours at depth d, else `?<bytes>`.
+fn dir_tokens(built: &Path, real: &Path) -> String {
+    let real_dir = directory_names(real);
+    // Same numbering as `walk=`: the root is d0.
+    let first_depth = usize::from(real.has_root());
+    let token = |(i, name): (usize, &OsStr)| {
+        if real_dir.get(i) == Some(&name) {
+            return "=".to_string();
+        }
+        match real_dir.iter().position(|r| *r == name) {
+            Some(j) => format!("r{}", j + first_depth),
+            None => format!("?{}", name.len()),
+        }
+    };
+    let tokens: Vec<String> = directory_names(built)
+        .into_iter()
+        .enumerate()
+        .map(token)
+        .collect();
+    let kind = if built.has_root() { "abs" } else { "rel" };
+    format!("{kind}:{}", tokens.join(","))
+}
+
+fn directory_names(path: &Path) -> Vec<&OsStr> {
+    path.parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
 fn outcome<T>(result: io::Result<T>) -> String {
@@ -119,37 +152,10 @@ fn joined(links: Vec<String>) -> String {
     }
 }
 
-/// Repeats SQLite's two open attempts on a sibling file, never on the database itself.
-/// Created exclusively: a file that already has the sibling's name is never opened or removed.
-fn open_sibling(path: &Path, tag: &str) -> (String, String) {
-    let Some(parent) = path.parent() else {
-        return ("n/a".to_string(), "n/a".to_string());
-    };
-    let sibling = parent.join(sibling_name(tag));
-    let created = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&sibling);
-    if let Err(error) = created {
-        return (errno(&error), "n/a".to_string());
-    }
-    let ro = outcome(File::open(&sibling));
-    let _ = fs::remove_file(&sibling);
-    ("ok".to_string(), ro)
-}
-
-fn sibling_name(tag: &str) -> String {
-    format!(".rlz-probe-{}-{tag}", std::process::id())
-}
-
 struct ProcFacts {
     tid: Option<u64>,
     thread_age: Option<f64>,
     process_age: Option<f64>,
-    threads: Option<u64>,
-    vm_size_kb: Option<u64>,
-    vm_rss_kb: Option<u64>,
 }
 
 impl ProcFacts {
@@ -158,7 +164,6 @@ impl ProcFacts {
         let thread = read_proc("/proc/thread-self/stat");
         let process = read_proc("/proc/self/stat");
         let uptime = read_proc("/proc/uptime").as_deref().and_then(uptime_secs);
-        let status = read_proc("/proc/self/status").unwrap_or_default();
         let age = |stat: &Option<String>| {
             Some(age_secs(
                 uptime?,
@@ -169,30 +174,16 @@ impl ProcFacts {
             tid: thread.as_deref().and_then(stat_pid),
             thread_age: age(&thread),
             process_age: age(&process),
-            threads: status_value(&status, "Threads"),
-            vm_size_kb: status_value(&status, "VmSize"),
-            vm_rss_kb: status_value(&status, "VmRSS"),
         }
-    }
-
-    /// Unique per thread, so concurrent probes of one directory never share a sibling.
-    fn sibling_tag(&self) -> String {
-        self.tid.map_or_else(
-            || format!("{:?}", thread::current().id()),
-            |tid| tid.to_string(),
-        )
     }
 
     fn render(&self) -> String {
         let seconds = |age: Option<f64>| age.map(|s| format!("{s:.2}"));
         format!(
-            "tid={} threadAge={} procAge={} threads={} vmSizeKb={} vmRssKb={}",
+            "tid={} threadAge={} procAge={}",
             or_na(self.tid),
             or_na(seconds(self.thread_age)),
-            or_na(seconds(self.process_age)),
-            or_na(self.threads),
-            or_na(self.vm_size_kb),
-            or_na(self.vm_rss_kb)
+            or_na(seconds(self.process_age))
         )
     }
 }
@@ -222,24 +213,13 @@ fn uptime_secs(uptime: &str) -> Option<f64> {
     uptime.split_whitespace().next()?.parse().ok()
 }
 
-fn status_value(status: &str, key: &str) -> Option<u64> {
-    status.lines().find_map(|line| {
-        line.strip_prefix(key)?
-            .strip_prefix(':')?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
-}
-
 fn age_secs(uptime: f64, start_ticks: u64) -> f64 {
     (uptime - start_ticks as f64 / USER_HZ).max(0.0)
 }
 
 #[cfg(test)]
-pub(crate) fn throttled(site: &'static str, path: &Path) -> bool {
-    throttle().contains_key(&(site, path.to_path_buf()))
+pub(crate) fn throttled(path: &Path) -> bool {
+    throttle().contains_key(path)
 }
 
 #[cfg(test)]
@@ -265,26 +245,43 @@ pub(crate) fn depth(path: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::coin::{close_pool, Coin};
 
     const STAT: &str =
         "4321 (a) (b) S 1 4321 4321 0 -1 4194624 100 0 0 0 5 3 0 0 20 0 7 0 98765 123456789 900";
+
+    /// `busy` only means another test holds the pool registry right now, so sample again.
+    fn settled_probe(path: &Path) -> String {
+        for _ in 0..5000 {
+            let line = probe(path);
+            if !line.contains(" file=busy ") {
+                return line;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the pool registry stayed locked")
+    }
+
+    /// A pool registered at a canonical directory, and a missing directory beside it.
+    async fn registered_pool_and_missing_twin(tag: &str) -> (PathBuf, PathBuf) {
+        let base = fs::canonicalize(std::env::temp_dir()).expect("canonicalize the temp dir");
+        let name = format!("{tag}.sqlite3");
+        let leaf = |dir: PathBuf| base.join(dir.file_name().expect("a unique name"));
+        let real = leaf(unique_dir(&format!("{tag}-real"))).join(&name);
+        fs::create_dir_all(real.parent().expect("a parent")).expect("create the directory");
+        Coin::new(None)
+            .open_database_with_key(real.to_string_lossy().into_owned(), None)
+            .await
+            .expect("open the pool");
+        let built = leaf(unique_dir(&format!("{tag}-built"))).join(&name);
+        (real, built)
+    }
 
     #[test]
     fn stat_parsers_comm_with_parens_reads_fields_after_the_last_paren() {
         assert_eq!(Some(4321), stat_pid(STAT));
         assert_eq!(Some(98765), stat_field(STAT, START_TIME_FIELD));
         assert_eq!(Some(7), stat_field(STAT, 20));
-    }
-
-    #[test]
-    fn status_value_reads_threads_and_memory_in_kb() {
-        let status =
-            "Name:\tx\nVmSizeMax:\t1 kB\nThreads:\t42\nVmSize:\t  123456 kB\nVmRSS:\t   7890 kB\n";
-
-        assert_eq!(Some(42), status_value(status, "Threads"));
-        assert_eq!(Some(123456), status_value(status, "VmSize"));
-        assert_eq!(Some(7890), status_value(status, "VmRSS"));
-        assert_eq!(None, status_value(status, "VmSwap"));
     }
 
     #[test]
@@ -296,30 +293,74 @@ mod tests {
     }
 
     #[test]
-    fn admit_once_per_window_per_site_and_path() {
+    fn admit_once_per_window_per_path() {
         let mut seen = Throttle::new();
         let start = Instant::now();
         let at = |secs| start + Duration::from_secs(secs);
         let wallet = Path::new("/w/a.sqlite3");
         let other = Path::new("/w/b.sqlite3");
 
-        assert!(admit(&mut seen, CALLER, wallet, at(0)));
-        assert!(!admit(&mut seen, CALLER, wallet, at(59)));
-        assert!(admit(&mut seen, CALLER, other, at(1)));
-        assert!(admit(&mut seen, OPEN_THREAD, wallet, at(1)));
-        assert!(admit(&mut seen, CALLER, wallet, at(60)));
+        assert!(admit(&mut seen, wallet, at(0)));
+        assert!(!admit(&mut seen, wallet, at(59)));
+        assert!(admit(&mut seen, other, at(1)));
+        assert!(admit(&mut seen, wallet, at(60)));
     }
 
     #[test]
     fn admit_drops_entries_older_than_the_window() {
         let mut seen = Throttle::new();
         let start = Instant::now();
-        admit(&mut seen, CALLER, Path::new("/w/a.sqlite3"), start);
-        admit(&mut seen, CALLER, Path::new("/w/b.sqlite3"), start);
+        admit(&mut seen, Path::new("/w/a.sqlite3"), start);
+        admit(&mut seen, Path::new("/w/b.sqlite3"), start);
 
-        admit(&mut seen, CALLER, Path::new("/w/c.sqlite3"), start + WINDOW);
+        admit(&mut seen, Path::new("/w/c.sqlite3"), start + WINDOW);
 
         assert_eq!(1, seen.len());
+    }
+
+    #[test]
+    fn dir_tokens_identical_directories_are_all_equal() {
+        let tokens = dir_tokens(Path::new("/a/bb/ccc/w.db"), Path::new("/a/bb/ccc/w.db"));
+
+        assert_eq!("abs:=,=,=", tokens);
+    }
+
+    #[test]
+    fn dir_tokens_truncated_component_reports_its_length() {
+        let tokens = dir_tokens(
+            Path::new("/data/use/0/w.db"),
+            Path::new("/data/user/0/w.db"),
+        );
+
+        assert_eq!("abs:=,?3,=", tokens);
+    }
+
+    #[test]
+    fn dir_tokens_swapped_components_name_their_real_depth() {
+        let tokens = dir_tokens(Path::new("/a/c/b/d/w.db"), Path::new("/a/b/c/d/w.db"));
+
+        assert_eq!("abs:=,r3,r2,=", tokens);
+    }
+
+    #[test]
+    fn dir_tokens_relative_built_path_is_marked_rel() {
+        let tokens = dir_tokens(Path::new("b/x/w.db"), Path::new("/a/b/w.db"));
+
+        assert_eq!("rel:r2,?1", tokens);
+    }
+
+    #[test]
+    fn dir_tokens_built_longer_than_real_reports_the_extra_components() {
+        let tokens = dir_tokens(Path::new("/a/b/c/dd/w.db"), Path::new("/a/b/w.db"));
+
+        assert_eq!("abs:=,=,?1,?2", tokens);
+    }
+
+    #[test]
+    fn dir_tokens_built_shorter_than_real_stops_at_its_own_end() {
+        let tokens = dir_tokens(Path::new("/a/c/w.db"), Path::new("/a/b/c/w.db"));
+
+        assert_eq!("abs:=,r3", tokens);
     }
 
     #[test]
@@ -327,51 +368,31 @@ mod tests {
         let missing = unique_dir("missing");
         let path = missing.join("wallet.sqlite3");
 
-        let line = probe(CALLER, &path);
+        let line = probe(&path);
 
-        // `file=` is pool_label's: a parallel test holding the registry turns it into `busy`.
-        assert!(line.starts_with("probe site=caller file="), "{line}");
+        // `file=` is pool_match's: a parallel test holding the registry turns it into `busy`.
+        assert!(line.starts_with("probe file="), "{line}");
         assert!(line.contains(" stat=err2 "), "{line}");
         assert!(
             line.contains(&format!(" walk=d{}:err2 ", depth(&missing))),
             "{line}"
         );
-        assert!(line.contains(" siblingRw=err2 siblingRo=n/a "), "{line}");
+        assert!(
+            line.contains(" builtDir=n/a realStat=n/a realWalk=n/a realLinks=n/a "),
+            "{line}"
+        );
     }
 
     #[test]
-    fn probe_existing_file_reports_ok_and_removes_the_sibling() {
+    fn probe_existing_file_reports_ok() {
         let directory = unique_dir("existing");
         fs::create_dir_all(&directory).expect("create the directory");
         let path = directory.join("wallet.sqlite3");
         fs::write(&path, b"").expect("create the file");
 
-        let line = probe(CALLER, &path);
+        let line = probe(&path);
 
         assert!(line.contains(" stat=ok walk=ok "), "{line}");
-        assert!(line.contains(" siblingRw=ok siblingRo=ok "), "{line}");
-        let left: Vec<_> = fs::read_dir(&directory)
-            .expect("list the directory")
-            .map(|e| e.expect("entry").file_name())
-            .collect();
-        assert_eq!(vec![std::ffi::OsString::from("wallet.sqlite3")], left);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn probe_database_named_like_the_sibling_leaves_it_untouched() {
-        let directory = unique_dir("sibling-name");
-        fs::create_dir_all(&directory).expect("create the directory");
-        let path = directory.join(sibling_name(&ProcFacts::read().sibling_tag()));
-        fs::write(&path, b"wallet").expect("create the database");
-
-        let line = probe(CALLER, &path);
-
-        assert!(line.contains(" siblingRw=err17 siblingRo=n/a "), "{line}");
-        assert_eq!(
-            b"wallet".as_slice(),
-            fs::read(&path).expect("the database survives")
-        );
     }
 
     #[cfg(unix)]
@@ -384,27 +405,49 @@ mod tests {
         let path = link.join("wallet.sqlite3");
         fs::write(&path, b"").expect("create the file");
 
-        let line = probe(CALLER, &path);
+        let line = probe(&path);
 
         let expected = format!("d{}:{}:ok", depth(&link), real.as_os_str().len());
         assert!(line.contains(&expected), "{expected} in {line}");
         assert!(line.contains(" walk=ok "), "{line}");
     }
 
-    #[test]
-    fn probe_line_contains_no_part_of_the_path() {
-        let directory = unique_dir("privacy-marker");
-        let path = directory.join("account-marker.sqlite3");
+    // Unix errno and path components: a missing directory is err3 on Windows, which also has a prefix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_failed_path_named_like_a_registered_pool_reports_our_real_path() {
+        let (real, built) = registered_pool_and_missing_twin("probe-twin").await;
 
-        let line = probe(OPEN_THREAD, &path);
+        let line = settled_probe(&built);
+        close_pool(&real.to_string_lossy());
 
-        assert!(line.starts_with("probe site=open-thread "), "{line}");
+        assert!(line.starts_with("probe file=pool"), "{line}");
+        assert!(line.contains("-otherdir stat=err2 "), "{line}");
+        let shared = "=,".repeat(depth(real.parent().expect("a parent")) - 1);
+        let leaf = built.parent().and_then(Path::file_name).expect("a leaf");
+        let tokens = format!(" builtDir=abs:{shared}?{} ", leaf.len());
+        assert!(line.contains(&tokens), "{tokens} in {line}");
+        assert!(
+            line.contains(" realStat=ok realWalk=ok realLinks=none "),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_line_contains_no_part_of_the_path() {
+        let (real, built) = registered_pool_and_missing_twin("privacy-marker").await;
+
+        let line = settled_probe(&built);
+        close_pool(&real.to_string_lossy());
+
+        assert!(line.starts_with("probe file="), "{line}");
+        assert!(line.contains(" builtDir=abs:"), "{line}");
         let temp = std::env::temp_dir();
         for part in [
             "privacy-marker",
-            "account-marker",
             "sqlite3",
             &temp.to_string_lossy(),
+            &real.parent().expect("a parent").to_string_lossy(),
         ] {
             assert!(!line.contains(part), "{part} in {line}");
         }
