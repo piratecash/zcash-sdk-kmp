@@ -128,9 +128,18 @@ public data class PaymentOptions(
     val confirmations: Int = DEFAULT_CONFIRMATIONS,
     /** Forces a v5 (ZIP-244) transaction so an external hardware signer (e.g. Trezor) can sign it. */
     val hardwareSigning: Boolean = false,
+    /**
+     * Plans for a device that signs the PCZT field by field (e.g. Ledger): no Sapling, within the
+     * device's limits, and the branch's own transaction version. A plan the device cannot sign
+     * fails with [ZcashException.externalSigningRefusal] set.
+     */
+    val externalPcztSigning: Boolean = false,
 ) {
     init {
         require(confirmations >= 0) { "Confirmations must not be negative: $confirmations" }
+        require(!(hardwareSigning && externalPcztSigning)) {
+            "hardwareSigning and externalPcztSigning target different signers"
+        }
     }
 }
 
@@ -213,6 +222,99 @@ public data class TransparentSigningOutput(
     val scope: Int? = null,
     val dindex: Int? = null,
 )
+
+/**
+ * What a device that signs a PCZT field by field (e.g. Ledger) needs, from
+ * [ZcashWallet.externalSigningView]. Byte fields are hex; paths hold raw BIP-32/ZIP-32 indices
+ * with the hardened bit (`0x8000_0000`) set.
+ */
+public data class ExternalSigningView(
+    val txVersion: Int,
+    val versionGroupId: Long,
+    val consensusBranchId: Long,
+    val fallbackLockTime: Long?,
+    val expiryHeight: Int,
+    val coinType: Int,
+    val txModifiable: Int,
+    val transparentInputs: List<ExternalTransparentInput>,
+    val transparentOutputs: List<ExternalTransparentOutput>,
+    val orchard: ExternalActionBundle?,
+    /** Always null below transaction version 6. */
+    val ironwood: ExternalActionBundle?,
+)
+
+public data class ExternalKeyDerivation(val pubkey: String, val seedFingerprint: String, val path: List<Long>)
+
+public data class ExternalTransparentInput(
+    val prevoutTxid: String,
+    val prevoutIndex: Int,
+    val sequence: Long?,
+    val value: Long,
+    val scriptPubkey: String,
+    val sighashType: Int,
+    val derivation: ExternalKeyDerivation,
+)
+
+/** [derivation] is set only on the wallet's own change output. */
+public data class ExternalTransparentOutput(
+    val value: Long,
+    val scriptPubkey: String,
+    val derivation: ExternalKeyDerivation?,
+)
+
+/** [signIndices] are the actions the device signs; the others are dummies the host signed already. */
+public data class ExternalActionBundle(
+    val actions: List<ExternalAction>,
+    val flags: Int,
+    /** Spends minus outputs, in zatoshi. */
+    val valueBalance: Long,
+    val anchor: String,
+    val notePlaintextVersion: Int,
+    val signIndices: List<Int>,
+)
+
+/** [recipientAddress] is the Orchard-only unified address the device shows for this output. */
+public data class ExternalAction(
+    val cvNet: String,
+    val nullifier: String,
+    val rk: String,
+    val spendRecipient: String,
+    val spendValue: Long,
+    val spendRho: String,
+    val spendRseed: String,
+    val alpha: String,
+    val seedFingerprint: String,
+    val path: List<Long>,
+    val cmx: String,
+    val ephemeralKey: String,
+    val encCiphertext: String,
+    val outCiphertext: String,
+    val recipient: String,
+    val recipientAddress: String,
+    val value: Long,
+    val rseed: String,
+    val rcv: String,
+)
+
+/**
+ * A device's answers keyed by index: 64-byte spend authorization signatures per Orchard/Ironwood
+ * action, and DER ‖ sighash type per transparent input, exactly as the device returns them.
+ */
+public class ExternalSignatures(
+    public val orchard: Map<Int, ByteArray>,
+    public val ironwood: Map<Int, ByteArray>,
+    public val transparent: Map<Int, ByteArray>,
+)
+
+/** Why the external device cannot sign a payment; see [ZcashException.externalSigningRefusal]. */
+public enum class ExternalSigningRefusal(internal val code: String) {
+    SAPLING("sapling"),
+    SHIELDED_RECIPIENTS("shielded-recipients"),
+    TRANSPARENT_INPUTS("transparent-inputs"),
+    TRANSPARENT_OUTPUTS("transparent-outputs"),
+    ORCHARD_ACTIONS("orchard-actions"),
+    IRONWOOD_ACTIONS("ironwood-actions"),
+}
 
 /**
  * The outcome of a finished sync. The native layer reports every failure — cancellation

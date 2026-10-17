@@ -22,6 +22,9 @@ pub struct PaymentOptions {
     pub category: Option<u32>,
     /// Forces a v5 (ZIP-244) transaction so an external hardware signer (e.g. Trezor) can sign it.
     pub hardware_signing: bool,
+    /// Plans for a device that signs the PCZT field by field (e.g. Ledger); see
+    /// [`crate::pay::external`].
+    pub external_pczt_signing: bool,
 }
 
 #[cfg_attr(feature = "flutter", frb)]
@@ -56,6 +59,7 @@ pub async fn prepare(
         None,  // preselected
         None,  // anchor_height
         options.hardware_signing,
+        options.external_pczt_signing,
     )
     .await
 }
@@ -89,6 +93,7 @@ pub async fn prepare_migration(
         None,  // preselected
         None,  // anchor_height
         false, // hardware_signing
+        false, // external_pczt_signing
     )
     .await
 }
@@ -131,6 +136,29 @@ pub fn apply_transparent_signatures(
     sigs: &[Vec<u8>],
 ) -> Result<PcztPackage> {
     crate::pay::plan::apply_transparent_signatures(pczt, indices, sigs)
+}
+
+/// Adds the proofs to a package an external device will sign; needs no spending key.
+pub async fn prove_transaction(pczt: &PcztPackage) -> Result<PcztPackage> {
+    crate::pay::external::prove_transaction(pczt).await
+}
+
+/// JSON of [`crate::pay::external::ExternalSigningView`] for `pczt`, with every path under
+/// ZIP-32/BIP-44 account `account_index`.
+pub fn external_signing_view(coin: u8, pczt: &PcztPackage, account_index: u32) -> Result<String> {
+    let network = network_from_coin(coin);
+    let view = crate::pay::external::external_signing_view(&network, pczt, account_index)?;
+    Ok(serde_json::to_string(&view)?)
+}
+
+/// Applies an external device's signatures to `pczt` and finalizes it.
+pub fn apply_external_signatures(
+    pczt: &PcztPackage,
+    orchard: &[(u32, [u8; 64])],
+    ironwood: &[(u32, [u8; 64])],
+    transparent: &[(u32, Vec<u8>)],
+) -> Result<PcztPackage> {
+    crate::pay::external::apply_external_signatures(pczt, orchard, ironwood, transparent)
 }
 
 #[cfg_attr(feature = "flutter", frb)]

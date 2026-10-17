@@ -21,8 +21,9 @@ use jni::{Env, EnvUnowned};
 use rlz::api::account::{
     address_kind, address_receivers, addresses_from_key, delete_account, derive_unified_address,
     generate_next_receive_address, get_account_pools, get_account_ufvk, list_accounts,
-    list_tx_history, new_account, next_unused_receive_address, receivers_from_ua, receivers_of,
-    transparent_address_balance, transparent_coverage, ua_from_ufvk, unified_address, AddressKind,
+    list_tx_history, new_account, next_unused_receive_address, orchard_only_address,
+    receivers_from_ua, receivers_of, transparent_address_balance, transparent_address_of_tex,
+    transparent_coverage, transparent_receive_index, ua_from_ufvk, unified_address, AddressKind,
     NewAccount,
 };
 use rlz::api::coin::{database_stats, init_datadir, Coin};
@@ -33,9 +34,10 @@ use rlz::api::key::{
 use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::{get_current_height, probe_server};
 use rlz::api::pay::{
-    apply_transparent_signatures, broadcast, extract_transaction, pack_transaction, prepare,
-    reserve_for_broadcast, sign_transaction_with_key, to_plan, transaction_id,
-    transparent_signing_request, unpack_transaction, PaymentOptions, PcztPackage,
+    apply_external_signatures, apply_transparent_signatures, broadcast, external_signing_view,
+    extract_transaction, pack_transaction, prepare, prove_transaction, reserve_for_broadcast,
+    sign_transaction_with_key, to_plan, transaction_id, transparent_signing_request,
+    unpack_transaction, PaymentOptions, PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sqlite_log::{describe, record};
@@ -173,6 +175,54 @@ fn account_ids(accounts: &JIntArray<'_>, env: &Env<'_>) -> Result<Vec<u32>, Brid
     let mut ids = vec![0i32; accounts.len(env)?];
     accounts.get_region(env, 0, &mut ids)?;
     Ok(ids.into_iter().map(|id| id as u32).collect())
+}
+
+fn byte_arrays(
+    arrays: &JObjectArray<'_, JByteArray<'_>>,
+    env: &mut Env<'_>,
+) -> Result<Vec<Vec<u8>>, BridgeError> {
+    let count = arrays.len(env)?;
+    let mut bytes = Vec::with_capacity(count);
+    for i in 0..count {
+        let element = arrays.get_element(env, i)?;
+        bytes.push(env.convert_byte_array(&element)?);
+    }
+    Ok(bytes)
+}
+
+/// `indices[i]` is the input or action `sigs[i]` signs.
+fn indexed_signatures(
+    indices: &JIntArray<'_>,
+    sigs: &JObjectArray<'_, JByteArray<'_>>,
+    env: &mut Env<'_>,
+) -> Result<Vec<(u32, Vec<u8>)>, BridgeError> {
+    let indices = account_ids(indices, env)?;
+    let sigs = byte_arrays(sigs, env)?;
+    if indices.len() != sigs.len() {
+        return Err(BridgeError(format!(
+            "indices and signatures have different lengths: {} vs {}",
+            indices.len(),
+            sigs.len()
+        )));
+    }
+    Ok(indices.into_iter().zip(sigs).collect())
+}
+
+fn spend_auth_signatures(
+    signatures: Vec<(u32, Vec<u8>)>,
+) -> Result<Vec<(u32, [u8; 64])>, BridgeError> {
+    signatures
+        .into_iter()
+        .map(|(index, sig)| {
+            let len = sig.len();
+            let sig = sig.try_into().map_err(|_| {
+                BridgeError(format!(
+                    "spend authorization signature for action {index} is {len} bytes, expected 64"
+                ))
+            })?;
+            Ok((index, sig))
+        })
+        .collect()
 }
 
 fn optional_bytes(value: &JByteArray<'_>, env: &Env<'_>) -> Result<Option<Vec<u8>>, BridgeError> {
@@ -628,6 +678,25 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentBalance<'local>(
         .resolve::<ThrowNativeError>()
 }
 
+/// Receive-scope derivation index of `address` among the account's own addresses; -1 when it is not one.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentAddressIndex<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    address: JString<'local>,
+) -> jint {
+    unowned_env
+        .with_env(|env| -> Result<jint, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let address = address.try_to_string(env)?;
+            let index = runtime().block_on(transparent_receive_index(&coin, &address))?;
+            Ok(index.and_then(|i| jint::try_from(i).ok()).unwrap_or(-1))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
 /// A negative width would wrap to a huge `u32`; zero is what the walk clamps up to one.
 fn concurrency_arg(value: jint) -> u32 {
     u32::try_from(value).unwrap_or(0)
@@ -716,6 +785,44 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_addressReceivers<'local>(
             let address = address.try_to_string(env)?;
             let json = address_receivers(coin as u8, &address)?;
             Ok(env.new_string(json)?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: needs no open wallet. The Orchard receiver of a unified `address` alone; `null` otherwise.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_orchardOnlyAddress<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    address: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let address = address.try_to_string(env)?;
+            match orchard_only_address(coin as u8, &address) {
+                Some(orchard) => Ok(env.new_string(&orchard)?),
+                None => Ok(JString::default()),
+            }
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: needs no open wallet. The `t1…` address a TEX `address` encodes; `null` otherwise.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentAddressOfTex<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    address: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let address = address.try_to_string(env)?;
+            match transparent_address_of_tex(coin as u8, &address) {
+                Some(transparent) => Ok(env.new_string(&transparent)?),
+                None => Ok(JString::default()),
+            }
         })
         .resolve::<ThrowNativeError>()
 }
@@ -1036,6 +1143,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_prepare<'local>(
     smart_transparent: jboolean,
     confirmations: jint,
     hardware_signing: jboolean,
+    external_pczt_signing: jboolean,
 ) -> JByteArray<'local> {
     unowned_env
         .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
@@ -1053,6 +1161,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_prepare<'local>(
                 confirmations: confirmations as u32,
                 category: None,
                 hardware_signing,
+                external_pczt_signing,
             };
             let package = runtime().block_on(prepare(&recipients, options, &coin))?;
             pack_package(env, &package)
@@ -1108,14 +1217,73 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_applyTransparentSignatures<'lo
         .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
             let package = unpack_package(env, &pkg)?;
             let indices = account_ids(&indices, env)?;
-            let sig_count = sigs.len(env)?;
-            let mut sig_bytes = Vec::with_capacity(sig_count);
-            for i in 0..sig_count {
-                let sig = sigs.get_element(env, i)?;
-                sig_bytes.push(env.convert_byte_array(&sig)?);
-            }
+            let sig_bytes = byte_arrays(&sigs, env)?;
             let updated = apply_transparent_signatures(&package, &indices, &sig_bytes)?;
             pack_package(env, &updated)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: adds the proofs to a package an external device will sign.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_proveTransaction<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    pkg: JByteArray<'local>,
+) -> JByteArray<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
+            let package = unpack_package(env, &pkg)?;
+            let proved = runtime().block_on(prove_transaction(&package))?;
+            pack_package(env, &proved)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: the JSON field view an external device signs from.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_externalSigningView<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    coin: jbyte,
+    pkg: JByteArray<'local>,
+    account_index: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let account_index = u32::try_from(account_index)
+                .map_err(|_| BridgeError("Account index must not be negative".to_string()))?;
+            let package = unpack_package(env, &pkg)?;
+            let json = external_signing_view(coin as u8, &package, account_index)?;
+            Ok(env.new_string(json)?)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stateless: applies an external device's signatures and finalizes the spends.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_applyExternalSignatures<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    pkg: JByteArray<'local>,
+    orchard_indices: JIntArray<'local>,
+    orchard_sigs: JObjectArray<'local, JByteArray<'local>>,
+    ironwood_indices: JIntArray<'local>,
+    ironwood_sigs: JObjectArray<'local, JByteArray<'local>>,
+    transparent_indices: JIntArray<'local>,
+    transparent_sigs: JObjectArray<'local, JByteArray<'local>>,
+) -> JByteArray<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
+            let package = unpack_package(env, &pkg)?;
+            let orchard =
+                spend_auth_signatures(indexed_signatures(&orchard_indices, &orchard_sigs, env)?)?;
+            let ironwood =
+                spend_auth_signatures(indexed_signatures(&ironwood_indices, &ironwood_sigs, env)?)?;
+            let transparent = indexed_signatures(&transparent_indices, &transparent_sigs, env)?;
+            let signed = apply_external_signatures(&package, &orchard, &ironwood, &transparent)?;
+            pack_package(env, &signed)
         })
         .resolve::<ThrowNativeError>()
 }

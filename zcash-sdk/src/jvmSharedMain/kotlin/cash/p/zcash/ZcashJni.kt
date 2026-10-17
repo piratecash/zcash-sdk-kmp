@@ -77,6 +77,9 @@ internal object ZcashJni {
     /** Unspent value at [address] in zatoshi, as of the last sync. */
     external fun transparentBalance(handle: Long, account: Int, address: String): Long
 
+    /** Receive-scope derivation index of [address] among the account's own addresses; -1 when it is not one. */
+    external fun transparentAddressIndex(handle: Long, account: Int, address: String): Int
+
     /** Re-derives transparent addresses the account used before a restore. Returns how many were added. */
     external fun discoverTransparentAddresses(
         handle: Long,
@@ -120,6 +123,7 @@ internal object ZcashJni {
         smartTransparent: Boolean,
         confirmations: Int,
         hardwareSigning: Boolean,
+        externalPcztSigning: Boolean,
     ): ByteArray
 
     external fun transactionPlan(handle: Long, pkg: ByteArray): String
@@ -132,6 +136,23 @@ internal object ZcashJni {
         pkg: ByteArray,
         indices: IntArray,
         sigs: Array<ByteArray>,
+    ): ByteArray
+
+    /** Stateless: adds the proofs to a package an external device will sign. */
+    external fun proveTransaction(pkg: ByteArray): ByteArray
+
+    /** Stateless: the JSON field view an external device signs from. */
+    external fun externalSigningView(coin: Byte, pkg: ByteArray, accountIndex: Int): String
+
+    /** Stateless: applies an external device's signatures and finalizes the spends. */
+    external fun applyExternalSignatures(
+        pkg: ByteArray,
+        orchardIndices: IntArray,
+        orchardSigs: Array<ByteArray>,
+        ironwoodIndices: IntArray,
+        ironwoodSigs: Array<ByteArray>,
+        transparentIndices: IntArray,
+        transparentSigs: Array<ByteArray>,
     ): ByteArray
 
     external fun signTransaction(
@@ -185,6 +206,12 @@ internal object ZcashJni {
 
     /** Stateless: needs no open wallet. Which receiver kinds [address] carries. */
     external fun addressReceivers(coin: Byte, address: String): String
+
+    /** Stateless: needs no open wallet. The Orchard receiver of a unified [address] alone; `null` otherwise. */
+    external fun orchardOnlyAddress(coin: Byte, address: String): String?
+
+    /** Stateless: needs no open wallet. The `t1…` address a TEX [address] encodes; `null` otherwise. */
+    external fun transparentAddressOfTex(coin: Byte, address: String): String?
 
     /** Stateless: needs no open wallet. The component mask `key` encodes, not spendable pools. */
     external fun keyPools(coin: Byte, key: String): Int

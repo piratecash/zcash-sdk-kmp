@@ -16,6 +16,7 @@ use zcash_protocol::consensus::BranchId;
 use zcash_transparent::address::TransparentAddress;
 
 pub mod error;
+pub mod external;
 pub mod fee;
 pub mod plan;
 pub mod pool;

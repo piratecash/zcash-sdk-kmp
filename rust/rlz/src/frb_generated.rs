@@ -10816,6 +10816,7 @@ impl SseDecode for crate::api::pay::PaymentOptions {
         let mut var_confirmations = <u32>::sse_decode(deserializer);
         let mut var_category = <Option<u32>>::sse_decode(deserializer);
         let mut var_hardwareSigning = <bool>::sse_decode(deserializer);
+        let mut var_externalPcztSigning = <bool>::sse_decode(deserializer);
         return crate::api::pay::PaymentOptions {
             src_pools: var_srcPools,
             recipient_pays_fee: var_recipientPaysFee,
@@ -10823,6 +10824,7 @@ impl SseDecode for crate::api::pay::PaymentOptions {
             confirmations: var_confirmations,
             category: var_category,
             hardware_signing: var_hardwareSigning,
+            external_pczt_signing: var_externalPcztSigning,
         };
     }
 }
@@ -13383,6 +13385,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::pay::PaymentOptions {
             self.confirmations.into_into_dart().into_dart(),
             self.category.into_into_dart().into_dart(),
             self.hardware_signing.into_into_dart().into_dart(),
+            self.external_pczt_signing.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -16165,6 +16168,7 @@ impl SseEncode for crate::api::pay::PaymentOptions {
         <u32>::sse_encode(self.confirmations, serializer);
         <Option<u32>>::sse_encode(self.category, serializer);
         <bool>::sse_encode(self.hardware_signing, serializer);
+        <bool>::sse_encode(self.external_pczt_signing, serializer);
     }
 }
 

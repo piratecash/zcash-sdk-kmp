@@ -399,6 +399,7 @@ pub async fn step(
             Some(&preselected),
             None,  // anchor_height
             false, // hardware_signing
+            false, // external_pczt_signing
         )
         .await?;
 
@@ -491,6 +492,7 @@ pub async fn step(
             Some(&preselected),
             Some(anchor_height),
             false, // hardware_signing
+            false, // external_pczt_signing
         )
         .await?;
 

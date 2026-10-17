@@ -236,6 +236,26 @@ pub fn address_receivers(coin: u8, address: &str) -> Result<String> {
     Ok(serde_json::to_string(&dto)?)
 }
 
+/// The Orchard receiver of the unified `address` alone, encoded the way the Ledger Zcash app shows
+/// an Orchard or Ironwood recipient; `None` for any other address.
+pub fn orchard_only_address(coin: u8, address: &str) -> Option<String> {
+    receivers_of(coin, address).ok()?.oaddr
+}
+
+/// The `t1…` address a ZIP-320 TEX `address` encodes, which is what the Ledger Zcash app shows
+/// for it; `None` for any other address or another network.
+pub fn transparent_address_of_tex(coin: u8, address: &str) -> Option<String> {
+    let network = network_from_coin(coin);
+    match ZcashAddress::try_from_encoded(address)
+        .ok()?
+        .convert_if_network(network.network_type())
+        .ok()?
+    {
+        Address::Tex(data) => Some(TransparentAddress::PublicKeyHash(data).encode(&network)),
+        _ => None,
+    }
+}
+
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn list_accounts(c: &Coin) -> Result<Vec<Account>> {
     let mut connection = c.get_connection().await?;
@@ -386,6 +406,13 @@ pub async fn transparent_address_balance(c: &Coin, address: &str) -> Result<u64>
     let mut connection = c.get_connection().await?;
 
     crate::db::transparent_address_balance(&mut connection, c.account, address).await
+}
+
+/// Receive-scope derivation index of `address` when it is one of the account's own addresses.
+pub async fn transparent_receive_index(c: &Coin, address: &str) -> Result<Option<u32>> {
+    let mut connection = c.get_connection().await?;
+
+    crate::db::transparent_receive_index(&mut connection, c.account, address).await
 }
 
 #[cfg_attr(feature = "flutter", frb)]
@@ -1290,6 +1317,65 @@ mod tests {
     #[test]
     fn address_receivers_errors_on_a_malformed_address() {
         assert!(address_receivers(MAIN, "not an address").is_err());
+    }
+
+    #[test]
+    fn orchard_only_address_of_a_ua_without_orchard_is_none() {
+        let (ua, _) = main_addresses();
+        let (_, decoded) = zcash_address::unified::Address::decode(&ua).expect("decode");
+        let without_orchard = decoded
+            .items()
+            .into_iter()
+            .filter(|item| !matches!(item, zcash_address::unified::Receiver::Orchard(_)))
+            .collect();
+        let transparent_and_sapling =
+            zcash_address::unified::Address::try_from_items(without_orchard)
+                .expect("ua")
+                .encode(&network_from_coin(MAIN).network_type());
+
+        assert_eq!(orchard_only_address(MAIN, &shielded_only_ua()), None);
+        assert_eq!(orchard_only_address(MAIN, &transparent_and_sapling), None);
+    }
+
+    #[test]
+    fn orchard_only_address_of_a_transparent_or_sapling_address_is_none() {
+        let (ua, receivers) = main_addresses();
+
+        assert!(orchard_only_address(MAIN, &ua).is_some());
+        assert_eq!(
+            orchard_only_address(MAIN, &receivers.taddr.expect("taddr")),
+            None
+        );
+        assert_eq!(
+            orchard_only_address(MAIN, &receivers.saddr.expect("saddr")),
+            None
+        );
+        assert_eq!(orchard_only_address(TEST, &ua), None);
+    }
+
+    /// ZIP-320, and the `tex` test of zcash_address `encoding.rs`.
+    const ZIP320_TEX: &str = "tex1s2rt77ggv6q989lr49rkgzmh5slsksa9khdgte";
+    const ZIP320_P2PKH: &str = "t1VmmGiyjVNeCjxDZzg7vZmd99WyzVby9yC";
+
+    #[test]
+    fn transparent_address_of_tex_is_the_p2pkh_address_it_encodes() {
+        assert_eq!(
+            transparent_address_of_tex(MAIN, ZIP320_TEX).as_deref(),
+            Some(ZIP320_P2PKH)
+        );
+    }
+
+    #[test]
+    fn transparent_address_of_tex_of_anything_else_is_none() {
+        let (ua, receivers) = main_addresses();
+
+        assert_eq!(transparent_address_of_tex(MAIN, ZIP320_P2PKH), None);
+        assert_eq!(
+            transparent_address_of_tex(MAIN, &receivers.saddr.expect("saddr")),
+            None
+        );
+        assert_eq!(transparent_address_of_tex(MAIN, &ua), None);
+        assert_eq!(transparent_address_of_tex(TEST, ZIP320_TEX), None);
     }
 
     #[test]

@@ -229,6 +229,142 @@ internal data class TransparentSigningOutputDto(
 internal fun parseTransparentSigningRequest(json: String): TransparentSigningRequest =
     nativeJson.decodeFromString<TransparentSigningRequestDto>(json).toTransparentSigningRequest()
 
+/** Bridges rlz's `ExternalSigningView`, plain snake_case like [TransparentSigningRequestDto]. */
+@Serializable
+internal data class ExternalSigningViewDto(
+    @SerialName("tx_version") val txVersion: Int,
+    @SerialName("version_group_id") val versionGroupId: Long,
+    @SerialName("consensus_branch_id") val consensusBranchId: Long,
+    @SerialName("fallback_lock_time") val fallbackLockTime: Long? = null,
+    @SerialName("expiry_height") val expiryHeight: Int,
+    @SerialName("coin_type") val coinType: Int,
+    @SerialName("tx_modifiable") val txModifiable: Int,
+    @SerialName("transparent_inputs") val transparentInputs: List<ExternalTransparentInputDto>,
+    @SerialName("transparent_outputs") val transparentOutputs: List<ExternalTransparentOutputDto>,
+    val orchard: ExternalActionBundleDto? = null,
+    val ironwood: ExternalActionBundleDto? = null,
+) {
+    fun toExternalSigningView(): ExternalSigningView = ExternalSigningView(
+        txVersion = txVersion,
+        versionGroupId = versionGroupId,
+        consensusBranchId = consensusBranchId,
+        fallbackLockTime = fallbackLockTime,
+        expiryHeight = expiryHeight,
+        coinType = coinType,
+        txModifiable = txModifiable,
+        transparentInputs = transparentInputs.map(ExternalTransparentInputDto::toModel),
+        transparentOutputs = transparentOutputs.map(ExternalTransparentOutputDto::toModel),
+        orchard = orchard?.toModel(),
+        ironwood = ironwood?.toModel(),
+    )
+}
+
+@Serializable
+internal data class ExternalKeyDerivationDto(
+    val pubkey: String,
+    @SerialName("seed_fingerprint") val seedFingerprint: String,
+    val path: List<Long>,
+) {
+    fun toModel(): ExternalKeyDerivation = ExternalKeyDerivation(pubkey, seedFingerprint, path)
+}
+
+@Serializable
+internal data class ExternalTransparentInputDto(
+    @SerialName("prevout_txid") val prevoutTxid: String,
+    @SerialName("prevout_index") val prevoutIndex: Int,
+    val sequence: Long? = null,
+    val value: Long,
+    @SerialName("script_pubkey") val scriptPubkey: String,
+    @SerialName("sighash_type") val sighashType: Int,
+    val derivation: ExternalKeyDerivationDto,
+) {
+    fun toModel(): ExternalTransparentInput = ExternalTransparentInput(
+        prevoutTxid = prevoutTxid,
+        prevoutIndex = prevoutIndex,
+        sequence = sequence,
+        value = value,
+        scriptPubkey = scriptPubkey,
+        sighashType = sighashType,
+        derivation = derivation.toModel(),
+    )
+}
+
+@Serializable
+internal data class ExternalTransparentOutputDto(
+    val value: Long,
+    @SerialName("script_pubkey") val scriptPubkey: String,
+    val derivation: ExternalKeyDerivationDto? = null,
+) {
+    fun toModel(): ExternalTransparentOutput = ExternalTransparentOutput(value, scriptPubkey, derivation?.toModel())
+}
+
+@Serializable
+internal data class ExternalActionBundleDto(
+    val actions: List<ExternalActionDto>,
+    val flags: Int,
+    @SerialName("value_balance") val valueBalance: Long,
+    val anchor: String,
+    @SerialName("note_plaintext_version") val notePlaintextVersion: Int,
+    @SerialName("sign_indices") val signIndices: List<Int>,
+) {
+    fun toModel(): ExternalActionBundle = ExternalActionBundle(
+        actions = actions.map(ExternalActionDto::toModel),
+        flags = flags,
+        valueBalance = valueBalance,
+        anchor = anchor,
+        notePlaintextVersion = notePlaintextVersion,
+        signIndices = signIndices,
+    )
+}
+
+@Serializable
+internal data class ExternalActionDto(
+    @SerialName("cv_net") val cvNet: String,
+    val nullifier: String,
+    val rk: String,
+    @SerialName("spend_recipient") val spendRecipient: String,
+    @SerialName("spend_value") val spendValue: Long,
+    @SerialName("spend_rho") val spendRho: String,
+    @SerialName("spend_rseed") val spendRseed: String,
+    val alpha: String,
+    @SerialName("seed_fingerprint") val seedFingerprint: String,
+    val path: List<Long>,
+    val cmx: String,
+    @SerialName("ephemeral_key") val ephemeralKey: String,
+    @SerialName("enc_ciphertext") val encCiphertext: String,
+    @SerialName("out_ciphertext") val outCiphertext: String,
+    val recipient: String,
+    @SerialName("recipient_address") val recipientAddress: String,
+    val value: Long,
+    val rseed: String,
+    val rcv: String,
+) {
+    fun toModel(): ExternalAction = ExternalAction(
+        cvNet = cvNet,
+        nullifier = nullifier,
+        rk = rk,
+        spendRecipient = spendRecipient,
+        spendValue = spendValue,
+        spendRho = spendRho,
+        spendRseed = spendRseed,
+        alpha = alpha,
+        seedFingerprint = seedFingerprint,
+        path = path,
+        cmx = cmx,
+        ephemeralKey = ephemeralKey,
+        encCiphertext = encCiphertext,
+        outCiphertext = outCiphertext,
+        recipient = recipient,
+        recipientAddress = recipientAddress,
+        value = value,
+        rseed = rseed,
+        rcv = rcv,
+    )
+}
+
+internal fun parseExternalSigningView(json: String): ExternalSigningView =
+    nativeJson.decodeFromString<ExternalSigningViewDto>(json).toExternalSigningView()
+
 /** The native layer returns available, locked, change, value per pool in [Pool] bit order. */
 internal fun LongArray.toPoolBalance(): PoolBalance =
     PoolBalance(
