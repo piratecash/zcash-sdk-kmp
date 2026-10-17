@@ -1067,7 +1067,11 @@ pub(crate) mod tests {
         let keys = speculos_keys();
         let package = planned_package(&keys, Fixture::V5Orchard);
         let mut signatures = device_signatures(&keys, &package);
-        signatures.transparent[0].1.pop();
+        // Not `pop()`: the DER body's own last byte is 0x01 once in 256 runs.
+        *signatures.transparent[0]
+            .1
+            .last_mut()
+            .expect("sighash type byte") = 0x02;
 
         let error = apply(&package, &signatures)
             .err()
