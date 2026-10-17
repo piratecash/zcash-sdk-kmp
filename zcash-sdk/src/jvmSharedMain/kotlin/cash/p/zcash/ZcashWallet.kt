@@ -22,6 +22,7 @@ private const val DEFAULT_GAP_LIMIT = 20
 private const val DEFAULT_DISCOVERY_CONCURRENCY = 8
 private const val PROGRESS_SAMPLE_MS = 250L
 private const val MEMPOOL_POLL_MS = 500L
+private const val SPEND_AUTH_SIGNATURE_SIZE = 64
 private val logger = Logger.withTag("ZEC")
 
 internal interface SyncBackend {
@@ -377,6 +378,15 @@ public class ZcashWallet private constructor(
     }
 
     /**
+     * The receive-scope derivation index of [address] when it is one of [id]'s own transparent addresses the SDK
+     * has stored, or `null` otherwise. Reads the address table only: nothing is derived or fetched.
+     */
+    public suspend fun transparentAddressIndex(id: Int, address: String): Int? {
+        require(address.isNotBlank()) { "Address must not be blank" }
+        return withNative { ZcashJni.transparentAddressIndex(handle, id, address).takeIf { it >= 0 } }
+    }
+
+    /**
      * Re-derives the transparent addresses [id] handed out before it was restored and stores those
      * the server knows a transaction for. A restore keeps the keys but not the address rows, so
      * money received on a one-time address stays invisible until this runs. Returns how many
@@ -429,6 +439,7 @@ public class ZcashWallet private constructor(
             options.smartTransparent,
             options.confirmations,
             options.hardwareSigning,
+            options.externalPcztSigning,
         )
         PreparedTransaction(bytes)
     }
@@ -492,6 +503,56 @@ public class ZcashWallet private constructor(
         require(sigs.none { it.isEmpty() }) { "sigs must not contain an empty signature" }
         return withNative {
             PreparedTransaction(ZcashJni.applyTransparentSignatures(transaction.bytes, indices, sigs))
+        }
+    }
+
+    /**
+     * Adds the zero-knowledge proofs to [transaction], which must come from a [prepare] with
+     * `externalPcztSigning = true`. Needs no spending key and no network.
+     */
+    public suspend fun proveForExternalSigner(transaction: PreparedTransaction): PreparedTransaction =
+        withNative { PreparedTransaction(ZcashJni.proveTransaction(transaction.bytes)) }
+
+    /**
+     * What an external device needs to review and sign [transaction], with every path under the
+     * device's ZIP-32/BIP-44 account [accountIndex]. Stateless, like [transparentSigningRequest].
+     */
+    public suspend fun externalSigningView(
+        transaction: PreparedTransaction,
+        accountIndex: Int,
+    ): ExternalSigningView {
+        require(accountIndex >= 0) { "Account index must not be negative: $accountIndex" }
+        return withNative {
+            parseExternalSigningView(ZcashJni.externalSigningView(network.coin, transaction.bytes, accountIndex))
+        }
+    }
+
+    /**
+     * Applies the device's [signatures] to [transaction] and finalizes it, ready for [extract].
+     * Every signature is verified natively; each action or input to sign needs exactly one.
+     */
+    public suspend fun applyExternalSignatures(
+        transaction: PreparedTransaction,
+        signatures: ExternalSignatures,
+    ): PreparedTransaction {
+        val all = signatures.orchard + signatures.ironwood
+        require((all.keys + signatures.transparent.keys).none { it < 0 }) { "Signature indices must not be negative" }
+        require(all.values.all { it.size == SPEND_AUTH_SIGNATURE_SIZE }) {
+            "Orchard and Ironwood signatures must be $SPEND_AUTH_SIGNATURE_SIZE bytes"
+        }
+        require(signatures.transparent.values.none { it.isEmpty() }) { "Transparent signatures must not be empty" }
+        return withNative {
+            PreparedTransaction(
+                ZcashJni.applyExternalSignatures(
+                    transaction.bytes,
+                    signatures.orchard.keys.toIntArray(),
+                    signatures.orchard.values.toTypedArray(),
+                    signatures.ironwood.keys.toIntArray(),
+                    signatures.ironwood.values.toTypedArray(),
+                    signatures.transparent.keys.toIntArray(),
+                    signatures.transparent.values.toTypedArray(),
+                ),
+            )
         }
     }
 

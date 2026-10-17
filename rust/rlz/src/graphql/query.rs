@@ -404,6 +404,7 @@ pub async fn prepare_tx(
         None,  // preselected
         None,  // anchor_height
         false, // hardware_signing
+        false, // external_pczt_signing
     )
     .await?;
     Ok(pczt)

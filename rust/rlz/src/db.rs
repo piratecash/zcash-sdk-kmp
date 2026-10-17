@@ -2268,6 +2268,23 @@ pub async fn transparent_address_balance(
     Ok(balance.max(0) as u64)
 }
 
+/// Receive-scope derivation index of `address` when it is one of `account`'s own addresses.
+pub async fn transparent_receive_index(
+    connection: &mut SqliteConnection,
+    account: u32,
+    address: &str,
+) -> Result<Option<u32>> {
+    let dindex = sqlx::query_scalar(
+        "SELECT dindex FROM transparent_address_accounts
+        WHERE account = ?1 AND scope = 0 AND address = ?2",
+    )
+    .bind(account)
+    .bind(address)
+    .fetch_optional(&mut *connection)
+    .await?;
+    Ok(dindex)
+}
+
 /// The account's own default address first, then every other receive address, then the newest
 /// `limit` change addresses, plus any older change address that still holds an unspent note —
 /// otherwise a Suite-side spend on it would go unrecorded once it fell out of the window — plus
@@ -3664,6 +3681,45 @@ pub(crate) mod tests {
             .expect("balance");
 
         assert_eq!(balance, 0);
+    }
+
+    async fn store_taddress(
+        connection: &mut SqliteConnection,
+        scope: u32,
+        dindex: u32,
+        address: &str,
+    ) {
+        store_account_transparent_addr(
+            connection, ACCOUNT, scope, dindex, None, b"pk", address, false,
+        )
+        .await
+        .expect("store");
+    }
+
+    #[tokio::test]
+    async fn transparent_receive_index_finds_an_own_receive_address() {
+        let mut connection = memory_db().await;
+        store_taddress(&mut connection, 0, 5, "t1receive").await;
+        store_taddress(&mut connection, 1, 3, "t1change").await;
+
+        let receive = transparent_receive_index(&mut connection, ACCOUNT, "t1receive").await;
+        let change = transparent_receive_index(&mut connection, ACCOUNT, "t1change").await;
+
+        assert_eq!(receive.expect("index"), Some(5));
+        assert_eq!(change.expect("index"), None);
+    }
+
+    #[tokio::test]
+    async fn transparent_receive_index_of_a_foreign_address_is_none() {
+        let mut connection = memory_db().await;
+        store_taddress(&mut connection, 0, 5, "t1receive").await;
+
+        let unknown = transparent_receive_index(&mut connection, ACCOUNT, "t1other").await;
+        let other_account =
+            transparent_receive_index(&mut connection, ACCOUNT + 1, "t1receive").await;
+
+        assert_eq!(unknown.expect("index"), None);
+        assert_eq!(other_account.expect("index"), None);
     }
 
     /// The signal `generate_next_transparent_address` retries on.

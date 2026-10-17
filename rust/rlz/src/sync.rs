@@ -3988,9 +3988,8 @@ mod tests {
         Stall,
         /// Cancels the walk, then never answers.
         CancelsThenStalls(CancellationToken),
-        /// Answers empty and cancels the walk only once the reply is off the wire, so the whole
-        /// batch is prefetched successfully and the cancellation lands before the ingest.
-        CancelsAfterReplying(CancellationToken),
+        /// Cancels the walk as it answers empty, so only the ingest can see the cancellation.
+        CancelsWhileReplying(CancellationToken),
         /// Stores another index's address row through its own connection first — what a concurrent
         /// `next_unused_transparent_address` does while a probe is in flight.
         StoresRow {
@@ -4182,8 +4181,8 @@ mod tests {
                     token.cancel();
                     Ok(self.stalling_stream())
                 }
-                Reply::CancelsAfterReplying(token) => {
-                    tokio::spawn(async move { token.cancel() });
+                Reply::CancelsWhileReplying(token) => {
+                    token.cancel();
                     let (_sender, receiver) = channel(1);
                     Ok(ReceiverStream::new(receiver))
                 }
@@ -4962,7 +4961,7 @@ mod tests {
         let last = taddress_at(&mut connection, account, 1, 2).await;
         let token = CancellationToken::new();
         let server = ScriptedServer::default();
-        server.always(&last, Reply::CancelsAfterReplying(token.clone()));
+        server.always(&last, Reply::CancelsWhileReplying(token.clone()));
         let mut client: Client = Box::new(server);
 
         let error = discover_transparent_addresses(

@@ -70,8 +70,9 @@ use crate::{
     keys::{sapling_pgk_for_scope, sapling_ssk_for_scope, SaplingFullViewingKey},
     pay::{
         error::Error,
+        external,
         fee::COST_PER_ACTION,
-        pool::{PoolMask, NUM_POOLS},
+        pool::{PoolMask, ALL_POOLS, NUM_POOLS},
         prepare::to_zec,
         signing_key::SigningKey,
         solve, DecomposedRecipient, InputNote, ReceiverOption, Recipient, RecipientState,
@@ -295,12 +296,20 @@ pub async fn plan_transaction(
     // Forces a v5 (ZIP-244) transaction, the only version an external hardware signer
     // (e.g. Trezor) currently understands, regardless of the account's own `hw` flag.
     hardware_signing: bool,
+    // Plans for a signer that takes the PCZT field by field (e.g. Ledger): no Sapling, within
+    // the device's limits, and - unlike `hardware_signing` - the branch's own tx version.
+    external_pczt_signing: bool,
 ) -> Result<PcztPackage> {
+    let usable_pools = if external_pczt_signing {
+        external::USABLE_POOLS
+    } else {
+        ALL_POOLS
+    };
     let mut input_pools = fetch_unspent_notes_by_pool(connection, account).await?;
     let height = client.latest_height().await?;
     let confirmations = confirmations.unwrap_or_default();
     let max_height = crate::db::confirmed_height(&mut *connection, account, confirmations).await?;
-    restrict_to_source_pools(&mut input_pools, src_pools, max_height);
+    restrict_to_source_pools(&mut input_pools, src_pools & usable_pools, max_height);
 
     // Preselected filter: restrict to specific note IDs (e.g. migration)
     if let Some(ids) = preselected {
@@ -495,6 +504,9 @@ pub async fn plan_transaction(
                 .unwrap_or(dr.receiver.pool)
         })
         .collect();
+    if external_pczt_signing {
+        external::check_recipient_pools(&pool_prefs)?;
+    }
 
     let select_outputs: Vec<solve::Output> = pool_prefs
         .iter()
@@ -525,6 +537,7 @@ pub async fn plan_transaction(
         migration,
         recipient_pays_fee,
         recipients.first().map(|r| r.amount).unwrap_or(0),
+        usable_pools,
     )
     .ok_or_else(|| anyhow!("No feasible note selection found"))?;
 
@@ -1134,6 +1147,9 @@ pub async fn plan_transaction(
 
     let (pczt, shielded_sighash) = IoFinalizer::new(pczt).finalize_io().unwrap();
     info!("IO Finalized");
+    if external_pczt_signing {
+        external::check_device_limits(&pczt)?;
+    }
 
     // Issuer phase 2: sign the issue bundle
     let pczt = if let Some(info) = issuance {
@@ -1497,23 +1513,7 @@ pub async fn sign_transaction(
     span.in_scope(|| {
         info!("Adding Proofs to PCZT");
     });
-    let prover = Prover::new(pczt);
-    let prover = if prover.requires_sapling_proofs() {
-        let sapling_prover = get_sapling_prover().await?;
-        prover
-            .create_sapling_proofs(sapling_prover, sapling_prover)
-            .map_err(|error| anyhow!("failed to create Sapling proofs: {error:?}"))?
-    } else {
-        prover
-    };
-
-    let pczt = prover
-        .create_orchard_proof(orchard_pk)
-        .map_err(|error| anyhow!("failed to create Orchard proof: {error:?}"))?
-        .create_ironwood_proof(&IRONWOOD_PK)
-        .map_err(|error| anyhow!("failed to create Ironwood proof: {error:?}"))?
-        .finish();
-    info!("Proved");
+    let pczt = prove(pczt, orchard_pk).await?;
 
     let pczt = SpendFinalizer::new(pczt)
         .finalize_spends()
@@ -1534,6 +1534,28 @@ pub async fn sign_transaction(
         category: *category,
         is_issuance: *is_issuance,
     })
+}
+
+/// The Prover role: needs no spending key, only the PCZT and the circuit parameters.
+pub(super) async fn prove(pczt: Pczt, orchard_pk: &ProvingKey) -> Result<Pczt> {
+    let prover = Prover::new(pczt);
+    let prover = if prover.requires_sapling_proofs() {
+        let sapling_prover = get_sapling_prover().await?;
+        prover
+            .create_sapling_proofs(sapling_prover, sapling_prover)
+            .map_err(|error| anyhow!("failed to create Sapling proofs: {error:?}"))?
+    } else {
+        prover
+    };
+
+    let pczt = prover
+        .create_orchard_proof(orchard_pk)
+        .map_err(|error| anyhow!("failed to create Orchard proof: {error:?}"))?
+        .create_ironwood_proof(&IRONWOOD_PK)
+        .map_err(|error| anyhow!("failed to create Ironwood proof: {error:?}"))?
+        .finish();
+    info!("Proved");
+    Ok(pczt)
 }
 
 pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
@@ -1777,11 +1799,11 @@ fn wants_hardware_v5(hw: u8, hardware_signing: bool) -> bool {
 
 /// The change output's own derivation path, so an external signer can recognise the
 /// output as its own change rather than a payment to a third party.
-struct TransparentChangeLabel {
-    pubkey: PublicKey,
-    scope: u32,
-    dindex: u32,
-    address: String,
+pub(super) struct TransparentChangeLabel {
+    pub(super) pubkey: PublicKey,
+    pub(super) scope: u32,
+    pub(super) dindex: u32,
+    pub(super) address: String,
 }
 
 async fn load_transparent_change_label(
@@ -1809,7 +1831,7 @@ async fn load_transparent_change_label(
 /// Labels a planned transparent bundle's outputs for an external signer: each recipient
 /// output gets the user-facing address it pays, and the change output (if any) gets its
 /// own BIP-32 derivation so the signer can recognise it as change rather than a payment.
-fn label_transparent_outputs(
+pub(super) fn label_transparent_outputs(
     mut u: zcash_transparent::pczt::Updater<'_>,
     recipient_addresses: Vec<String>,
     change: Option<TransparentChangeLabel>,
@@ -2005,33 +2027,13 @@ pub fn apply_transparent_signatures(
         ));
     }
 
-    let expected = package.n_spends[0];
-    let mut seen = vec![false; expected];
-    for &index in indices {
-        let index = index as usize;
-        if index >= expected {
-            return Err(anyhow!(
-                "transparent input index {index} is out of range: only {expected} transparent input(s)"
-            ));
-        }
-        if seen[index] {
-            return Err(anyhow!("duplicate signature for transparent input {index}"));
-        }
-        seen[index] = true;
-    }
-    if let Some(index) = seen.iter().position(|signed| !signed) {
-        return Err(anyhow!("missing a signature for transparent input {index}"));
-    }
+    let expected: Vec<usize> = (0..package.n_spends[0]).collect();
+    check_signature_cover(indices, &expected, "transparent input")?;
 
     let signatures = indices
         .iter()
         .zip(sigs.iter())
-        .map(|(&index, sig)| {
-            let signature = secp256k1::ecdsa::Signature::from_der(sig).map_err(|error| {
-                anyhow!("signature for transparent input {index} is not valid DER: {error}")
-            })?;
-            Ok((index as usize, signature))
-        })
+        .map(|(&index, sig)| Ok((index as usize, parse_transparent_signature(index, sig)?)))
         .collect::<Result<Vec<_>>>()?;
 
     let pczt =
@@ -2039,36 +2041,85 @@ pub fn apply_transparent_signatures(
     let mut signer =
         Signer::new(pczt).map_err(|error| anyhow!("failed to start signing session: {error:?}"))?;
     for (index, signature) in signatures {
-        signer
-            .append_transparent_signature(index, signature)
-            .map_err(|error| match error {
-                pczt::roles::signer::Error::InvalidIndex => {
-                    anyhow!("transparent input index {index} is out of range")
-                }
-                pczt::roles::signer::Error::TransparentSign(error) => anyhow!(
-                    "signature for transparent input {index} failed sighash verification: {error:?}"
-                ),
-                other => {
-                    anyhow!("failed to apply signature for transparent input {index}: {other:?}")
-                }
-            })?;
+        append_transparent_signature(&mut signer, index, signature)?;
     }
+    finalize_signed(package, signer)
+}
 
-    let pczt = signer.finish();
-    let pczt = SpendFinalizer::new(pczt)
+/// Every index in `indices` is one of `expected`, none repeats, and none of `expected` is left out.
+pub(super) fn check_signature_cover(indices: &[u32], expected: &[usize], what: &str) -> Result<()> {
+    let mut seen = vec![false; expected.len()];
+    for &index in indices {
+        let slot = expected
+            .iter()
+            .position(|&e| e == index as usize)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{what} index {index} is out of range: the {what}s to sign are {expected:?}"
+                )
+            })?;
+        if seen[slot] {
+            return Err(anyhow!("duplicate signature for {what} {index}"));
+        }
+        seen[slot] = true;
+    }
+    if let Some(slot) = seen.iter().position(|signed| !signed) {
+        return Err(anyhow!("missing a signature for {what} {}", expected[slot]));
+    }
+    Ok(())
+}
+
+pub(super) fn parse_transparent_signature(
+    index: u32,
+    der: &[u8],
+) -> Result<secp256k1::ecdsa::Signature> {
+    secp256k1::ecdsa::Signature::from_der(der).map_err(|error| {
+        anyhow!("signature for transparent input {index} is not valid DER: {error}")
+    })
+}
+
+pub(super) fn append_transparent_signature(
+    signer: &mut Signer,
+    index: usize,
+    signature: secp256k1::ecdsa::Signature,
+) -> Result<()> {
+    signer
+        .append_transparent_signature(index, signature)
+        .map_err(|error| match error {
+            pczt::roles::signer::Error::InvalidIndex => {
+                anyhow!("transparent input index {index} is out of range")
+            }
+            pczt::roles::signer::Error::TransparentSign(error) => anyhow!(
+                "signature for transparent input {index} failed sighash verification: {error:?}"
+            ),
+            other => anyhow!("failed to apply signature for transparent input {index}: {other:?}"),
+        })
+}
+
+/// Finalizes the spends of a fully signed PCZT; the result is ready for [`extract_transaction`].
+pub(super) fn finalize_signed(package: &PcztPackage, signer: Signer) -> Result<PcztPackage> {
+    let pczt = SpendFinalizer::new(signer.finish())
         .finalize_spends()
         .map_err(|error| anyhow!("failed to finalize PCZT spends: {error:?}"))?;
+    repackage(package, pczt, true)
+}
 
+/// `package` with its PCZT replaced; every other field is carried over.
+pub(super) fn repackage(
+    package: &PcztPackage,
+    pczt: Pczt,
+    can_broadcast: bool,
+) -> Result<PcztPackage> {
     Ok(PcztPackage {
         pczt: pczt
             .serialize()
-            .map_err(|error| anyhow!("failed to serialize signed PCZT: {error:?}"))?,
+            .map_err(|error| anyhow!("failed to serialize PCZT: {error:?}"))?,
         n_spends: package.n_spends,
         sapling_indices: package.sapling_indices.clone(),
         orchard_indices: package.orchard_indices.clone(),
         ironwood_indices: package.ironwood_indices.clone(),
         can_sign: package.can_sign,
-        can_broadcast: true,
+        can_broadcast,
         price: package.price,
         category: package.category,
         is_issuance: package.is_issuance,

@@ -70,4 +70,11 @@ class PoolSetTest {
     fun paymentOptions_negativeConfirmations_areRejected() {
         assertFailsWith<IllegalArgumentException> { PaymentOptions(confirmations = -1) }
     }
+
+    @Test
+    fun paymentOptions_hardwareAndExternalPcztSigningTogether_areRejected() {
+        assertFailsWith<IllegalArgumentException> {
+            PaymentOptions(hardwareSigning = true, externalPcztSigning = true)
+        }
+    }
 }

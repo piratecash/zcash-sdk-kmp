@@ -124,6 +124,28 @@ private const val TRANSPARENT_SIGNING_FIXTURE_HEX =
         "000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000" +
         "000000000000000000000000000000000000000000000000000000000000000000000000"
 
+/** Speculos' default seed: what the Ledger emulator holds, never funds. */
+private const val SPECULOS_PHRASE =
+    "glory promote mansion idle axis finger extra february uncover one trip resource lawn turtle " +
+        "enact monster seven myth punch hobby comfort wild raise skin"
+
+/** app-zcash `tests/standalone/test_pubkey_cmd.py`: the device's GET_VK answer for account 0. */
+private const val DEVICE_UFVK_ACCOUNT_0 =
+    "uview1zkk7f8hp2m5v09kq7h29vkgngwhhvgy2ey32cy5j0kp69g7ju2vqjvnue03u99z382rtkgvj3f8vtqdtxfxvgjy" +
+        "tezgt39dqc0lyt2sj084jdq4md69snc3wxdcl8uah8sxw3rrt9pnxnfl3r4xnczapts7gr4l0cuell7dcjv36gkdcsl4a" +
+        "xps827xt6fgmfl78zlhddec72tn2p0eqnpkuy7a08puhj97v0ahxuqlyzmyqtldqnc0p3696d9ww8x6mpd56mz6w32twr" +
+        "yevru2rx34lf8dtqsp50gar"
+
+/** The same source: the device's GET_SHIELD_ADDR answer for account 0 (Orchard only, index 0). */
+private const val DEVICE_ORCHARD_ADDRESS_ACCOUNT_0 =
+    "u1u2h4ce7e2cn3z4nzur95muq2dl4da9x8h8kdp2l80gm9nl9raj8zzpx79ycjnfvar4v5exea5pqr5y9qsnlp0cdunw" +
+        "f9yjjx5c4q7ar9"
+
+/** `m/44'/133'/0'/0/0` of [SPECULOS_PHRASE]: what speculos returned, derived independently with embit. */
+private const val DEVICE_TRANSPARENT_ADDRESS_ACCOUNT_0 = "t1LBsxhHpmugntmxBVBNh6MSvq2CmUE6g9X"
+
+private const val HARDENED = 0x8000_0000L
+
 /** BIP-39 passphrase, the "25th word": a different wallet from the very same phrase. */
 private const val TEST_PASSPHRASE = "pepper"
 
@@ -952,6 +974,167 @@ class ZcashWalletIntegrationTest {
             error.message.orEmpty().contains("is not valid DER"),
             "expected the native signer to reject the blob, got: ${error.message}",
         )
+    }
+
+    @Test
+    fun restoreAccount_ledgerDeviceUfvk_isAWatchAccountShowingTheDevicesOrchardAddress() = withWallet { wallet ->
+        val id = wallet.restoreAccount(
+            name = "ledger",
+            key = DEVICE_UFVK_ACCOUNT_0,
+            birthHeight = BIRTH_HEIGHT,
+            pools = PoolSet.of(Pool.TRANSPARENT, Pool.ORCHARD),
+        )
+
+        assertEquals(DEVICE_UFVK_ACCOUNT_0, wallet.viewingKey(id))
+        val addresses = wallet.addresses(id)
+        assertEquals(DEVICE_ORCHARD_ADDRESS_ACCOUNT_0, addresses.orchard)
+        assertNull(addresses.sapling)
+        assertEquals(0, addresses.diversifierIndex)
+    }
+
+    @Test
+    fun transparentAddressIndex_ledgerAccountAddresses_areTheirDerivationIndices() = withWallet { wallet ->
+        val id = wallet.restoreAccount(
+            name = "ledger",
+            key = DEVICE_UFVK_ACCOUNT_0,
+            birthHeight = BIRTH_HEIGHT,
+            pools = PoolSet.of(Pool.TRANSPARENT, Pool.ORCHARD),
+        )
+        val next = assertNotNull(wallet.nextTransparentAddress(id))
+
+        assertEquals(0, wallet.transparentAddressIndex(id, DEVICE_TRANSPARENT_ADDRESS_ACCOUNT_0))
+        assertEquals(1, wallet.transparentAddressIndex(id, next))
+    }
+
+    @Test
+    fun transparentAddressIndex_addressOfAnotherWallet_isNull() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertNull(wallet.transparentAddressIndex(id, DEVICE_TRANSPARENT_ADDRESS_ACCOUNT_0))
+    }
+
+    @Test
+    fun orchardOnlyAddress_ledgerAccountUnifiedAddress_isTheAddressTheDeviceReports() = runBlocking {
+        val unified = assertNotNull(
+            ZcashSdk.deriveAddressesFromViewingKey(DEVICE_UFVK_ACCOUNT_0, ZcashNetwork.MAIN).unified,
+        )
+
+        assertEquals(DEVICE_ORCHARD_ADDRESS_ACCOUNT_0, ZcashSdk.orchardOnlyAddress(unified, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun orchardOnlyAddress_transparentOrSaplingAddress_isNull() {
+        assertNull(ZcashSdk.orchardOnlyAddress(ECC_TRANSPARENT_RECEIVER, ZcashNetwork.MAIN))
+        assertNull(ZcashSdk.orchardOnlyAddress(ECC_SAPLING_RECEIVER, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun transparentAddressOfTex_texAddresses_areTheirP2pkhAddresses() {
+        // ZIP-320, and the `tex` test of zcash_address `encoding.rs`.
+        assertEquals(
+            "t1VmmGiyjVNeCjxDZzg7vZmd99WyzVby9yC",
+            ZcashSdk.transparentAddressOfTex("tex1s2rt77ggv6q989lr49rkgzmh5slsksa9khdgte", ZcashNetwork.MAIN),
+        )
+        assertEquals(ECC_TRANSPARENT_RECEIVER, ZcashSdk.transparentAddressOfTex(ECC_TEX_RECEIVER, ZcashNetwork.MAIN))
+    }
+
+    @Test
+    fun transparentAddressOfTex_otherAddressesOrNetwork_isNull() {
+        assertNull(ZcashSdk.transparentAddressOfTex(ECC_TRANSPARENT_RECEIVER, ZcashNetwork.MAIN))
+        assertNull(ZcashSdk.transparentAddressOfTex(ECC_SAPLING_RECEIVER, ZcashNetwork.MAIN))
+        assertNull(ZcashSdk.transparentAddressOfTex(DEVICE_ORCHARD_ADDRESS_ACCOUNT_0, ZcashNetwork.MAIN))
+        assertNull(ZcashSdk.transparentAddressOfTex(ECC_TEX_RECEIVER, ZcashNetwork.TEST))
+    }
+
+    @Test
+    fun viewingKey_speculosPhraseRestrictedToTransparentAndOrchard_isTheDevicesUfvk() = withWallet { wallet ->
+        val id = wallet.restoreAccount(
+            name = "speculos",
+            key = SPECULOS_PHRASE,
+            birthHeight = BIRTH_HEIGHT,
+            pools = PoolSet.of(Pool.TRANSPARENT, Pool.ORCHARD),
+        )
+
+        assertEquals(DEVICE_UFVK_ACCOUNT_0, wallet.viewingKey(id))
+    }
+
+    @Test
+    fun externalSigningView_transparentFixture_reportsFullBip44Paths() = withWallet { wallet ->
+        val view = wallet.externalSigningView(
+            PreparedTransaction(TRANSPARENT_SIGNING_FIXTURE_HEX.hexToBytes()),
+            accountIndex = 2,
+        )
+
+        assertEquals(133, view.coinType)
+        val account = listOf(44 + HARDENED, 133 + HARDENED, 2 + HARDENED)
+        assertEquals(account + listOf(0L, 0L), view.transparentInputs.single().derivation.path)
+        assertNull(view.transparentOutputs[0].derivation)
+        assertEquals(account + listOf(1L, 3L), assertNotNull(view.transparentOutputs[1].derivation).path)
+        assertNull(view.orchard)
+        assertNull(view.ironwood)
+    }
+
+    @Test
+    fun externalSigningView_negativeAccountIndex_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        assertFailsWith<IllegalArgumentException> {
+            wallet.externalSigningView(PreparedTransaction(ByteArray(0)), accountIndex = -1)
+        }
+    }
+
+    @Test
+    fun proveForExternalSigner_transparentFixture_needsNoKeyAndLeavesTheViewUnchanged() = withWallet { wallet ->
+        val fixture = PreparedTransaction(TRANSPARENT_SIGNING_FIXTURE_HEX.hexToBytes())
+
+        val proved = wallet.proveForExternalSigner(fixture)
+
+        assertEquals(wallet.externalSigningView(fixture, 0), wallet.externalSigningView(proved, 0))
+    }
+
+    @Test
+    fun applyExternalSignatures_orchardSignatureForATransparentOnlyPackage_isRejectedNatively() =
+        withWallet { wallet ->
+            val error = assertFailsWith<ZcashException> {
+                wallet.applyExternalSignatures(
+                    PreparedTransaction(TRANSPARENT_SIGNING_FIXTURE_HEX.hexToBytes()),
+                    ExternalSignatures(
+                        orchard = mapOf(0 to ByteArray(64)),
+                        ironwood = emptyMap(),
+                        transparent = emptyMap(),
+                    ),
+                )
+            }
+
+            assertTrue(
+                error.message.orEmpty().contains("Orchard action index 0 is out of range"),
+                "unexpected error: ${error.message}",
+            )
+        }
+
+    @Test
+    fun applyExternalSignatures_transparentSignatureWithoutSighashType_isRejectedNatively() =
+        withWallet { wallet ->
+            val error = assertFailsWith<ZcashException> {
+                wallet.applyExternalSignatures(
+                    PreparedTransaction(TRANSPARENT_SIGNING_FIXTURE_HEX.hexToBytes()),
+                    ExternalSignatures(
+                        orchard = emptyMap(),
+                        ironwood = emptyMap(),
+                        transparent = mapOf(0 to byteArrayOf(0x30, 0x02)),
+                    ),
+                )
+            }
+
+            assertTrue(error.message.orEmpty().contains("SIGHASH_ALL"), "unexpected error: ${error.message}")
+        }
+
+    @Test
+    fun applyExternalSignatures_shortIronwoodSignature_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        assertFailsWith<IllegalArgumentException> {
+            wallet.applyExternalSignatures(
+                PreparedTransaction(ByteArray(0)),
+                ExternalSignatures(orchard = emptyMap(), ironwood = mapOf(0 to ByteArray(63)), transparent = emptyMap()),
+            )
+        }
     }
 
     @Test
