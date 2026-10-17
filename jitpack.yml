@@ -36,6 +36,8 @@ before_install:
         }
     }
     GRADLE
+    # JitPack joins the steps with ";", so the heredoc must not end the step.
+    echo "wrote $init_dir/central-mirror.gradle"
   - |
     (
       echo "== wrapper diagnostics"; pwd; ls -la gradle/wrapper; sha256sum gradle/wrapper/gradle-wrapper.jar || true
