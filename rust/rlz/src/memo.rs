@@ -48,6 +48,7 @@ pub async fn fetch_tx_details(
     for (id_tx, txid) in txids.iter() {
         match store_tx_details(network, connection, client, account, *id_tx, txid).await {
             Ok(()) => succeeded = true,
+            Err(e) if server_stopped_answering(&e) => return Err(e),
             Err(e) => {
                 tracing::warn!("details of {} not fetched: {e:#}", hex::encode(txid));
                 failure = Some(e);
@@ -58,6 +59,16 @@ pub async fn fetch_tx_details(
         Some(e) if !succeeded => Err(e.context("no transaction's details could be fetched")),
         _ => Ok(()),
     }
+}
+
+/// Every further request would wait out its own deadline, holding back the sync and server failover.
+fn server_stopped_answering(error: &anyhow::Error) -> bool {
+    matches!(
+        error
+            .downcast_ref::<tonic::Status>()
+            .map(tonic::Status::code),
+        Some(tonic::Code::DeadlineExceeded | tonic::Code::Unavailable)
+    )
 }
 
 async fn store_tx_details(
@@ -625,6 +636,10 @@ mod tests {
     const ACCOUNT: u32 = 1;
     const FAILING_TXID: u8 = 7;
     const SERVED_TXID: u8 = 8;
+    const TIMED_OUT_TXID: u8 = 9;
+    const UNAVAILABLE_TXID: u8 = 10;
+    /// Sorts after the unanswered ids: pending transactions come back in txid order.
+    const LAST_TXID: u8 = 11;
 
     /// Serves one transaction under `SERVED_TXID` if it has one, recording every txid asked for.
     #[derive(Clone)]
@@ -663,6 +678,11 @@ mod tests {
             txid: &[u8],
         ) -> Result<(u32, Transaction)> {
             self.asked.lock().unwrap().push(txid[0]);
+            match txid[0] {
+                TIMED_OUT_TXID => return Err(tonic::Status::deadline_exceeded("timed out").into()),
+                UNAVAILABLE_TXID => return Err(tonic::Status::unavailable("gone").into()),
+                _ => {}
+            }
             match &self.served {
                 Some(raw) if txid[0] == SERVED_TXID => {
                     Ok((100, Transaction::read(&raw[..], BranchId::Nu6_3)?))
@@ -701,8 +721,12 @@ mod tests {
     }
 
     async fn db_with_pending_transactions() -> SqliteConnection {
+        db_with_pending(&[FAILING_TXID, SERVED_TXID]).await
+    }
+
+    async fn db_with_pending(txids: &[u8]) -> SqliteConnection {
         let mut connection = memory_db().await;
-        for txid in [FAILING_TXID, SERVED_TXID] {
+        for txid in txids.iter().copied() {
             sqlx::query("INSERT INTO transactions(txid, height, account) VALUES (?, 100, ?)")
                 .bind(vec![txid])
                 .bind(ACCOUNT)
@@ -738,6 +762,26 @@ mod tests {
             "{error}"
         );
         assert_eq!(*asked.lock().unwrap(), vec![FAILING_TXID, SERVED_TXID]);
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_server_stops_answering_returns_error_and_asks_no_further() {
+        for unanswered in [TIMED_OUT_TXID, UNAVAILABLE_TXID] {
+            let mut connection = db_with_pending(&[SERVED_TXID, unanswered, LAST_TXID]).await;
+            let asked = Arc::new(Mutex::new(vec![]));
+            let (raw, _) = crate::pay::reserve::tests::transparent_transaction();
+            let mut client: Client = Box::new(OneTransactionServer {
+                served: Some(raw),
+                asked: asked.clone(),
+            });
+
+            let result =
+                fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT).await;
+
+            assert!(result.is_err(), "txid {unanswered}");
+            assert!(details_done(&mut connection, SERVED_TXID).await);
+            assert_eq!(*asked.lock().unwrap(), vec![SERVED_TXID, unanswered]);
+        }
     }
 
     #[tokio::test]
