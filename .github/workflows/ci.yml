@@ -67,6 +67,11 @@ jobs:
           echo 'C:\Strawberry\perl\bin' >> "$GITHUB_PATH"
           echo 'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' >> "$GITHUB_ENV"
 
+      # This image installs rustup through its package manager, so ~/.cargo/bin/cargo does not exist.
+      - name: Point Gradle at the installed cargo
+        if: runner.os == 'macOS'
+        run: echo "CARGO=$(command -v cargo)" >> "$GITHUB_ENV"
+
       - name: Test desktop target
         shell: bash
         run: ./gradlew :zcash-sdk:desktopTest -PzcashSdk.rustRelease=true --console=plain
