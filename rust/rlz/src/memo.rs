@@ -68,11 +68,13 @@ async fn store_tx_details(
     id_tx: u32,
     txid: &[u8],
 ) -> Result<()> {
-    decrypt_memo(network, connection, client, account, txid).await?;
+    let fetched = decrypt_memo(network, connection, client, account, txid).await;
+    // Summarized from local notes and spends, so history stays right while details are pending.
     let (tpe, value, asset_id, zsa_value) = summarize_tx(connection, id_tx).await?;
     sqlx::query(
-        "UPDATE transactions SET details = TRUE, tpe = ?, value = ?, zsa_value = ?, asset_id = ? WHERE id_tx = ?",
+        "UPDATE transactions SET details = ?, tpe = ?, value = ?, zsa_value = ?, asset_id = ? WHERE id_tx = ?",
     )
+    .bind(fetched.is_ok())
     .bind(tpe)
     .bind(value)
     .bind(zsa_value)
@@ -80,7 +82,7 @@ async fn store_tx_details(
     .bind(id_tx)
     .execute(&mut *connection)
     .await?;
-    Ok(())
+    fetched
 }
 
 async fn summarize_tx(
@@ -761,6 +763,58 @@ mod tests {
 
         assert!(retry.is_err());
         assert_eq!(*asked.lock().unwrap(), vec![FAILING_TXID]);
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_transaction_fails_summarizes_it_from_local_notes_and_keeps_it_pending(
+    ) {
+        let mut connection = db_with_pending_transactions().await;
+        let id_tx: u32 = sqlx::query_scalar("SELECT id_tx FROM transactions WHERE txid = ?")
+            .bind(vec![FAILING_TXID])
+            .fetch_one(&mut connection)
+            .await
+            .expect("id_tx");
+        for (note, tx, value) in [(1, 999, 100_000), (2, id_tx, 30_000)] {
+            sqlx::query(
+                "INSERT INTO notes(id_note, height, account, pool, nullifier, tx, value)
+                VALUES (?, 100, ?, 2, ?, ?, ?)",
+            )
+            .bind(note)
+            .bind(ACCOUNT)
+            .bind(vec![note as u8])
+            .bind(tx)
+            .bind(value)
+            .execute(&mut connection)
+            .await
+            .expect("insert note");
+        }
+        sqlx::query(
+            "INSERT INTO spends(id_note, height, account, pool, tx, value)
+            VALUES (1, 100, ?, 2, ?, -100000)",
+        )
+        .bind(ACCOUNT)
+        .bind(id_tx)
+        .execute(&mut connection)
+        .await
+        .expect("insert spend");
+        let (raw, _) = crate::pay::reserve::tests::transparent_transaction();
+        let mut client: Client = Box::new(OneTransactionServer {
+            served: Some(raw),
+            asked: Arc::new(Mutex::new(vec![])),
+        });
+
+        fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT)
+            .await
+            .expect("one transaction succeeded");
+
+        let (value, tpe): (i64, Option<u8>) =
+            sqlx::query_as("SELECT value, tpe FROM transactions WHERE id_tx = ?")
+                .bind(id_tx)
+                .fetch_one(&mut connection)
+                .await
+                .expect("summary");
+        assert_eq!((value, tpe), (-70_000, Some(2)));
+        assert!(!details_done(&mut connection, FAILING_TXID).await);
     }
 
     #[test]
