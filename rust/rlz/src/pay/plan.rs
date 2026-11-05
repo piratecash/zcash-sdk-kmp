@@ -83,6 +83,32 @@ use crate::{
 
 use zcash_primitives::transaction::zsa_builder::ZsaBuilder;
 
+fn is_zsa_at(network: &Network, height: u32) -> bool {
+    BranchId::for_height(network, BlockHeight::from_u32(height)) == BranchId::Zsa
+}
+
+fn orchard_note_version_at(network: &Network, height: u32) -> orchard::NoteVersion {
+    if is_zsa_at(network, height) {
+        orchard::NoteVersion::V3ZSA
+    } else {
+        orchard::NoteVersion::V2
+    }
+}
+
+pub(super) fn attach_asset_names(
+    updater: Updater,
+    network: &Network,
+    target_height: u32,
+    asset_names: &HashMap<[u8; 32], String>,
+) -> Result<Updater> {
+    if is_zsa_at(network, target_height) {
+        updater.update_orchard_zsa_with(|u| attach_orchard_asset_names(u, asset_names))
+    } else {
+        updater.update_orchard_with(|u| attach_orchard_asset_names(u, asset_names))
+    }
+    .map_err(|error| anyhow!("Failed to attach Orchard asset names: {error:?}"))
+}
+
 fn attach_orchard_asset_names<D: Domain>(
     mut updater: orchard::pczt::Updater<'_, D>,
     asset_names: &HashMap<[u8; 32], String>,
@@ -349,12 +375,7 @@ pub async fn plan_transaction(
 
     let ironwood_active =
         network.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(height));
-    let orchard_note_version =
-        if BranchId::for_height(network, BlockHeight::from_u32(height)) == BranchId::Nu7 {
-            orchard::NoteVersion::V3ZSA
-        } else {
-            orchard::NoteVersion::V2
-        };
+    let orchard_note_version = orchard_note_version_at(network, height);
     let decomposed: Vec<DecomposedRecipient> = recipients
         .iter()
         .map(|r| {
@@ -745,9 +766,9 @@ pub async fn plan_transaction(
 
     // Hardware (Ledger) wallets only support v5 (ZIP-244) transaction signing.
     // The Zondax "Zcash Shielded" app predates NU6.3 and cannot sign v6/Ironwood
-    // transactions, so force a v5 tx while keeping consensus_branch_id = Nu6_3
-    // (V5 is valid in Nu6_3 per TxVersion::valid_in_branch). A v5 tx carrying the
-    // current Nu6_3 branch id is valid on the network.
+    // transactions, so force a v5 tx while keeping the current consensus_branch_id
+    // (V5 is valid in Nu6_3 and Nu7 per TxVersion::valid_in_branch). A v5 tx carrying
+    // the current branch id is valid on the network.
     if wants_hardware_v5(hw, hardware_signing) {
         builder
             .propose_version::<()>(TxVersion::V5)
@@ -1121,13 +1142,7 @@ pub async fn plan_transaction(
         })
         .unwrap();
 
-    let updater =
-        if BranchId::for_height(network, BlockHeight::from_u32(target_height)) == BranchId::Nu7 {
-            updater.update_orchard_zsa_with(|u| attach_orchard_asset_names(u, &asset_names))
-        } else {
-            updater.update_orchard_with(|u| attach_orchard_asset_names(u, &asset_names))
-        }
-        .map_err(|error| anyhow!("Failed to attach Orchard asset names: {error:?}"))?;
+    let updater = attach_asset_names(updater, network, target_height, &asset_names)?;
 
     let pczt = updater.finish();
 
@@ -1784,8 +1799,8 @@ enum OrchardProvingKeyKind {
 
 fn orchard_proving_key_kind(branch_id: BranchId) -> OrchardProvingKeyKind {
     match branch_id {
-        BranchId::Nu7 => OrchardProvingKeyKind::Zsa,
-        BranchId::Nu6_3 => OrchardProvingKeyKind::Ironwood,
+        BranchId::Zsa => OrchardProvingKeyKind::Zsa,
+        BranchId::Nu6_3 | BranchId::Nu7 => OrchardProvingKeyKind::Ironwood,
         _ => OrchardProvingKeyKind::Vanilla,
     }
 }
@@ -2146,9 +2161,9 @@ mod tests {
         transparent_signing_request, verify_spending_key, Pczt, PcztPackage, NO_SPENDING_KEY,
     };
     use super::{
-        get_transparent_address, label_transparent_outputs, orchard_proving_key_kind,
-        wants_hardware_v5, BranchId, Creator, OrchardProvingKeyKind, Signer,
-        TransparentChangeLabel,
+        attach_asset_names, get_transparent_address, label_transparent_outputs,
+        orchard_note_version_at, orchard_proving_key_kind, wants_hardware_v5, BranchId, Creator,
+        OrchardProvingKeyKind, Signer, TransparentChangeLabel,
     };
     use super::{
         AssetBase, BlockHeight, BuildConfig, Builder, BundlePadding, FeeRule, IoFinalizer,
@@ -2160,7 +2175,9 @@ mod tests {
     use crate::api::coin::Network;
     use crate::db::tests::memory_db;
     use crate::keys::SaplingFullViewingKey as _;
+    use crate::pay::external::tests::{planned_package, speculos_keys, Fixture};
     use crate::pay::signing_key::{self, SigningKey};
+    use crate::pay::TxPlan;
     use bip32::{ExtendedPrivateKey, Prefix};
     use incrementalmerkletree::{Hashable, Level, Position};
     use pczt::roles::verifier::{TransparentError, Verifier};
@@ -2170,12 +2187,14 @@ mod tests {
     };
     use secp256k1::{PublicKey, SecretKey};
     use sha2::{Digest as _, Sha256};
+    use std::collections::HashMap;
     use std::convert::Infallible;
     use std::str::FromStr as _;
     use zcash_keys::encoding::encode_extended_spending_key;
     use zcash_keys::encoding::AddressCodec as _;
     use zcash_keys::keys::{sapling::ExtendedSpendingKey, Era, UnifiedSpendingKey};
     use zcash_protocol::consensus::NetworkConstants as _;
+    use zcash_protocol::memo::MemoBytes;
     use zcash_transparent::{keys::AccountPrivKey, pczt::Bip32Derivation};
 
     /// A second seed, built from entropy rather than a literal so it cannot rot.
@@ -3349,9 +3368,50 @@ mod tests {
     #[test]
     fn zsa_selects_zsa_orchard_proving_key() {
         assert_eq!(
-            orchard_proving_key_kind(BranchId::Nu7),
+            orchard_proving_key_kind(BranchId::Zsa),
             OrchardProvingKeyKind::Zsa,
         );
+    }
+
+    #[test]
+    fn official_nu7_selects_ironwood_not_zsa() {
+        assert_eq!(
+            orchard_proving_key_kind(BranchId::Nu7),
+            OrchardProvingKeyKind::Ironwood,
+        );
+    }
+
+    #[test]
+    fn orchard_note_version_at_official_nu7_height_is_v2() {
+        assert_eq!(
+            orchard_note_version_at(&Network::Main, MAINNET_NU7_HEIGHT),
+            orchard::NoteVersion::V2,
+        );
+    }
+
+    #[test]
+    fn orchard_note_version_at_coin_three_is_v3_zsa() {
+        let zsa_network = crate::api::coin::Coin::new(Some(3)).network();
+        assert_eq!(
+            orchard_note_version_at(&zsa_network, 1),
+            orchard::NoteVersion::V3ZSA,
+        );
+    }
+
+    #[test]
+    fn coin_two_stays_on_nu6_3_branch() {
+        let regtest = crate::api::coin::Coin::new(Some(2)).network();
+        let branch = BranchId::for_height(&regtest, BlockHeight::from_u32(250));
+        assert_eq!(branch, BranchId::Nu6_3);
+    }
+
+    #[test]
+    fn coin_three_retains_deployed_zsa_branch_id() {
+        let zsa_network = crate::api::coin::Coin::new(Some(3)).network();
+        let branch = BranchId::for_height(&zsa_network, BlockHeight::from_u32(1));
+        assert_eq!(branch, BranchId::Zsa);
+        assert_eq!(u32::from(branch), 0x7719_0ad8);
+        assert_ne!(branch, BranchId::Nu7);
     }
 
     #[test]
@@ -3374,6 +3434,12 @@ mod tests {
     /// version is `V6` — only `hardware_signing` can force `V5` here. Returns
     /// `(tx_version, version_group_id)` from the built header.
     fn built_pczt_header(hardware_signing: bool) -> (u32, u32) {
+        let pczt = built_pczt(3_500_000, hardware_signing);
+        let global = pczt.global();
+        (*global.tx_version(), *global.version_group_id())
+    }
+
+    fn built_pczt(target_height: u32, hardware_signing: bool) -> Pczt {
         let build_config = BuildConfig::Standard {
             sapling_anchor: None,
             orchard_anchor: None,
@@ -3383,7 +3449,7 @@ mod tests {
         };
         let mut builder = Builder::new(
             &Network::Main,
-            BlockHeight::from_u32(3_500_000),
+            BlockHeight::from_u32(target_height),
             build_config,
         );
         if wants_hardware_v5(0, hardware_signing) {
@@ -3392,16 +3458,8 @@ mod tests {
                 .expect("propose v5");
         }
 
-        let sk = SecretKey::from_slice(&[7u8; 32]).expect("secret key");
-        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
-        let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
-        let addr = TransparentAddress::PublicKeyHash(pkh);
-        let coin = TxOut::new(Zatoshis::const_from_u64(20_000), addr.script().into());
-        let utxo = OutPoint::new([9u8; 32], 0);
-        builder.add_transparent_input(
-            TransparentInputInfo::from_parts(utxo, coin, SpendInfo::P2pkh { pubkey })
-                .expect("input"),
-        );
+        let (input, addr) = transparent_coin(20_000);
+        builder.add_transparent_input(input);
         builder
             .add_transparent_output(&addr, Zatoshis::const_from_u64(10_000))
             .expect("output");
@@ -3413,9 +3471,154 @@ mod tests {
                 |_asset: &AssetBase| false,
             )
             .expect("build_for_pczt");
+        Creator::build_from_parts(r.pczt_parts).expect("creator")
+    }
+
+    fn transparent_coin(value: u64) -> (TransparentInputInfo, TransparentAddress) {
+        let sk = SecretKey::from_slice(&[7u8; 32]).expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
+        let addr = TransparentAddress::PublicKeyHash(pkh);
+        let coin = TxOut::new(Zatoshis::const_from_u64(value), addr.script().into());
+        let utxo = OutPoint::new([9u8; 32], 0);
+        let input = TransparentInputInfo::from_parts(utxo, coin, SpendInfo::P2pkh { pubkey })
+            .expect("input");
+        (input, addr)
+    }
+
+    /// A payment into Orchard on coin 3, whose bundle is in the ZSA format.
+    fn coin_three_orchard_output_package() -> (PcztPackage, Network) {
+        let network = crate::api::coin::Coin::new(Some(3)).network();
+        let build_config = BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: Some(orchard::Anchor::empty_tree()),
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        };
+        let mut builder = Builder::new(&network, BlockHeight::from_u32(1), build_config);
+        let (input, _) = transparent_coin(75_000);
+        builder.add_transparent_input(input);
+        let sk = orchard::keys::SpendingKey::from_bytes([9u8; 32]).expect("sk");
+        let recipient = orchard::keys::FullViewingKey::from(&sk)
+            .address_at(0u32, orchard::keys::Scope::External);
+        builder
+            .add_orchard_output::<Infallible>(
+                None,
+                recipient,
+                Zatoshis::const_from_u64(60_000),
+                AssetBase::zatoshi(),
+                MemoBytes::empty(),
+            )
+            .expect("output");
+        let r = builder
+            .build_for_pczt(
+                rand_core::OsRng,
+                &FeeRule::standard(),
+                |_asset: &AssetBase| false,
+            )
+            .expect("build_for_pczt");
         let pczt = Creator::build_from_parts(r.pczt_parts).expect("creator");
+        let package = PcztPackage {
+            pczt: pczt.serialize().expect("serialize"),
+            n_spends: [1, 0, 0, 0],
+            sapling_indices: vec![],
+            orchard_indices: vec![],
+            ironwood_indices: vec![],
+            can_sign: false,
+            can_broadcast: false,
+            price: None,
+            category: None,
+            is_issuance: false,
+        };
+        (package, network)
+    }
+
+    fn nu7_orchard_spend_package() -> PcztPackage {
+        planned_package(&speculos_keys(), Fixture::Nu7OrchardToIronwood)
+    }
+
+    #[test]
+    fn from_package_nu7_orchard_spend_reads_the_vanilla_orchard_bundle() {
+        let plan =
+            TxPlan::from_package(&Network::Main, &nu7_orchard_spend_package()).expect("plan");
+
+        assert!(plan
+            .inputs
+            .iter()
+            .any(|input| input.pool == 2 && input.amount == Some(100_000)));
+    }
+
+    #[test]
+    fn from_package_zsa_orchard_output_reads_the_zsa_bundle() {
+        let (package, network) = coin_three_orchard_output_package();
+
+        let plan = TxPlan::from_package(&network, &package).expect("plan");
+
+        assert!(plan
+            .outputs
+            .iter()
+            .any(|output| output.pool == 2 && output.amount == 60_000));
+    }
+
+    #[test]
+    fn attach_asset_names_nu7_orchard_spend_uses_the_vanilla_orchard_path() {
+        let pczt = Pczt::parse(&nu7_orchard_spend_package().pczt).expect("parse");
+
+        let result = attach_asset_names(
+            Updater::new(pczt),
+            &Network::Main,
+            MAINNET_NU7_HEIGHT,
+            &HashMap::new(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn attach_asset_names_zsa_orchard_output_uses_the_zsa_path() {
+        let (package, network) = coin_three_orchard_output_package();
+        let pczt = Pczt::parse(&package.pczt).expect("parse");
+
+        let result = attach_asset_names(Updater::new(pczt), &network, 1, &HashMap::new());
+
+        assert!(result.is_ok());
+    }
+
+    const MAINNET_NU7_HEIGHT: u32 = 3_543_405;
+    const NU7_WIRE_BRANCH_ID: u32 = 0x7719_0ad9;
+    const NU6_3_WIRE_BRANCH_ID: u32 = 0x37a5_165b;
+
+    #[test]
+    fn build_for_pczt_at_nu7_height_gives_v6_nu7_branch_and_expiry_120() {
+        let pczt = built_pczt(MAINNET_NU7_HEIGHT, false);
         let global = pczt.global();
-        (*global.tx_version(), *global.version_group_id())
+
+        assert_eq!(*global.tx_version(), 6);
+        assert_eq!(*global.version_group_id(), 0xD884_B698);
+        assert_eq!(*global.consensus_branch_id(), NU7_WIRE_BRANCH_ID);
+        assert_eq!(*global.expiry_height(), MAINNET_NU7_HEIGHT + 120);
+    }
+
+    #[test]
+    fn build_for_pczt_one_block_before_nu7_gives_nu6_3_branch_and_expiry_40() {
+        let target_height = MAINNET_NU7_HEIGHT - 1;
+        let pczt = built_pczt(target_height, false);
+        let global = pczt.global();
+
+        assert_eq!(*global.tx_version(), 6);
+        assert_eq!(*global.consensus_branch_id(), NU6_3_WIRE_BRANCH_ID);
+        assert_eq!(*global.expiry_height(), target_height + 40);
+    }
+
+    #[test]
+    fn build_for_pczt_hardware_signing_at_nu7_height_gives_v5_on_the_nu7_branch() {
+        let pczt = built_pczt(MAINNET_NU7_HEIGHT, true);
+        let global = pczt.global();
+
+        assert_eq!(*global.tx_version(), 5);
+        assert_eq!(*global.consensus_branch_id(), NU7_WIRE_BRANCH_ID);
+        assert_eq!(*global.expiry_height(), MAINNET_NU7_HEIGHT + 120);
     }
 
     #[test]

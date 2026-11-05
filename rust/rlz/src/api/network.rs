@@ -236,6 +236,9 @@ mod tests {
     const NU6_HEIGHT: u64 = 2_800_000;
     const NU6_BRANCH_ID: &str = "c8e71055";
     const NU5_BRANCH_ID: &str = "c2d6d0b4";
+    const NU7_HEIGHT: u64 = 3_543_405;
+    const NU7_BRANCH_ID: &str = "77190ad9";
+    const NU6_3_BRANCH_ID: &str = "37a5165b";
 
     /// Answers `GetLightdInfo` with `info` after `info_delay`, and a block range with at most
     /// `blocks_served` blocks after `range_delay`; `None` info never answers.
@@ -374,6 +377,33 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn measure_branch_id_of_another_upgrade_does_not_match() {
         let server = FakeLightwalletd::new(NU6_HEIGHT, NU5_BRANCH_ID);
+
+        let probe = measure_fake(&server, 10).await.expect("probe");
+
+        assert!(!probe.branch_id_matches);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn measure_nu7_height_with_nu7_branch_id_matches() {
+        let server = FakeLightwalletd::new(NU7_HEIGHT, NU7_BRANCH_ID);
+
+        let probe = measure_fake(&server, 10).await.expect("probe");
+
+        assert!(probe.branch_id_matches);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn measure_nu7_height_with_nu6_3_branch_id_does_not_match() {
+        let server = FakeLightwalletd::new(NU7_HEIGHT, NU6_3_BRANCH_ID);
+
+        let probe = measure_fake(&server, 10).await.expect("probe");
+
+        assert!(!probe.branch_id_matches);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn measure_height_before_nu7_with_nu7_branch_id_does_not_match() {
+        let server = FakeLightwalletd::new(NU7_HEIGHT - 1, NU7_BRANCH_ID);
 
         let probe = measure_fake(&server, 10).await.expect("probe");
 

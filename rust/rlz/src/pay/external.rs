@@ -590,8 +590,13 @@ pub(crate) mod tests {
     use zcash_primitives::transaction::{
         builder::{BuildConfig, Builder, BundlePadding},
         fees::zip317::FeeRule,
+        Transaction, TxVersion,
     };
-    use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis};
+    use zcash_protocol::{
+        consensus::{BlockHeight, BranchId},
+        memo::MemoBytes,
+        value::Zatoshis,
+    };
     use zcash_transparent::{
         address::TransparentAddress,
         builder::{SpendInfo, TransparentInputInfo},
@@ -612,6 +617,7 @@ pub(crate) mod tests {
     // NU6.2: the last branch whose transactions are v5 by default.
     const V5_HEIGHT: u32 = 3_400_000;
     const V6_HEIGHT: u32 = 3_500_000;
+    const NU7_HEIGHT: u32 = 3_543_405;
     const H: u32 = HARDENED;
 
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -627,6 +633,7 @@ pub(crate) mod tests {
         V6Ironwood,
         /// An old Orchard note spent after NU6.3: both bundles in one v6 transaction.
         V6OrchardToIronwood,
+        Nu7OrchardToIronwood,
     }
 
     impl Fixture {
@@ -634,12 +641,15 @@ pub(crate) mod tests {
             match self {
                 Fixture::V5Orchard => V5_HEIGHT,
                 Fixture::V6Ironwood | Fixture::V6OrchardToIronwood => V6_HEIGHT,
+                Fixture::Nu7OrchardToIronwood => NU7_HEIGHT,
             }
         }
 
         fn spend_pool(self) -> ShieldedPool {
             match self {
-                Fixture::V5Orchard | Fixture::V6OrchardToIronwood => ShieldedPool::Orchard,
+                Fixture::V5Orchard
+                | Fixture::V6OrchardToIronwood
+                | Fixture::Nu7OrchardToIronwood => ShieldedPool::Orchard,
                 Fixture::V6Ironwood => ShieldedPool::Ironwood,
             }
         }
@@ -649,7 +659,7 @@ pub(crate) mod tests {
         fn fee(self) -> u64 {
             match self {
                 Fixture::V5Orchard | Fixture::V6Ironwood => 15_000,
-                Fixture::V6OrchardToIronwood => 25_000,
+                Fixture::V6OrchardToIronwood | Fixture::Nu7OrchardToIronwood => 25_000,
             }
         }
 
@@ -661,7 +671,9 @@ pub(crate) mod tests {
         fn output_pool(self) -> ShieldedPool {
             match self {
                 Fixture::V5Orchard => ShieldedPool::Orchard,
-                Fixture::V6Ironwood | Fixture::V6OrchardToIronwood => ShieldedPool::Ironwood,
+                Fixture::V6Ironwood
+                | Fixture::V6OrchardToIronwood
+                | Fixture::Nu7OrchardToIronwood => ShieldedPool::Ironwood,
             }
         }
     }
@@ -1146,6 +1158,16 @@ pub(crate) mod tests {
     async fn apply_external_signatures_v6_with_both_bundles_extracts() {
         let tx = prove_sign_extract(Fixture::V6OrchardToIronwood).await;
         assert_eq!(&tx[..4], &[0x06, 0x00, 0x00, 0x80]);
+    }
+
+    #[tokio::test]
+    async fn apply_external_signatures_nu7_with_both_bundles_extracts_v6_on_the_nu7_branch() {
+        let raw = prove_sign_extract(Fixture::Nu7OrchardToIronwood).await;
+
+        let tx = Transaction::read(&raw[..], BranchId::Nu7).expect("read");
+        assert_eq!(tx.version(), TxVersion::V6);
+        assert_eq!(u32::from(tx.consensus_branch_id()), 0x7719_0ad9);
+        assert_eq!(u32::from(tx.expiry_height()), NU7_HEIGHT + 120);
     }
 
     #[test]

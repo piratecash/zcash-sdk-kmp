@@ -158,7 +158,7 @@ pub fn try_orchard_decrypt(
         let mut plaintext = ca.ciphertext.clone();
         keystream.apply_keystream(&mut plaintext);
 
-        // NU7 uses the asset-carrying V3ZSA note version for every Orchard
+        // The ZSA protocol uses the asset-carrying V3ZSA note version for every Orchard
         // note, including native ZEC.
         if plaintext[0] == 0x03 {
             use zcash_note_encryption::Domain;

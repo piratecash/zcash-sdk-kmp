@@ -15,6 +15,7 @@ pub(crate) struct ParsedTransaction {
 
 pub(crate) fn parse_transaction(raw: &[u8]) -> Result<ParsedTransaction> {
     for branch in [
+        BranchId::Zsa,
         BranchId::Nu7,
         BranchId::Nu6_3,
         BranchId::Nu6_2,
@@ -379,7 +380,7 @@ pub(crate) mod tests {
         bytes
     }
 
-    pub(crate) fn transparent_transaction() -> (Vec<u8>, Vec<u8>) {
+    fn transparent_spend() -> (Bundle<TransparentAuthorized>, Vec<u8>) {
         let bundle = Bundle {
             vin: vec![TxIn::from_parts(
                 OutPoint::new([1; 32], 0),
@@ -394,8 +395,13 @@ pub(crate) mod tests {
             .prevout()
             .write(&mut input)
             .expect("serialize outpoint");
+        (bundle, input)
+    }
+
+    fn transparent_v6_transaction(branch: BranchId) -> (Vec<u8>, Vec<u8>) {
+        let (bundle, input) = transparent_spend();
         let raw = serialize(TransactionData::<Authorized>::from_parts_v6(
-            BranchId::Nu6_3,
+            branch,
             0,
             0u32.into(),
             Zatoshis::ZERO,
@@ -405,6 +411,10 @@ pub(crate) mod tests {
             None,
         ));
         (raw, input)
+    }
+
+    pub(crate) fn transparent_transaction() -> (Vec<u8>, Vec<u8>) {
+        transparent_v6_transaction(BranchId::Nu6_3)
     }
 
     #[test]
@@ -464,6 +474,36 @@ pub(crate) mod tests {
                 .await
                 .expect("merged metadata");
         assert_eq!(metadata, (2.5, 7));
+    }
+
+    #[test]
+    fn parse_transaction_nu7_transparent_spend_returns_serialized_outpoint() {
+        let (raw, expected) = transparent_v6_transaction(BranchId::Nu7);
+
+        assert!(parse_transaction(&raw)
+            .expect("parse")
+            .inputs
+            .contains(&expected));
+    }
+
+    #[test]
+    fn parse_transaction_zsa_transparent_spend_returns_serialized_outpoint() {
+        let (bundle, expected) = transparent_spend();
+        let raw = serialize(TransactionData::<Authorized>::from_parts_zsa(
+            BranchId::Zsa,
+            0,
+            0u32.into(),
+            Zatoshis::ZERO,
+            Some(bundle),
+            None,
+            None,
+            None,
+        ));
+
+        assert!(parse_transaction(&raw)
+            .expect("parse")
+            .inputs
+            .contains(&expected));
     }
 
     #[test]
