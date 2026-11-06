@@ -10,6 +10,7 @@ use pczt::Pczt;
 use sqlx::SqliteConnection;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::async_trait;
+use zcash_keys::address::UnifiedAddress;
 use zcash_primitives::transaction::Transaction;
 
 use crate::account::{
@@ -23,7 +24,7 @@ use crate::lwd::CompactBlock;
 use crate::net::{BroadcastOutcome, LwdServer};
 use crate::pay::plan::{max_sendable, plan_transaction};
 use crate::pay::pool::{ALL_POOLS, NUM_POOLS};
-use crate::pay::{Recipient, TxPlan};
+use crate::pay::{pool::PoolMask, Recipient, TxPlan};
 use crate::Client;
 
 pub(crate) const NU7_ACTIVATION: u32 = 3_543_405;
@@ -205,6 +206,7 @@ struct Payment {
     amount: u64,
     recipient_pays_fee: bool,
     hardware_signing: bool,
+    pools: Option<u8>,
 }
 
 impl Payment {
@@ -214,6 +216,7 @@ impl Payment {
             amount,
             recipient_pays_fee: false,
             hardware_signing: false,
+            pools: None,
         }
     }
 }
@@ -227,6 +230,7 @@ async fn plan(
     let recipient = Recipient {
         address: payment.address,
         amount: payment.amount,
+        pools: payment.pools,
         ..Recipient::default()
     };
     plan_transaction(
@@ -425,6 +429,33 @@ async fn plan_transaction_software_account_with_ironwood_recipient_still_builds(
     .expect("the refusal is only for v5");
 }
 
+async fn quote(
+    connection: &mut SqliteConnection,
+    server: &ScriptedServer,
+    account: u32,
+    recipient: &Recipient,
+    hardware_signing: bool,
+) -> Result<MaxSendable> {
+    let options = PaymentOptions {
+        src_pools: ALL_POOLS,
+        recipient_pays_fee: false,
+        smart_transparent: false,
+        confirmations: 0,
+        category: None,
+        hardware_signing,
+        external_pczt_signing: false,
+    };
+    max_sendable(
+        &Network::Main,
+        connection,
+        &mut server.client(),
+        account,
+        recipient,
+        &options,
+    )
+    .await
+}
+
 async fn quote_max(
     connection: &mut SqliteConnection,
     server: &ScriptedServer,
@@ -435,25 +466,9 @@ async fn quote_max(
         address,
         ..Recipient::default()
     };
-    let options = PaymentOptions {
-        src_pools: ALL_POOLS,
-        recipient_pays_fee: false,
-        smart_transparent: false,
-        confirmations: 0,
-        category: None,
-        hardware_signing: false,
-        external_pczt_signing: false,
-    };
-    max_sendable(
-        &Network::Main,
-        connection,
-        &mut server.client(),
-        account,
-        &recipient,
-        &options,
-    )
-    .await
-    .expect("max")
+    quote(connection, server, account, &recipient, false)
+        .await
+        .expect("max")
 }
 
 /// Output and input values, without the zero-value padding of a shielded bundle.
@@ -646,4 +661,116 @@ async fn max_sendable_repeated_quotes_do_not_grow_the_change_indices() {
     .expect("a partial send pays change");
 
     assert_eq!(change_indices(&mut connection, account).await, after_first);
+}
+
+/// The account's UA reduced to its transparent and Sapling receivers.
+async fn transparent_and_sapling_recipient(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> String {
+    let full = shielded_recipient(connection, account).await;
+    let full = UnifiedAddress::decode(&Network::Main, &full).expect("unified address");
+    UnifiedAddress::from_receivers(
+        None,
+        full.sapling().copied(),
+        full.transparent().copied(),
+        None,
+        None,
+    )
+    .expect("receivers")
+    .encode(&Network::Main)
+}
+
+#[tokio::test]
+async fn max_sendable_forced_transparent_pool_quotes_what_the_send_builds() {
+    let tip = LAST_LEGACY_TARGET - 1;
+    let mut connection = memory_db().await;
+    let account = funded_account(&mut connection, tip, &[100_000]).await;
+    let address = transparent_and_sapling_recipient(&mut connection, account).await;
+    let server = silent_server(&[tip]);
+    let forced = Some(PoolMask::from_pool(0).0);
+    let recipient = |pools| Recipient {
+        address: address.clone(),
+        pools,
+        ..Recipient::default()
+    };
+
+    let free = quote(&mut connection, &server, account, &recipient(None), false)
+        .await
+        .expect("max");
+    let max = quote(&mut connection, &server, account, &recipient(forced), false)
+        .await
+        .expect("max");
+    let package = plan(
+        &mut connection,
+        &server,
+        account,
+        Payment {
+            recipient_pays_fee: true,
+            pools: forced,
+            ..Payment::to(address.clone(), max.amount + max.fee)
+        },
+    )
+    .await
+    .expect("plan");
+
+    assert_eq!(
+        free,
+        MaxSendable {
+            amount: 85_000,
+            fee: 15_000
+        }
+    );
+    assert_eq!(
+        max,
+        MaxSendable {
+            amount: 90_000,
+            fee: 10_000
+        }
+    );
+    let plan = TxPlan::from_package(&Network::Main, &package).expect("plan");
+    assert_eq!(plan.fee, max.fee);
+    assert!(plan
+        .outputs
+        .iter()
+        .any(|output| output.pool == 0 && output.amount == max.amount));
+}
+
+#[tokio::test]
+async fn max_sendable_hardware_signing_forced_transparent_pool_avoids_the_ironwood_refusal() {
+    let tip = NU7_ACTIVATION + 10;
+    let mut connection = memory_db().await;
+    let account = funded_account(&mut connection, tip, &[100_000]).await;
+    let address = shielded_recipient(&mut connection, account).await;
+    let server = silent_server(&[tip]);
+    let recipient = |pools| Recipient {
+        address: address.clone(),
+        pools,
+        ..Recipient::default()
+    };
+
+    let error = quote(&mut connection, &server, account, &recipient(None), true)
+        .await
+        .expect_err("a v5 transaction cannot carry Ironwood");
+    let max = quote(
+        &mut connection,
+        &server,
+        account,
+        &recipient(Some(PoolMask::from_pool(0).0)),
+        true,
+    )
+    .await
+    .expect("max");
+
+    assert_eq!(
+        error.to_string(),
+        "Hardware signing cannot spend or receive Ironwood funds"
+    );
+    assert_eq!(
+        max,
+        MaxSendable {
+            amount: 90_000,
+            fee: 10_000
+        }
+    );
 }

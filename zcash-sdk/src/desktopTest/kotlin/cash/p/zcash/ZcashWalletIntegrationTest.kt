@@ -1351,6 +1351,35 @@ class ZcashWalletIntegrationTest {
             }
         }
 
+    // A Sapling recipient is refused before note selection, so the empty wallet still tells them apart.
+    @Test
+    fun maxSendable_poolsSelection_reachesThePlan() =
+        LoopbackZebra().use { zebra ->
+            withWallet(ServerType.ZEBRA, zebra.url) { wallet ->
+                val account = wallet.restoreAccount(
+                    name = "vector",
+                    key = TEST_PHRASE,
+                    birthHeight = BIRTH_HEIGHT,
+                )
+                val unified = assertNotNull(wallet.addresses(account).unified)
+                val options = PaymentOptions(externalPcztSigning = true)
+
+                assertEquals(
+                    MaxSendable(amount = 0, fee = 0),
+                    wallet.maxSendable(account, unified, options = options),
+                )
+                val refusal = assertFailsWith<ZcashException> {
+                    wallet.maxSendable(
+                        account,
+                        unified,
+                        options = options,
+                        pools = PoolSet.of(Pool.SAPLING),
+                    )
+                }
+                assertEquals(ExternalSigningRefusal.SAPLING, refusal.externalSigningRefusal)
+            }
+        }
+
     @Test
     fun setServer_malformedUrl_throwsAndKeepsThePreviousServer() =
         LoopbackZebra().use { zebra ->

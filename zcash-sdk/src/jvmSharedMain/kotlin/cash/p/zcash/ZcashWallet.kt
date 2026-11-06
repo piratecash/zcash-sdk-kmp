@@ -450,12 +450,13 @@ public class ZcashWallet private constructor(
         address: String,
         memo: String? = null,
         options: PaymentOptions = PaymentOptions(),
+        pools: PoolSet? = null,
     ): MaxSendable = withNative {
         parseMaxSendable(
             ZcashJni.maxSendable(
                 handle,
                 account,
-                encodeRecipients(listOf(Recipient(address, 0L, memo = memo))),
+                encodeRecipients(listOf(Recipient(address, 0L, pools = pools, memo = memo))),
                 options.sourcePools.mask.toByte(),
                 options.confirmations,
                 options.hardwareSigning,
