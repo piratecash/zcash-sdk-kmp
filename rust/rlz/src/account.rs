@@ -30,6 +30,7 @@ use crate::{
     pay::pool::ALL_POOLS,
 };
 use secp256k1::{PublicKey, SecretKey};
+use secrecy::ExposeSecret as _;
 use zcash_keys::keys::{Era, UnifiedFullViewingKey, UnifiedSpendingKey};
 use zcash_transparent::address::TransparentAddress;
 
@@ -51,7 +52,7 @@ use sqlx::{sqlite::SqliteRow, Connection, Row, SqliteConnection};
 use zcash_keys::{
     address::UnifiedAddress, encoding::AddressCodec as _, keys::UnifiedAddressRequest,
 };
-use zcash_protocol::consensus::{NetworkConstants, NetworkUpgrade, Parameters};
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 use zcash_transparent::keys::{
     AccountPrivKey, AccountPubKey, NonHardenedChildIndex, TransparentKeyScope,
 };
@@ -90,7 +91,7 @@ pub(crate) fn derive_spending_key(
     let aindex = AccountId::try_from(aindex).map_err(|_| anyhow!("account index out of range"))?;
     let (usk, _) = usk_from_phrase(network, phrase, passphrase.unwrap_or_default(), aindex)?;
 
-    Ok(usk.to_bytes(Era::Orchard))
+    Ok(usk.to_bytes(Era::Orchard).expose_secret().clone())
 }
 
 /// Account-level transparent key (m/44'/<coin>'/0') — the form an external wallet imports.
@@ -125,7 +126,7 @@ pub(crate) fn derive_ufvk(
     let aindex = AccountId::try_from(aindex).map_err(|_| anyhow!("account index out of range"))?;
     let (usk, _) = usk_from_phrase(network, phrase, passphrase.unwrap_or_default(), aindex)?;
 
-    Ok(usk.to_unified_full_viewing_key().encode(network))
+    Ok(usk.to_unified_full_viewing_key().encode(network)?)
 }
 
 pub async fn new_account(
@@ -319,8 +320,7 @@ pub async fn new_account(
             )
             .await?;
         } else if let Ok(sk) = bip38::import_tsk(&key) {
-            let secp = secp256k1::Secp256k1::new();
-            let pk = sk.0.public_key(&secp);
+            let pk = sk.0.public_key();
             let tpk = if sk.1 {
                 pk.serialize_uncompressed().to_vec()
             } else {
@@ -371,7 +371,7 @@ pub async fn new_account(
     } else if is_valid_sapling_key(network, &key) {
         init_account_sapling(network, &mut db_tx, account, birth).await?;
         let di = if let Ok(xsk) = zcash_keys::encoding::decode_extended_spending_key(
-            network.hrp_sapling_extended_spending_key(),
+            zcash_keys::constants::hrp_sapling_extended_spending_key(network.network_type()),
             &key,
         ) {
             let xvk = xsk.to_diversifiable_full_viewing_key();
@@ -380,7 +380,7 @@ pub async fn new_account(
             store_account_sapling_vk(&mut db_tx, account, &xvk, &address).await?;
             di
         } else if let Ok(xvk) = zcash_keys::encoding::decode_extended_full_viewing_key(
-            network.hrp_sapling_extended_full_viewing_key(),
+            zcash_keys::constants::hrp_sapling_extended_full_viewing_key(network.network_type()),
             &key,
         ) {
             let (di, address) = xvk.default_address();
@@ -404,7 +404,7 @@ pub async fn new_account(
         let (ua, di) = uvk.default_address(UnifiedAddressRequest::AllAvailableKeys)?;
         let dindex: u32 = di.try_into()?;
 
-        match uvk.transparent() {
+        match uvk.p2pkh() {
             Some(tvk) if pools & 1 != 0 => {
                 init_account_transparent(&mut db_tx, account, birth).await?;
                 store_account_transparent_vk(&mut db_tx, account, tvk).await?;
@@ -749,7 +749,8 @@ pub async fn get_account_full_address(
     let address = match (taddress, saddress, oaddress) {
         (Some(taddress), None, None) => taddress.encode(network),
         _ => {
-            let ua = UnifiedAddress::from_receivers(oaddress, saddress, taddress).unwrap();
+            let ua =
+                UnifiedAddress::from_receivers(oaddress, saddress, taddress, None, None).unwrap();
             ua.encode(network)
         }
     };
@@ -1039,12 +1040,14 @@ pub async fn get_addresses(
         .as_ref()
         .map(|xvk| xvk.address_at(dindex, orchard::keys::Scope::External));
 
-    let ua_orchard = UnifiedAddress::from_receivers(oaddr, None, None);
+    let ua_orchard = UnifiedAddress::from_receivers(oaddr, None, None, None, None);
 
     let ua = UnifiedAddress::from_receivers(
         if ua_pools & 4 != 0 { oaddr } else { None },
         if ua_pools & 2 != 0 { saddr } else { None },
         if ua_pools & 1 != 0 { taddr } else { None },
+        None,
+        None,
     );
 
     // final fallback if we have a transparent address from a BIP 38 secret key
@@ -1580,7 +1583,9 @@ pub(crate) mod tests {
     pub(crate) fn account_efvk() -> String {
         let efvk = test_usk(0).sapling().to_extended_full_viewing_key();
         encode_extended_full_viewing_key(
-            Network::Main.hrp_sapling_extended_full_viewing_key(),
+            zcash_keys::constants::hrp_sapling_extended_full_viewing_key(
+                Network::Main.network_type(),
+            ),
             &efvk,
         )
     }
@@ -1600,7 +1605,10 @@ pub(crate) mod tests {
         vec![
             WatchOnlyKey {
                 label: "ufvk",
-                key: usk.to_unified_full_viewing_key().encode(&network),
+                key: usk
+                    .to_unified_full_viewing_key()
+                    .encode(&network)
+                    .expect("ufvk"),
                 viewing: ("orchard_accounts", "xvk"),
             },
             WatchOnlyKey {
@@ -1610,7 +1618,7 @@ pub(crate) mod tests {
             },
             WatchOnlyKey {
                 label: "tprv",
-                key: ExtendedPrivateKey::<SecretKey>::new(seed)
+                key: ExtendedPrivateKey::<SecretKey>::new(&seed)
                     .expect("xprv")
                     .to_string(Prefix::XPRV)
                     .to_string(),
@@ -1619,7 +1627,9 @@ pub(crate) mod tests {
             WatchOnlyKey {
                 label: "sapling xsk",
                 key: encode_extended_spending_key(
-                    network.hrp_sapling_extended_spending_key(),
+                    zcash_keys::constants::hrp_sapling_extended_spending_key(
+                        network.network_type(),
+                    ),
                     usk.sapling(),
                 ),
                 viewing: ("sapling_accounts", "xvk"),
@@ -2296,7 +2306,7 @@ pub(crate) mod tests {
         let seed = bip39::Mnemonic::from_str(TEST_PHRASE)
             .expect("phrase")
             .to_seed("");
-        let mut key = ExtendedPrivateKey::<SecretKey>::new(seed).expect("master");
+        let mut key = ExtendedPrivateKey::<SecretKey>::new(&seed).expect("master");
         for index in [44u32, coin, 0] {
             key = key
                 .derive_child(ChildNumber::new(index, true).expect("child number"))

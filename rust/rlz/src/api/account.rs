@@ -21,7 +21,7 @@ use zcash_keys::{
     encoding::{decode_extended_full_viewing_key, decode_extended_spending_key, AddressCodec},
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
 };
-use zcash_protocol::consensus::{NetworkConstants, Parameters as ZkParams};
+use zcash_protocol::consensus::Parameters as ZkParams;
 use zcash_transparent::{
     address::TransparentAddress,
     keys::{AccountPrivKey, AccountPubKey},
@@ -148,7 +148,7 @@ pub fn receivers_from_ua(ua: &str, c: &Coin) -> Result<Receivers> {
 pub fn receivers_of(coin: u8, ua: &str) -> Result<Receivers> {
     let network = network_from_coin(coin);
 
-    let (net, ua) = zcash_address::unified::Address::decode(ua)?;
+    let (net, _revision, ua) = zcash_address::unified::Address::decode(ua)?;
     if net != network.network_type() {
         anyhow::bail!("Invalid Network");
     }
@@ -173,7 +173,7 @@ pub fn receivers_of(coin: u8, ua: &str) -> Result<Receivers> {
                 let oaddr = orchard::Address::from_raw_address_bytes(&o)
                     .into_option()
                     .ok_or_else(|| anyhow!("invalid Orchard receiver in unified address"))?;
-                let oaddr = UnifiedAddress::from_receivers(Some(oaddr), None, None)
+                let oaddr = UnifiedAddress::from_receivers(Some(oaddr), None, None, None, None)
                     .ok_or_else(|| anyhow!("failed to wrap Orchard receiver"))?;
                 receivers.oaddr = Some(oaddr.encode(&network));
             }
@@ -615,8 +615,11 @@ pub fn addresses_from_key(coin: u8, key: &str) -> Result<Addresses> {
     }
 
     if crate::key::is_sapling_esk(&network, key) {
-        let xsk = decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), key)
-            .map_err(|_| anyhow!("Invalid Key"))?;
+        let xsk = decode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(network.network_type()),
+            key,
+        )
+        .map_err(|_| anyhow!("Invalid Key"))?;
         let dfvk = xsk.to_diversifiable_full_viewing_key();
         let (di, _) = dfvk.default_address();
         let diversifier_index: u32 = di.try_into()?;
@@ -634,9 +637,11 @@ pub fn addresses_from_key(coin: u8, key: &str) -> Result<Addresses> {
     }
 
     if crate::key::is_sapling_efvk(&network, key) {
-        let xvk =
-            decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), key)
-                .map_err(|_| anyhow!("Invalid Key"))?;
+        let xvk = decode_extended_full_viewing_key(
+            zcash_keys::constants::hrp_sapling_extended_full_viewing_key(network.network_type()),
+            key,
+        )
+        .map_err(|_| anyhow!("Invalid Key"))?;
         let dfvk = xvk.to_diversifiable_full_viewing_key();
         let (di, _) = dfvk.default_address();
         let diversifier_index: u32 = di.try_into()?;
@@ -762,7 +767,7 @@ pub async fn fetch_address_tx_count(
             let dfvk_bytes = dfvk.to_bytes();
             let dk_bytes: [u8; 32] = dfvk_bytes[96..128].try_into().ok()?;
             let dk = sapling_crypto::zip32::DiversifierKey::from_bytes(dk_bytes);
-            let (int_fvk, int_dk) = sapling_derive_internal_fvk(dfvk.fvk(), &dk);
+            let (int_fvk, int_dk) = sapling_derive_internal_fvk(dfvk.fvk(), &dk)?;
             let mut ivk_bytes = [0u8; 64];
             ivk_bytes[..32].copy_from_slice(int_dk.as_bytes());
             ivk_bytes[32..].copy_from_slice(&int_fvk.vk.ivk().to_repr());
@@ -830,7 +835,7 @@ pub async fn fetch_address_tx_count(
                         let addr = fvk.address_at(d as u64, s);
                         o_addr_raw = Some(addr);
                         Some(
-                            UnifiedAddress::from_receivers(Some(addr), None, None)
+                            UnifiedAddress::from_receivers(Some(addr), None, None, None, None)
                                 .unwrap()
                                 .encode(&network),
                         )
@@ -842,9 +847,9 @@ pub async fn fetch_address_tx_count(
                 };
 
                 if aggregate {
-                    if let Some(ua) =
-                        UnifiedAddress::from_receivers(o_addr_raw, s_addr_raw, t_addr_raw)
-                    {
+                    if let Some(ua) = UnifiedAddress::from_receivers(
+                        o_addr_raw, s_addr_raw, t_addr_raw, None, None,
+                    ) {
                         results.push(TAddressTxCount {
                             pool: 0,
                             address: ua.encode(&network),
@@ -982,7 +987,7 @@ pub async fn print_keys(id: u32, c: &Coin) -> Result<()> {
     if uvk.orchard().is_some() {
         println!("Has Orchard");
     }
-    let uvk = uvk.encode(&network);
+    let uvk = uvk.encode(&network)?;
     println!("Unified Full Viewing Key: {}", uvk);
 
     Ok(())
@@ -1233,6 +1238,7 @@ mod tests {
     use crate::api::sync::{file_backed_coin, LOCK_TEST_SERIAL, SYNCING};
     use crate::db::tests::memory_db;
     use std::time::Duration;
+    use zcash_address::unified::{Revision, Uitem};
     use zcash_address::ToAddress;
 
     const MAIN: u8 = 0;
@@ -1257,15 +1263,18 @@ mod tests {
     /// a real, decodable receiver, but no transparent one.
     fn shielded_only_ua() -> String {
         let (ua, _) = main_addresses();
-        let (_, decoded) = zcash_address::unified::Address::decode(&ua).expect("decode");
+        let (_, _, decoded) = zcash_address::unified::Address::decode(&ua).expect("decode");
         let sapling_item = decoded
             .items()
             .into_iter()
             .find(|item| matches!(item, zcash_address::unified::Receiver::Sapling(_)))
             .expect("fixture account has a sapling receiver");
 
-        let shielded = zcash_address::unified::Address::try_from_items(vec![sapling_item])
-            .expect("a single shielded item is a valid unified address");
+        let shielded = zcash_address::unified::Address::try_from_items(
+            Revision::R0,
+            vec![Uitem::Data(sapling_item)],
+        )
+        .expect("a single shielded item is a valid unified address");
         shielded.encode(&network_from_coin(MAIN).network_type())
     }
 
@@ -1273,8 +1282,11 @@ mod tests {
     /// byte length for its typecode but is not a valid point — never encountered
     /// from real key derivation, only from a crafted string.
     fn ua_with_invalid_receiver(receiver: zcash_address::unified::Receiver) -> String {
-        let address = zcash_address::unified::Address::try_from_items(vec![receiver])
-            .expect("a single shielded item is a valid unified address");
+        let address = zcash_address::unified::Address::try_from_items(
+            Revision::R0,
+            vec![Uitem::Data(receiver)],
+        )
+        .expect("a single shielded item is a valid unified address");
         address.encode(&network_from_coin(MAIN).network_type())
     }
 
@@ -1322,14 +1334,15 @@ mod tests {
     #[test]
     fn orchard_only_address_of_a_ua_without_orchard_is_none() {
         let (ua, _) = main_addresses();
-        let (_, decoded) = zcash_address::unified::Address::decode(&ua).expect("decode");
+        let (_, _, decoded) = zcash_address::unified::Address::decode(&ua).expect("decode");
         let without_orchard = decoded
             .items()
             .into_iter()
             .filter(|item| !matches!(item, zcash_address::unified::Receiver::Orchard(_)))
+            .map(Uitem::Data)
             .collect();
         let transparent_and_sapling =
-            zcash_address::unified::Address::try_from_items(without_orchard)
+            zcash_address::unified::Address::try_from_items(Revision::R0, without_orchard)
                 .expect("ua")
                 .encode(&network_from_coin(MAIN).network_type());
 

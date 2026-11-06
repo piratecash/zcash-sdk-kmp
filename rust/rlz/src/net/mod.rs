@@ -16,8 +16,6 @@ pub mod lwd;
 pub mod nym;
 #[cfg(feature = "nym")]
 pub mod nym_service;
-#[cfg(feature = "voting")]
-pub mod votechain;
 pub mod zebra;
 
 pub const NYM_URL_SCHEME: &str = "nym://";

@@ -10,7 +10,8 @@ use pczt::{
     },
     Pczt,
 };
-use rand_core::{CryptoRng, OsRng, RngCore};
+use rand::rngs::SysRng;
+use rand_core::{CryptoRng, Rng, UnwrapErr};
 use redjubjub::{SpendAuth, VerificationKey, VerificationKeyBytes};
 use sapling_crypto::{
     bundle::OutputDescription,
@@ -52,7 +53,7 @@ use crate::{frb_generated::StreamSink, ledger::transport::Device};
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "flutter")]
-pub async fn sign_transaction<D: Device + Sync, R: RngCore + CryptoRng>(
+pub async fn sign_transaction<D: Device + Sync, R: Rng + CryptoRng>(
     network: &Network,
     connection: &mut SqliteConnection,
     account: u32,
@@ -310,7 +311,7 @@ pub async fn sign_transaction<D: Device + Sync, R: RngCore + CryptoRng>(
             let recipient = fvk.vk.to_payment_address(diversifier).unwrap();
             let rseed = Rseed::BeforeZip212(Fr::from_bytes(&rcm).unwrap());
             let note = Note::from_parts(recipient, NoteValue::from_raw(value), rseed);
-            let _nf = note.nf(&fvk.vk.nk, position as u64);
+            let _nf = note.nf(fvk.vk.nk(), position as u64);
 
             // Store data for in-place modification via Updater
             spend_updates.push(SpendUpdate {
@@ -427,13 +428,14 @@ pub async fn sign_transaction<D: Device + Sync, R: RngCore + CryptoRng>(
             .unwrap()
             .finish();
 
-        let (pczt, _) = IoFinalizer::new(pczt).finalize_io().unwrap();
+        let (pczt, _) = IoFinalizer::new(pczt).finalize_io(&mut rng).unwrap();
 
         let pczt = if !pczt.sapling().spends().is_empty() || !pczt.sapling().outputs().is_empty() {
             let updater = Updater::new(pczt);
             let fvk = fvk.as_ref().expect("fvk present for Sapling proofs");
             let nsk = Fr::from_bytes(&nsk).unwrap();
-            let pgk = ProofGenerationKey { ak: fvk.vk.ak.clone(), nsk };
+            let pgk = ProofGenerationKey::from_parts(fvk.vk.ak().clone(), nsk)
+                .ok_or_else(|| anyhow::anyhow!("invalid Ledger Sapling proof generation key"))?;
 
             let updater = updater
                 .update_sapling_with(|mut u| {
@@ -461,7 +463,7 @@ pub async fn sign_transaction<D: Device + Sync, R: RngCore + CryptoRng>(
         info!("Adding proofs to PCZT");
         let _ = sink.add(SigningEvent::Progress("Computing ZKPs".to_string()));
         let pczt = Prover::new(pczt)
-            .create_sapling_proofs(prover, prover)
+            .create_sapling_proofs(&mut rng, prover, prover)
             .unwrap()
             .finish();
 
@@ -716,7 +718,7 @@ pub async fn sign_ledger_transaction(
             sapling_prover,
             &sink,
             &ledger,
-            OsRng,
+            UnwrapErr(SysRng),
         )
         .await?;
         Ok::<_, LedgerError>(())

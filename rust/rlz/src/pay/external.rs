@@ -538,7 +538,7 @@ fn view_action(
         enc_ciphertext: hex::encode(note.enc_ciphertext.as_ref()),
         out_ciphertext: hex::encode(note.out_ciphertext),
         recipient: hex::encode(recipient.to_raw_address_bytes()),
-        recipient_address: UnifiedAddress::from_receivers(Some(recipient), None, None)
+        recipient_address: UnifiedAddress::from_receivers(Some(recipient), None, None, None, None)
             .ok_or_else(|| anyhow!("an Orchard receiver does not form a unified address"))?
             .encode(network),
         value: output
@@ -582,7 +582,7 @@ pub(crate) mod tests {
     };
     use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer, updater::Updater};
     use ripemd::Ripemd160;
-    use secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use secp256k1::{PublicKey, SecretKey};
     use sha2::{Digest as _, Sha256};
     use std::convert::Infallible;
     use zcash_keys::encoding::AddressCodec as _;
@@ -697,8 +697,9 @@ pub(crate) mod tests {
 
     fn transparent_key(keys: &DeviceKeys, scope: u32, dindex: u32) -> (SecretKey, PublicKey) {
         let sk = derive_transparent_sk(&keys.tsk, scope, dindex).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk).expect("secret key");
-        (sk, PublicKey::from_secret_key(&Secp256k1::new(), &sk))
+        let sk =
+            SecretKey::from_secret_bytes(sk.try_into().expect("32 bytes")).expect("secret key");
+        (sk, PublicKey::from_secret_key(&sk))
     }
 
     fn p2pkh(pubkey: &PublicKey) -> TransparentAddress {
@@ -821,7 +822,7 @@ pub(crate) mod tests {
 
         let built = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -853,7 +854,9 @@ pub(crate) mod tests {
             })
             .expect("update")
             .finish();
-        let (pczt, _) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        let (pczt, _) = IoFinalizer::new(pczt)
+            .finalize_io(rand_core::UnwrapErr(rand::rngs::SysRng))
+            .expect("finalize_io");
 
         PcztPackage {
             n_spends: match fixture.spend_pool() {
@@ -892,7 +895,7 @@ pub(crate) mod tests {
                 let (sk, _) = transparent_key(keys, path[3], path[4]);
                 let sighash = signer.transparent_sighash(index).expect("sighash");
                 let signature =
-                    Secp256k1::new().sign_ecdsa(&secp256k1::Message::from_digest(sighash), &sk);
+                    secp256k1::ecdsa::sign(secp256k1::Message::from_digest(sighash), &sk);
                 let mut der = signature.serialize_der().to_vec();
                 der.push(SIGHASH_ALL);
                 (index as u32, der)
@@ -906,12 +909,20 @@ pub(crate) mod tests {
         };
         for &index in &sign_indices(&view.orchard) {
             signer
-                .sign_orchard(index as usize, &keys.ask)
+                .sign_orchard(
+                    rand_core::UnwrapErr(rand::rngs::SysRng),
+                    index as usize,
+                    &keys.ask,
+                )
                 .expect("sign orchard");
         }
         for &index in &sign_indices(&view.ironwood) {
             signer
-                .sign_ironwood(index as usize, &keys.ask)
+                .sign_ironwood(
+                    rand_core::UnwrapErr(rand::rngs::SysRng),
+                    index as usize,
+                    &keys.ask,
+                )
                 .expect("sign ironwood");
         }
         let signed = signer.finish();
@@ -1014,9 +1025,10 @@ pub(crate) mod tests {
     fn external_signing_view_shows_the_third_party_as_an_orchard_only_address() {
         let keys = speculos_keys();
         let package = planned_package(&keys, Fixture::V5Orchard);
-        let expected = UnifiedAddress::from_receivers(Some(third_party_address()), None, None)
-            .expect("ua")
-            .encode(&Network::Main);
+        let expected =
+            UnifiedAddress::from_receivers(Some(third_party_address()), None, None, None, None)
+                .expect("ua")
+                .encode(&Network::Main);
 
         let view = external_signing_view(&Network::Main, &package, 0).expect("view");
 
@@ -1253,7 +1265,7 @@ pub(crate) mod tests {
         }
         let built = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -1304,6 +1316,7 @@ pub(crate) mod tests {
             .expect("input"),
         );
         let sapling_to = sapling_crypto::zip32::ExtendedSpendingKey::master(&[1u8; 32])
+            .expect("master key")
             .default_address()
             .1;
         builder
@@ -1316,7 +1329,7 @@ pub(crate) mod tests {
             .expect("sapling output");
         let built = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -1363,11 +1376,16 @@ pub(crate) mod tests {
 
     #[test]
     fn orchard_only_address_is_the_recipient_the_device_shows_for_orchard_and_ironwood_outputs() {
-        use zcash_address::unified::{Address, Encoding as _, Receiver};
-        let full = Address::try_from_items(vec![
-            Receiver::P2pkh([7u8; 20]),
-            Receiver::Orchard(third_party_address().to_raw_address_bytes()),
-        ])
+        use zcash_address::unified::{Address, Encoding as _, Receiver, Revision, Uitem};
+        let full = Address::try_from_items(
+            Revision::R0,
+            vec![
+                Uitem::Data(Receiver::P2pkh([7u8; 20])),
+                Uitem::Data(Receiver::Orchard(
+                    third_party_address().to_raw_address_bytes(),
+                )),
+            ],
+        )
         .expect("ua")
         .encode(&zcash_protocol::consensus::NetworkType::Main);
 

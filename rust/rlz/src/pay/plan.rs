@@ -25,7 +25,8 @@ use pczt::{
     },
     Pczt,
 };
-use rand_core::{OsRng, RngCore};
+use rand::rngs::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 use ripemd::Ripemd160;
 use sapling_crypto::PaymentAddress;
 use secp256k1::{PublicKey, SecretKey};
@@ -176,7 +177,7 @@ fn build_zsa_builder(info: &IssuanceInfo, oaddress: orchard::Address) -> Result<
         oaddress,
         NoteValue::from_raw(info.amount),
         info.first_issuance,
-        &mut OsRng,
+        &mut UnwrapErr(SysRng),
     )
     .map_err(|e| anyhow!("Failed to add issue output: {e:?}"))?;
     if info.finalize {
@@ -358,7 +359,7 @@ pub async fn plan_transaction(
         let notes = if groups.is_empty() {
             vec![]
         } else {
-            let i = OsRng.next_u32() as usize % groups.len();
+            let i = UnwrapErr(SysRng).next_u32() as usize % groups.len();
             groups[i].clone()
         };
         let max = notes.iter().map(|n| n.amount).sum::<u64>();
@@ -1065,7 +1066,11 @@ pub async fn plan_transaction(
         builder.set_zsa_builder(zsa);
     }
 
-    let r = builder.build_for_pczt(OsRng, &FeeRule::standard(), |_asset: &AssetBase| false)?;
+    let r = builder.build_for_pczt(
+        UnwrapErr(SysRng),
+        &FeeRule::standard(),
+        |_asset: &AssetBase| false,
+    )?;
     let sapling_meta = &r.sapling_meta;
     let ironwood_meta = &r.ironwood_meta;
 
@@ -1154,13 +1159,15 @@ pub async fn plan_transaction(
             .address_at(dindex, Scope::External);
         let zsa_builder = build_zsa_builder(info, oaddress)?;
         Issuer::new(pczt)
-            .build_awaiting_sighash(zsa_builder, OsRng)
+            .build_awaiting_sighash(zsa_builder, UnwrapErr(SysRng))
             .map_err(|e| anyhow!("Issuer (phase 1) failed: {e:?}"))?
     } else {
         pczt
     };
 
-    let (pczt, shielded_sighash) = IoFinalizer::new(pczt).finalize_io().unwrap();
+    let (pczt, shielded_sighash) = IoFinalizer::new(pczt)
+        .finalize_io(UnwrapErr(SysRng))
+        .unwrap();
     info!("IO Finalized");
     if external_pczt_signing {
         external::check_device_limits(&pczt)?;
@@ -1316,7 +1323,10 @@ async fn verify_spending_key(
     let mut compared = 0;
     for (table, expected) in derived {
         let stored: Option<Option<Vec<u8>>> =
-            sqlx::query_scalar(&format!("SELECT xvk FROM {table} WHERE account = ?"))
+            // `table` is one of the literals above.
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT xvk FROM {table} WHERE account = ?"
+            )))
                 .bind(account)
                 .fetch_optional(&mut *connection)
                 .await?;
@@ -1388,8 +1398,10 @@ pub async fn sign_transaction(
         updater
     } else {
         let esk = require_sapling_key(&key)?;
-        let pgk = esk.expsk.proof_generation_key();
-        let internal_pgk = esk.derive_internal().expsk.proof_generation_key();
+        let pgk = esk.expsk().proof_generation_key();
+        let internal_pgk = sapling_ssk_for_scope(1u8, esk)?
+            .expsk()
+            .proof_generation_key();
         updater
             .update_sapling_with(|mut u| {
                 for (bundle_index, scope) in &sapling_scopes {
@@ -1465,8 +1477,7 @@ pub async fn sign_transaction(
         let sk = SecretKey::from_bytes(&sk).map_err(|_| Error::NoSigningKey)?;
 
         // Derive pubkey from secret key to check
-        let secp = secp256k1::Secp256k1::new();
-        let derived_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let derived_pubkey = secp256k1::PublicKey::from_secret_key(&sk);
         let derived_compressed = derived_pubkey.serialize();
         let derived_uncompressed = derived_pubkey.serialize_uncompressed();
         let hash_compressed = zcash_transparent::util::hash160::hash(&derived_compressed);
@@ -1487,7 +1498,7 @@ pub async fn sign_transaction(
             anyhow!("failed to compute sighash for transparent input {index}: {e:?}")
         })?;
         let msg = secp256k1::Message::from_digest(sighash);
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        let sig = secp256k1::ecdsa::sign(msg, &sk);
 
         // Append the signature - the pubkey will be retrieved from hash160_preimages
         info!("Appending signature for input {}", index);
@@ -1500,9 +1511,9 @@ pub async fn sign_transaction(
     for (index, (bundle_index, scope)) in sapling_scopes.iter().enumerate() {
         info!("signing sapling {index}");
         let esk = require_sapling_key(&key)?;
-        let ssk = sapling_ssk_for_scope(*scope, esk);
+        let ssk = sapling_ssk_for_scope(*scope, esk)?;
         signer
-            .sign_sapling(*bundle_index, &ssk.expsk.ask)
+            .sign_sapling(UnwrapErr(SysRng), *bundle_index, ssk.expsk().ask())
             .map_err(|e| {
                 anyhow!(
                     "failed to sign sapling spend {bundle_index} (selected spend {index}): {e:?}"
@@ -1512,16 +1523,24 @@ pub async fn sign_transaction(
     for (index, bundle_index) in orchard_indices.iter().enumerate() {
         info!("signing orchard {index}");
         let osak = require_orchard_key(&key, "orchard")?;
-        signer.sign_orchard(*bundle_index, &osak).map_err(|e| {
-            anyhow!("failed to sign Orchard action {bundle_index} (selected spend {index}): {e:?}")
-        })?;
+        signer
+            .sign_orchard(UnwrapErr(SysRng), *bundle_index, &osak)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to sign Orchard action {bundle_index} (selected spend {index}): {e:?}"
+                )
+            })?;
     }
     for (index, bundle_index) in ironwood_indices.iter().enumerate() {
         info!("signing ironwood {index}");
         let osak = require_orchard_key(&key, "ironwood")?;
-        signer.sign_ironwood(*bundle_index, &osak).map_err(|e| {
-            anyhow!("failed to sign Ironwood action {bundle_index} (selected spend {index}): {e:?}")
-        })?;
+        signer
+            .sign_ironwood(UnwrapErr(SysRng), *bundle_index, &osak)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to sign Ironwood action {bundle_index} (selected spend {index}): {e:?}"
+                )
+            })?;
     }
     let pczt = signer.finish();
 
@@ -1557,16 +1576,16 @@ pub(super) async fn prove(pczt: Pczt, orchard_pk: &ProvingKey) -> Result<Pczt> {
     let prover = if prover.requires_sapling_proofs() {
         let sapling_prover = get_sapling_prover().await?;
         prover
-            .create_sapling_proofs(sapling_prover, sapling_prover)
+            .create_sapling_proofs(UnwrapErr(SysRng), sapling_prover, sapling_prover)
             .map_err(|error| anyhow!("failed to create Sapling proofs: {error:?}"))?
     } else {
         prover
     };
 
     let pczt = prover
-        .create_orchard_proof(orchard_pk)
+        .create_orchard_proof(UnwrapErr(SysRng), orchard_pk)
         .map_err(|error| anyhow!("failed to create Orchard proof: {error:?}"))?
-        .create_ironwood_proof(&IRONWOOD_PK)
+        .create_ironwood_proof(UnwrapErr(SysRng), &IRONWOOD_PK)
         .map_err(|error| anyhow!("failed to create Ironwood proof: {error:?}"))?
         .finish();
     info!("Proved");
@@ -1592,7 +1611,7 @@ pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
     if let Some((svk, ovk)) = &keys {
         tx_extractor = tx_extractor.with_sapling(svk, ovk);
     }
-    match tx_extractor.extract() {
+    match tx_extractor.extract(UnwrapErr(SysRng)) {
         Ok(tx) => {
             if let Some(bundle) = tx.sapling_bundle() {
                 let vb: i64 = (*bundle.value_balance()).into();
@@ -2193,7 +2212,7 @@ mod tests {
     use zcash_keys::encoding::encode_extended_spending_key;
     use zcash_keys::encoding::AddressCodec as _;
     use zcash_keys::keys::{sapling::ExtendedSpendingKey, Era, UnifiedSpendingKey};
-    use zcash_protocol::consensus::NetworkConstants as _;
+    use zcash_protocol::consensus::Parameters as _;
     use zcash_protocol::memo::MemoBytes;
     use zcash_transparent::{keys::AccountPrivKey, pczt::Bip32Derivation};
 
@@ -2210,7 +2229,7 @@ mod tests {
         let seed = bip39::Mnemonic::from_str(phrase)
             .expect("phrase")
             .to_seed("");
-        let xprv = ExtendedPrivateKey::<SecretKey>::new(seed)
+        let xprv = ExtendedPrivateKey::<SecretKey>::new(&seed)
             .expect("xprv")
             .to_string(Prefix::XPRV)
             .to_string();
@@ -2227,7 +2246,7 @@ mod tests {
     fn sapling_key_bytes_of(phrase: &str, aindex: u32) -> Vec<u8> {
         let usk = usk_of(phrase, aindex);
         let esk = encode_extended_spending_key(
-            Network::Main.hrp_sapling_extended_spending_key(),
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
             usk.sapling(),
         );
         signing_key::encode_sapling(&esk, &Network::Main).expect("encode")
@@ -2257,7 +2276,7 @@ mod tests {
         let seed = bip39::Mnemonic::from_str(TEST_PHRASE)
             .expect("phrase")
             .to_seed("");
-        ExtendedPrivateKey::<SecretKey>::new(seed)
+        ExtendedPrivateKey::<SecretKey>::new(&seed)
             .expect("xprv")
             .to_string(Prefix::XPRV)
             .to_string()
@@ -2285,8 +2304,9 @@ mod tests {
         set_hash160_preimage: bool,
     ) -> Vec<u8> {
         let sk_bytes = derive_transparent_sk(tsk, scope, dindex).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
-        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&sk);
 
         let build_config = BuildConfig::Standard {
             sapling_anchor: None,
@@ -2316,7 +2336,7 @@ mod tests {
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -2347,7 +2367,9 @@ mod tests {
             .expect("update transparent")
             .finish();
 
-        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        let (pczt, _sighash) = IoFinalizer::new(pczt)
+            .finalize_io(rand_core::UnwrapErr(rand::rngs::SysRng))
+            .expect("finalize_io");
         pczt.serialize().expect("serialize")
     }
 
@@ -2376,13 +2398,15 @@ mod tests {
         change_dindex: u32,
     ) -> Vec<u8> {
         let sk_bytes = derive_transparent_sk(tsk, scope, dindex).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
-        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&sk);
 
         let change_sk_bytes =
             derive_transparent_sk(tsk, change_scope, change_dindex).expect("derive change sk");
-        let change_sk = SecretKey::from_slice(&change_sk_bytes).expect("change secret key");
-        let change_pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &change_sk);
+        let change_sk = SecretKey::from_secret_bytes(change_sk_bytes.try_into().expect("32 bytes"))
+            .expect("change secret key");
+        let change_pubkey = PublicKey::from_secret_key(&change_sk);
 
         let build_config = BuildConfig::Standard {
             sapling_anchor: None,
@@ -2422,7 +2446,7 @@ mod tests {
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -2454,7 +2478,9 @@ mod tests {
             .expect("update transparent")
             .finish();
 
-        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        let (pczt, _sighash) = IoFinalizer::new(pczt)
+            .finalize_io(rand_core::UnwrapErr(rand::rngs::SysRng))
+            .expect("finalize_io");
         pczt.serialize().expect("serialize")
     }
 
@@ -2500,8 +2526,9 @@ mod tests {
         );
 
         let change_sk_bytes = derive_transparent_sk(&tsk, 1, 3).expect("derive change sk");
-        let change_sk = SecretKey::from_slice(&change_sk_bytes).expect("change secret key");
-        let change_pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &change_sk);
+        let change_sk = SecretKey::from_secret_bytes(change_sk_bytes.try_into().expect("32 bytes"))
+            .expect("change secret key");
+        let change_pubkey = PublicKey::from_secret_key(&change_sk);
         Verifier::new(pczt)
             .with_transparent(|bundle| {
                 let derivations = bundle.outputs()[1].bip32_derivation();
@@ -2520,7 +2547,7 @@ mod tests {
     /// A sapling spending key built directly from raw seed bytes, unrelated to any
     /// mnemonic-derived account: a genuinely "imported" ESK.
     fn sapling_only_esk() -> ExtendedSpendingKey {
-        ExtendedSpendingKey::master(b"phase2b sapling fixture seed 32")
+        ExtendedSpendingKey::master(b"phase2b sapling fixture seed 32").expect("master key")
     }
 
     /// A structurally valid PCZT with a single sapling spend from `esk`'s default address
@@ -2580,7 +2607,7 @@ mod tests {
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -2600,7 +2627,9 @@ mod tests {
             .expect("update sapling")
             .finish();
 
-        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        let (pczt, _sighash) = IoFinalizer::new(pczt)
+            .finalize_io(rand_core::UnwrapErr(rand::rngs::SysRng))
+            .expect("finalize_io");
         pczt.serialize().expect("serialize")
     }
 
@@ -3077,8 +3106,10 @@ mod tests {
     async fn sign_transaction_signs_a_sapling_only_account_with_an_imported_esk() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3176,8 +3207,10 @@ mod tests {
     async fn sign_transaction_rejects_a_sapling_spend_missing_its_scope_field() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3207,8 +3240,10 @@ mod tests {
     async fn sign_transaction_rejects_a_sapling_scope_field_of_the_wrong_length() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3238,8 +3273,10 @@ mod tests {
     async fn sign_transaction_propagates_a_failed_sapling_signature_as_an_error() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3466,7 +3503,7 @@ mod tests {
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -3475,8 +3512,8 @@ mod tests {
     }
 
     fn transparent_coin(value: u64) -> (TransparentInputInfo, TransparentAddress) {
-        let sk = SecretKey::from_slice(&[7u8; 32]).expect("secret key");
-        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let sk = SecretKey::from_secret_bytes([7u8; 32]).expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&sk);
         let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
         let addr = TransparentAddress::PublicKeyHash(pkh);
         let coin = TxOut::new(Zatoshis::const_from_u64(value), addr.script().into());
@@ -3513,7 +3550,7 @@ mod tests {
             .expect("output");
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -3727,12 +3764,12 @@ mod tests {
         let bytes = transparent_pczt_bytes(&tsk, 0, 0);
 
         let sk_bytes = derive_transparent_sk(&tsk, 0, 0).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
         let pczt = Pczt::parse(&bytes).expect("parse pczt");
         let signer = Signer::new(pczt).expect("signer");
         let sighash = signer.transparent_sighash(0).expect("sighash");
-        let signature =
-            secp256k1::Secp256k1::new().sign_ecdsa(&secp256k1::Message::from_digest(sighash), &sk);
+        let signature = secp256k1::ecdsa::sign(secp256k1::Message::from_digest(sighash), &sk);
 
         let mut package = empty_package();
         package.pczt = bytes;
@@ -3758,12 +3795,12 @@ mod tests {
         let bytes = transparent_pczt_bytes(&tsk, 0, 0);
 
         let sk_bytes = derive_transparent_sk(&tsk, 0, 0).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
         let pczt = Pczt::parse(&bytes).expect("parse pczt");
         let signer = Signer::new(pczt).expect("signer");
         let sighash = signer.transparent_sighash(0).expect("sighash");
-        let signature =
-            secp256k1::Secp256k1::new().sign_ecdsa(&secp256k1::Message::from_digest(sighash), &sk);
+        let signature = secp256k1::ecdsa::sign(secp256k1::Message::from_digest(sighash), &sk);
         let mut der = signature.serialize_der()[..].to_vec();
         let last = der.len() - 1;
         der[last] ^= 0xFF;

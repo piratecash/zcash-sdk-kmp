@@ -702,9 +702,10 @@ async fn add_address_column(
     if has_column(&mut tx, "transparent_address_accounts", name).await? {
         return Ok(());
     }
-    sqlx::query(&format!(
+    // Both values are literals at the call sites; ALTER TABLE takes no bind parameters.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE transparent_address_accounts ADD COLUMN {name} {definition}"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1870,7 +1871,8 @@ pub async fn calculate_balance_breakdown(
         {OWNED_UNSPENT_ZEC_NOTES}
         GROUP BY n.pool"
     );
-    let mut rows = sqlx::query(&query)
+    // Interpolates only the SQL constants above; values are bound.
+    let mut rows = sqlx::query(sqlx::AssertSqlSafe(query))
         .bind(account)
         .bind(confirmed_height)
         .map(|row: SqliteRow| {
@@ -2522,10 +2524,12 @@ pub async fn change_db_password(
 
     let mut connection = SqliteConnection::connect_with(&options).await?;
     let escaped_password = new_password.replace('\'', "''");
-    sqlx::query(&format!(
+    // ATTACH ... KEY takes no bind parameters: the path is built here, the password's quotes
+    // are doubled directly above.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ATTACH DATABASE '{}' AS new_db KEY '{}'",
         tmp_db_filepath, escaped_password
-    ))
+    )))
     .execute(&mut connection)
     .await?;
     sqlx::query("SELECT sqlcipher_export('new_db')")
@@ -2724,7 +2728,8 @@ pub async fn max_spendable(connection: &mut SqliteConnection, account: u32) -> R
     )
     .await?;
     let query = format!("SELECT SUM(n.value) {OWNED_UNSPENT_ZEC_NOTES} AND {AVAILABLE_NOTE}");
-    let (amount,): (Option<u64>,) = sqlx::query_as(&query)
+    // Interpolates only the SQL constants above; values are bound.
+    let (amount,): (Option<u64>,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
         .bind(account)
         .bind(confirmed_height)
         .fetch_one(connection)
@@ -2746,7 +2751,8 @@ pub async fn max_spendable_from_pools(
         {OWNED_UNSPENT_ZEC_NOTES} AND {AVAILABLE_NOTE} AND n.value >= ?3
         GROUP BY n.pool"
     );
-    let mut rows = sqlx::query(&query)
+    // Interpolates only the SQL constants above; values are bound.
+    let mut rows = sqlx::query(sqlx::AssertSqlSafe(query))
         .bind(account)
         .bind(confirmed_height)
         .bind(COST_PER_ACTION as i64)
@@ -2816,7 +2822,7 @@ pub(crate) mod tests {
         table: &str,
         column: &str,
     ) -> Option<Vec<u8>> {
-        sqlx::query_scalar(&format!("SELECT {column} FROM {table}"))
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT {column} FROM {table}")))
             .fetch_optional(&mut *connection)
             .await
             .expect("query")
@@ -2829,9 +2835,9 @@ pub(crate) mod tests {
         table: &str,
         column: &str,
     ) -> i64 {
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL"
-        ))
+        )))
         .fetch_one(&mut *connection)
         .await
         .expect("query")

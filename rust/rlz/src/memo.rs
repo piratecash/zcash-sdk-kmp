@@ -417,7 +417,7 @@ pub async fn decrypt_memo(
                         &action.encrypted_note().out_ciphertext,
                     ) {
                         let address =
-                            UnifiedAddress::from_receivers(Some(address), None, None).unwrap();
+                            UnifiedAddress::from_receivers(Some(address), None, None, None, None).unwrap();
                         let id_output = store_output(
                             connection,
                             account,
@@ -468,7 +468,7 @@ pub async fn decrypt_memo(
                                 .await?;
                             } else {
                                 let address = UnifiedAddress::from_receivers(
-                                    Some(address), None, None,
+                                    Some(address), None, None, None, None,
                                 )
                                 .unwrap();
                                 let id_output = store_output(

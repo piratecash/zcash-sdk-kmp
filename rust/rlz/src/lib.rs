@@ -35,8 +35,6 @@ pub mod plugin;
 pub mod recover;
 pub mod sync;
 pub mod vault;
-#[cfg(feature = "voting")]
-pub mod voting;
 pub mod warp;
 
 pub type Hash32 = [u8; 32];

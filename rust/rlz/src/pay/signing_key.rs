@@ -15,7 +15,7 @@ use zcash_keys::{
     encoding::decode_extended_spending_key,
     keys::{sapling::ExtendedSpendingKey, Era, UnifiedSpendingKey},
 };
-use zcash_protocol::consensus::{BranchId, NetworkConstants as _};
+use zcash_protocol::consensus::{BranchId, Parameters as _};
 use zcash_transparent::keys::AccountPrivKey;
 
 use crate::api::coin::Network;
@@ -206,10 +206,13 @@ pub fn encode_transparent(xprv: &str) -> Result<Vec<u8>, InvalidSpendingKey> {
 
 /// Encodes a Sapling extended spending key as a single-component envelope.
 pub fn encode_sapling(esk: &str, network: &Network) -> Result<Vec<u8>, InvalidSpendingKey> {
-    let key = decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), esk)
-        .map_err(|_| InvalidSpendingKey::MalformedComponent {
-            typecode: TYPECODE_SAPLING,
-        })?;
+    let key = decode_extended_spending_key(
+        zcash_keys::constants::hrp_sapling_extended_spending_key(network.network_type()),
+        esk,
+    )
+    .map_err(|_| InvalidSpendingKey::MalformedComponent {
+        typecode: TYPECODE_SAPLING,
+    })?;
     Ok(single_component_envelope(TYPECODE_SAPLING, &key.to_bytes()))
 }
 
@@ -218,6 +221,7 @@ mod tests {
     use super::*;
     use crate::account::tests::{test_usk, TEST_PHRASE};
     use bip32::Prefix;
+    use secrecy::ExposeSecret as _;
     use zcash_keys::encoding::encode_extended_spending_key;
 
     fn era_header() -> Vec<u8> {
@@ -245,7 +249,7 @@ mod tests {
         let seed = bip39::Mnemonic::from_str(TEST_PHRASE)
             .expect("phrase")
             .to_seed("");
-        ExtendedPrivateKey::<SecretKey>::new(seed)
+        ExtendedPrivateKey::<SecretKey>::new(&seed)
             .expect("xprv")
             .to_string(Prefix::XPRV)
             .to_string()
@@ -256,7 +260,7 @@ mod tests {
         let usk = test_usk(0);
         let bytes = usk.to_bytes(Era::Orchard);
 
-        let decoded = SigningKey::decode(&bytes).expect("valid unified envelope");
+        let decoded = SigningKey::decode(bytes.expose_secret()).expect("valid unified envelope");
 
         assert!(matches!(decoded, SigningKey::Unified(_)));
     }
@@ -283,7 +287,7 @@ mod tests {
         let network = Network::Main;
         let usk = test_usk(0);
         let esk = encode_extended_spending_key(
-            network.hrp_sapling_extended_spending_key(),
+            zcash_keys::constants::hrp_sapling_extended_spending_key(network.network_type()),
             usk.sapling(),
         );
         let expected = usk.sapling().to_bytes();
@@ -349,7 +353,7 @@ mod tests {
     #[test]
     fn decode_trailing_bytes_after_full_envelope_returns_trailing_bytes() {
         let usk = test_usk(0);
-        let mut bytes = usk.to_bytes(Era::Orchard);
+        let mut bytes = usk.to_bytes(Era::Orchard).expose_secret().clone();
         bytes.push(0);
 
         let error = decode_err(&bytes);

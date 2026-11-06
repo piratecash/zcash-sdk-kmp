@@ -231,8 +231,14 @@ pub async fn decode_raw_transaction(
                             try_note_decryption(&domain, &pivk, v)
                         {
                             let diversifier = recipient.diversifier().as_array().to_vec();
-                            let ua = UnifiedAddress::from_receivers(Some(recipient), None, None)
-                                .unwrap();
+                            let ua = UnifiedAddress::from_receivers(
+                                Some(recipient),
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .unwrap();
                             let address = ua.encode(network);
                             let diversifier_index = ivk
                                 .diversifier_index(&recipient)

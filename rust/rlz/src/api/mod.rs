@@ -23,6 +23,4 @@ pub mod sweep;
 pub mod sync;
 pub mod transaction;
 pub mod vault;
-#[cfg(feature = "voting")]
-pub mod voting;
 pub mod zsa;

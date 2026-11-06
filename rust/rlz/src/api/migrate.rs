@@ -143,7 +143,8 @@ async fn run_migration(
     cancellation_token: CancellationToken,
     block_height_tx: watch::Sender<Option<u32>>,
 ) -> Result<()> {
-    use rand_core::{OsRng, RngCore};
+    use rand::rngs::SysRng;
+    use rand_core::{Rng as _, UnwrapErr};
     use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
     // Migration only makes sense when Ironwood (NU6.3) is active.
@@ -187,7 +188,7 @@ async fn run_migration(
         // Delay before doing any migration-specific network activity. This
         // also applies to the first transaction.
         let mean = mean_delay_ms as f64;
-        let u = (OsRng.next_u32() as f64 + 1.0) / (u32::MAX as f64 + 2.0);
+        let u = (UnwrapErr(SysRng).next_u32() as f64 + 1.0) / (u32::MAX as f64 + 2.0);
         let delay_ms = ((-mean * u.ln()) as u64).min(mean_delay_ms * 4);
         let delay_secs = delay_ms / 1000;
 
