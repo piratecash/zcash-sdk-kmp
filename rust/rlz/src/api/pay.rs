@@ -255,6 +255,7 @@ pub async fn broadcast(
     let mut connection = c.get_connection().await?;
     let mut client = c.client().await?;
     crate::pay::reserve::reserve_and_send(
+        &c.network(),
         &mut connection,
         &mut client,
         c.account,

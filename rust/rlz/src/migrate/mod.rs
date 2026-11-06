@@ -284,6 +284,7 @@ fn broadcast_txid(outcome: BroadcastOutcome) -> Result<String> {
 }
 
 async fn broadcast(
+    network: &Network,
     connection: &mut SqliteConnection,
     client: &mut Client,
     account: u32,
@@ -291,7 +292,16 @@ async fn broadcast(
     tx: &[u8],
 ) -> Result<String> {
     broadcast_txid(
-        reserve_and_send(connection, client, account, height, tx, OwnInputs::Required).await?,
+        reserve_and_send(
+            network,
+            connection,
+            client,
+            account,
+            height,
+            tx,
+            OwnInputs::Required,
+        )
+        .await?,
     )
 }
 
@@ -421,7 +431,15 @@ pub async fn step(
             .unwrap_or(0);
         let pczt = sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
         let tx_bytes = extract_transaction(&pczt).await?;
-        let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
+        let txid = broadcast(
+            network,
+            &mut *connection,
+            client,
+            account,
+            height,
+            &tx_bytes,
+        )
+        .await?;
 
         return Ok(MigrationEvent::SplitComplete { fee, txid });
     }
@@ -514,7 +532,15 @@ pub async fn step(
             .unwrap_or(0);
         let pczt = sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
         let tx_bytes = extract_transaction(&pczt).await?;
-        let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
+        let txid = broadcast(
+            network,
+            &mut *connection,
+            client,
+            account,
+            height,
+            &tx_bytes,
+        )
+        .await?;
 
         return Ok(MigrationEvent::MigrateComplete { fee, txid });
     }

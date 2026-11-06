@@ -415,9 +415,8 @@ pub async fn plan_transaction(
     external_pczt_signing: bool,
 ) -> Result<PcztPackage> {
     let usable_pools = usable_pools(external_pczt_signing);
-    let height = client.latest_height().await?;
     // The next block is the earliest this can be mined in, so it decides the branch and the fee.
-    let target_height = height.saturating_add(1);
+    let target_height = client.latest_height().await?.saturating_add(1);
     let cost = cost_per_action(network, target_height);
     let mut input_pools = notes_in_source_pools(
         connection,
@@ -464,8 +463,8 @@ pub async fn plan_transaction(
     };
 
     let ironwood_active =
-        network.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(height));
-    let orchard_note_version = orchard_note_version_at(network, height);
+        network.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(target_height));
+    let orchard_note_version = orchard_note_version_at(network, target_height);
     let decomposed: Vec<DecomposedRecipient> = recipients
         .iter()
         .map(|r| {

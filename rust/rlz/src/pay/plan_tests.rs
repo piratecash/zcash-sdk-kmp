@@ -26,7 +26,9 @@ use crate::pay::pool::{ALL_POOLS, NUM_POOLS};
 use crate::pay::{Recipient, TxPlan};
 use crate::Client;
 
-const NU7_ACTIVATION: u32 = 3_543_405;
+pub(crate) const NU7_ACTIVATION: u32 = 3_543_405;
+const NU6_3_ACTIVATION: u32 = 3_428_143;
+const NU6_3_BRANCH: u32 = 0x37a5_165b;
 const NU7_BRANCH: u32 = 0x77190ad9;
 const NU7_EXPIRY_DELTA: u32 = 120;
 const LAST_LEGACY_TARGET: u32 = 3_589_999;
@@ -76,7 +78,10 @@ impl LwdServer for ScriptedServer {
         if heights.len() > 1 {
             return Ok(heights.pop_front().expect("scripted height"));
         }
-        Ok(*heights.front().expect("scripted height"))
+        heights
+            .front()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("height unavailable"))
     }
 
     async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {
@@ -285,6 +290,30 @@ async fn plan_transaction_tip_is_last_block_before_nu7_builds_for_nu7() {
         header_of(&package),
         (NU7_BRANCH, 6, NU7_ACTIVATION + NU7_EXPIRY_DELTA)
     );
+}
+
+#[tokio::test]
+async fn plan_transaction_tip_is_last_block_before_nu6_3_pays_the_ua_on_ironwood() {
+    let tip = NU6_3_ACTIVATION - 1;
+    let mut connection = memory_db().await;
+    let account = funded_account(&mut connection, tip, &[50_000]).await;
+    let address = shielded_recipient(&mut connection, account).await;
+
+    let package = plan(
+        &mut connection,
+        &silent_server(&[tip]),
+        account,
+        Payment::to(address, 10_000),
+    )
+    .await
+    .expect("plan");
+
+    assert_eq!(header_of(&package).0, NU6_3_BRANCH);
+    let plan = TxPlan::from_package(&Network::Main, &package).expect("plan");
+    assert!(plan
+        .outputs
+        .iter()
+        .any(|output| output.pool == 3 && output.amount == 10_000));
 }
 
 #[tokio::test]
