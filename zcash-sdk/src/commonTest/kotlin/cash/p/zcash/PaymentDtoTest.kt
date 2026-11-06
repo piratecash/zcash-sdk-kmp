@@ -70,4 +70,18 @@ class PaymentDtoTest {
         assertEquals(-25, result.errorCode)
         assertEquals("tx already committed to best chain", result.message)
     }
+
+    @Test
+    fun parseBroadcastResult_inputsReleased_reachesTheCaller() {
+        val result = parseBroadcastResult(
+            """{"errorCode":-26,"message":"bad-txns","inputsReleased":true}"""
+        )
+
+        assertTrue(result.inputsReleased)
+    }
+
+    @Test
+    fun parseMaxSendable_readsAmountAndFee() {
+        assertEquals(MaxSendable(amount = 85_000, fee = 20_000), parseMaxSendable("""{"amount":85000,"fee":20000}"""))
+    }
 }

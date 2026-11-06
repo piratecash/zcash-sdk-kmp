@@ -116,8 +116,53 @@ pub async fn reserve_and_send(
     raw: &[u8],
     own_inputs: OwnInputs,
 ) -> Result<BroadcastOutcome> {
-    reserve_transaction(connection, account, raw, own_inputs).await?;
-    crate::pay::send(client, height, raw).await
+    let parsed = parse_transaction(raw)?;
+    reserve_parsed_transaction(connection, account, &parsed, own_inputs).await?;
+    // An `Err` here is not a verdict: the bytes may have reached the node, so the inputs stay held.
+    let mut outcome = crate::pay::send(client, height, raw).await?;
+    if outcome.error_code != 0 && never_valid(&outcome.message) {
+        outcome.inputs_released = release_reservation(connection, account, &parsed.txid).await;
+    }
+    Ok(outcome)
+}
+
+async fn release_reservation(connection: &mut SqliteConnection, account: u32, txid: &[u8]) -> bool {
+    delete_reservation(connection, account, txid)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(account, "Reserved inputs not released: {error:#}");
+            false
+        })
+}
+
+async fn delete_reservation(
+    connection: &mut SqliteConnection,
+    account: u32,
+    txid: &[u8],
+) -> Result<bool> {
+    let mut transaction = connection.begin().await?;
+    let released =
+        sqlx::query("DELETE FROM pending_spend_inputs WHERE account = ?1 AND owner_txid = ?2")
+            .bind(account)
+            .bind(txid)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+    sqlx::query("DELETE FROM pending_txs WHERE account = ?1 AND txid = ?2")
+        .bind(account)
+        .bind(txid)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(released > 0)
+}
+
+/// Zebra queues a transaction for retry before admission, so an error answer alone does not mean
+/// it is dead: only a failure no later block can cure frees the inputs.
+fn never_valid(message: &str) -> bool {
+    message
+        .to_lowercase()
+        .contains("incorrect consensus branch id")
 }
 
 async fn reserve_parsed_transaction(
@@ -293,7 +338,11 @@ pub(crate) mod tests {
             calculate_balance_breakdown, max_spendable, store_pending_tx,
             tests::{memory_db, set_pool_sync_height_for_account, ACCOUNT},
         },
-        pay::{plan::fetch_unspent_notes_by_pool, pool::NUM_POOLS},
+        pay::{
+            plan::fetch_unspent_notes_by_pool,
+            plan_tests::{BroadcastReply, ScriptedServer},
+            pool::NUM_POOLS,
+        },
     };
     use proptest::{
         strategy::{Strategy, ValueTree},
@@ -1008,6 +1057,152 @@ pub(crate) mod tests {
         .expect_err("an expired transaction must still fail");
 
         assert!(error.to_string().contains("expired"));
+    }
+
+    /// A real transaction whose input is this account's note, reserved and sent to `reply`.
+    async fn send_own_transaction(
+        connection: &mut SqliteConnection,
+        reply: BroadcastReply,
+    ) -> Result<BroadcastOutcome> {
+        set_sync_height(connection, ACCOUNT, 100).await;
+        let (raw, input) = transparent_transaction();
+        insert_note(connection, ACCOUNT, &input, 50_000, 80).await;
+        let mut client = ScriptedServer::new(&[100], reply).client();
+        reserve_and_send(
+            connection,
+            &mut client,
+            ACCOUNT,
+            100,
+            &raw,
+            OwnInputs::Required,
+        )
+        .await
+    }
+
+    const BRANCH_ID_REJECTION: &str = "failed to validate tx: WtxId(\"private\"), error: \
+        transaction did not pass consensus validation: \
+        transaction uses an incorrect consensus branch id";
+
+    #[tokio::test]
+    async fn reserve_and_send_incorrect_branch_id_releases_the_inputs_for_the_next_plan() {
+        for message in [BRANCH_ID_REJECTION, "INCORRECT CONSENSUS BRANCH ID"] {
+            let mut connection = memory_db().await;
+
+            let outcome =
+                send_own_transaction(&mut connection, BroadcastReply::Verdict(-25, message))
+                    .await
+                    .expect("a verdict");
+
+            assert!(outcome.inputs_released, "{message}");
+            assert_eq!(outcome.error_code, -25);
+            assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (0, 0));
+            assert_eq!(
+                fetch_unspent_notes_by_pool(&mut connection, ACCOUNT)
+                    .await
+                    .expect("notes")[1]
+                    .len(),
+                1
+            );
+        }
+    }
+
+    async fn assert_nonzero_verdict_keeps_the_reservation(message: &'static str) {
+        let mut connection = memory_db().await;
+
+        let outcome = send_own_transaction(&mut connection, BroadcastReply::Verdict(-25, message))
+            .await
+            .expect("a verdict");
+
+        assert!(!outcome.inputs_released, "{message}");
+        assert_eq!(
+            pending_row_counts(&mut connection, ACCOUNT).await,
+            (1, 1),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_unknown_rejection_text_keeps_the_reservation() {
+        for message in [
+            "something this wallet has never seen",
+            "failed to validate tx: bad anchor",
+        ] {
+            assert_nonzero_verdict_keeps_the_reservation(message).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_mempool_disabled_keeps_the_reservation() {
+        assert_nonzero_verdict_keeps_the_reservation(
+            "mempool is disabled since synchronization is behind the chain tip",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_transaction_already_known_keeps_the_reservation() {
+        for message in [
+            "transaction dropped because it is already in the mempool",
+            "18: txn-already-in-mempool",
+            "transaction was committed to the best chain",
+        ] {
+            assert_nonzero_verdict_keeps_the_reservation(message).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_transport_failure_keeps_the_reservation() {
+        let mut connection = memory_db().await;
+
+        send_own_transaction(&mut connection, BroadcastReply::TransportFailure)
+            .await
+            .expect_err("the bytes may have left");
+
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_accepted_keeps_the_reservation() {
+        let mut connection = memory_db().await;
+
+        let outcome = send_own_transaction(&mut connection, BroadcastReply::Verdict(0, "ok"))
+            .await
+            .expect("a verdict");
+
+        assert!(!outcome.inputs_released);
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_optional_without_own_inputs_rejected_deletes_nothing() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect("another transaction's reservation");
+        let (raw, _) = transparent_transaction();
+        let mut client =
+            ScriptedServer::new(&[100], BroadcastReply::Verdict(-25, BRANCH_ID_REJECTION)).client();
+
+        let outcome = reserve_and_send(
+            &mut connection,
+            &mut client,
+            ACCOUNT,
+            100,
+            &raw,
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("a verdict");
+
+        assert!(!outcome.inputs_released);
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (1, 1));
     }
 
     #[tokio::test]

@@ -377,9 +377,20 @@ public enum class MigrationEvent {
 public data class BroadcastResult(
     val errorCode: Int,
     val message: String,
+    /** The node refused it for good and its inputs are spendable again. */
+    val inputsReleased: Boolean = false,
 ) {
     public val accepted: Boolean get() = errorCode == 0
 }
+
+/**
+ * What sending the whole balance delivers. To send it, prepare [amount] + [fee] with
+ * [PaymentOptions.recipientPaysFee]: a plain plan for [amount] may leave a note behind.
+ */
+public data class MaxSendable(
+    val amount: Long,
+    val fee: Long,
+)
 
 /**
  * One observation of the mempool. The flow ends when the native run stops — cleanly on

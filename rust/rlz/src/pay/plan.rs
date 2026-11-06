@@ -40,8 +40,7 @@ use zcash_keys::{
 };
 use zcash_note_encryption::Domain;
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, Builder, BundlePadding},
-    fees::zip317::FeeRule,
+    builder::{BuildConfig, Builder, BundlePadding, Error as BuilderError},
     TxVersion,
 };
 use zcash_proofs::prover::LocalTxProver;
@@ -63,20 +62,24 @@ use zip321::{Payment, TransactionRequest};
 
 use crate::{
     account::{
-        derive_transparent_sk, generate_next_change_address, get_account_full_address,
-        get_orchard_note, get_orchard_vk, get_sapling_note, get_sapling_vk,
+        derive_transparent_sk, get_account_full_address, get_orchard_note, get_orchard_vk,
+        get_sapling_note, get_sapling_vk, unused_change_address,
     },
-    api::{coin::Network, issuance::IssuanceInfo, pay::PcztPackage},
+    api::{
+        coin::Network,
+        issuance::IssuanceInfo,
+        pay::{MaxSendable, PaymentOptions, PcztPackage},
+    },
     db::{get_account_can_sign, get_account_dindex, get_account_hw, select_account_transparent},
     keys::{sapling_pgk_for_scope, sapling_ssk_for_scope, SaplingFullViewingKey},
     pay::{
         error::Error,
         external,
-        fee::COST_PER_ACTION,
+        fee::{cost_per_action, fee_rule},
         pool::{PoolMask, ALL_POOLS, NUM_POOLS},
         prepare::to_zec,
         signing_key::SigningKey,
-        solve, DecomposedRecipient, InputNote, ReceiverOption, Recipient, RecipientState,
+        solve, DecomposedRecipient, InputNote, ReceiverOption, Recipient, RecipientState, TxPlan,
     },
     warp::hasher::{empty_roots, OrchardHasher, SaplingHasher},
     Client,
@@ -295,12 +298,96 @@ pub(crate) fn restrict_to_source_pools(
 
 /// Drops ZEC notes too small to pay for a single logical action. ZSA amounts are
 /// denominated in their own asset and cannot pay fees, so the threshold ignores them.
-pub(crate) fn drop_zec_dust(input_pools: &mut [Vec<InputNote>]) {
+pub(crate) fn drop_zec_dust(input_pools: &mut [Vec<InputNote>], cost_per_action: u64) {
     for pool in input_pools.iter_mut() {
-        pool.retain(|n| {
-            let is_zec = n.asset_base.is_empty() || n.asset_base.iter().all(|&byte| byte == 0);
-            !is_zec || n.amount >= COST_PER_ACTION
-        });
+        pool.retain(|n| !is_zec_note(n) || n.amount >= cost_per_action);
+    }
+}
+
+fn is_zec_note(note: &InputNote) -> bool {
+    note.asset_base.is_empty() || note.asset_base.iter().all(|&byte| byte == 0)
+}
+
+fn usable_pools(external_pczt_signing: bool) -> u8 {
+    if external_pczt_signing {
+        external::USABLE_POOLS
+    } else {
+        ALL_POOLS
+    }
+}
+
+async fn notes_in_source_pools(
+    connection: &mut SqliteConnection,
+    account: u32,
+    src_pools: u8,
+    confirmations: u32,
+) -> Result<Vec<Vec<InputNote>>> {
+    let mut input_pools = fetch_unspent_notes_by_pool(connection, account).await?;
+    let max_height = crate::db::confirmed_height(&mut *connection, account, confirmations).await?;
+    restrict_to_source_pools(&mut input_pools, src_pools, max_height);
+    Ok(input_pools)
+}
+
+/// What sending every spendable ZEC note to `recipient` delivers. Reach it with
+/// `recipient_pays_fee` and `amount + fee`: a plain plan for `amount` may leave a note behind.
+pub async fn max_sendable(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    recipient: &Recipient,
+    options: &PaymentOptions,
+) -> Result<MaxSendable> {
+    let target_height = client.latest_height().await?.saturating_add(1);
+    let mut input_pools = notes_in_source_pools(
+        connection,
+        account,
+        options.src_pools & usable_pools(options.external_pczt_signing),
+        options.confirmations,
+    )
+    .await?;
+    drop_zec_dust(&mut input_pools, cost_per_action(network, target_height));
+    let total: u64 = input_pools
+        .iter()
+        .flatten()
+        .filter(|note| is_zec_note(note))
+        .map(|note| note.amount)
+        .sum();
+    let everything = Recipient {
+        amount: total,
+        ..recipient.clone()
+    };
+    let package = plan_transaction(
+        network,
+        connection,
+        client,
+        account,
+        options.src_pools,
+        &[everything],
+        true,
+        Some(options.confirmations),
+        false,
+        None,
+        None,
+        false,
+        None,
+        None,
+        options.hardware_signing,
+        options.external_pczt_signing,
+    )
+    .await;
+    match package {
+        Ok(package) => {
+            let fee = TxPlan::from_package(network, &package)?.fee;
+            Ok(MaxSendable {
+                amount: total - fee,
+                fee,
+            })
+        }
+        Err(error) if matches!(error.downcast_ref(), Some(Error::NoFeasibleSelection)) => {
+            Ok(MaxSendable { amount: 0, fee: 0 })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -327,16 +414,18 @@ pub async fn plan_transaction(
     // the device's limits, and - unlike `hardware_signing` - the branch's own tx version.
     external_pczt_signing: bool,
 ) -> Result<PcztPackage> {
-    let usable_pools = if external_pczt_signing {
-        external::USABLE_POOLS
-    } else {
-        ALL_POOLS
-    };
-    let mut input_pools = fetch_unspent_notes_by_pool(connection, account).await?;
+    let usable_pools = usable_pools(external_pczt_signing);
     let height = client.latest_height().await?;
-    let confirmations = confirmations.unwrap_or_default();
-    let max_height = crate::db::confirmed_height(&mut *connection, account, confirmations).await?;
-    restrict_to_source_pools(&mut input_pools, src_pools & usable_pools, max_height);
+    // The next block is the earliest this can be mined in, so it decides the branch and the fee.
+    let target_height = height.saturating_add(1);
+    let cost = cost_per_action(network, target_height);
+    let mut input_pools = notes_in_source_pools(
+        connection,
+        account,
+        src_pools & usable_pools,
+        confirmations.unwrap_or_default(),
+    )
+    .await?;
 
     // Preselected filter: restrict to specific note IDs (e.g. migration)
     if let Some(ids) = preselected {
@@ -443,7 +532,7 @@ pub async fn plan_transaction(
             .await?;
 
     let before_dust: [usize; NUM_POOLS] = std::array::from_fn(|p| input_pools[p].len());
-    drop_zec_dust(&mut input_pools);
+    drop_zec_dust(&mut input_pools, cost);
     info!(
         "plan: after dust filter — t:{}→{}, s:{}→{}, o:{}→{}, iw:{}→{}",
         before_dust[0],
@@ -555,13 +644,13 @@ pub async fn plan_transaction(
     let selection = solve::select_notes(
         &select_notes_input,
         &select_outputs,
-        COST_PER_ACTION,
+        cost,
         migration,
         recipient_pays_fee,
         recipients.first().map(|r| r.amount).unwrap_or(0),
         usable_pools,
     )
-    .ok_or_else(|| anyhow!("No feasible note selection found"))?;
+    .ok_or(Error::NoFeasibleSelection)?;
 
     info!(
         "plan: select_notes succeeded — fee={}, change_pool={}, selected_inputs={}",
@@ -647,7 +736,7 @@ pub async fn plan_transaction(
     // Issuance actions add separate logical actions on top of regular pool
     // actions (ZIP-233). First issuance: 2 notes (reference + real), reissuance: 1.
     let issuance_fee = issuance
-        .map(|info| if info.first_issuance { 2 } else { 1 } * COST_PER_ACTION)
+        .map(|info| if info.first_issuance { 2 } else { 1 } * cost)
         .unwrap_or(0);
     let fee = selection.fee + issuance_fee;
     info!("Fee (select_notes + issuance): {}", to_zec(fee));
@@ -723,7 +812,7 @@ pub async fn plan_transaction(
         get_account_full_address(network, connection, account, change_scope, hw).await?;
     let tkeys = select_account_transparent(connection, account, dindex).await?;
     if change_pool == 0 && tkeys.xvk.is_some() {
-        change_address = generate_next_change_address(network, connection, account)
+        change_address = unused_change_address(network, connection, account)
             .await?
             .unwrap();
     }
@@ -741,9 +830,6 @@ pub async fn plan_transaction(
     let can_sign = account_can_sign(connection, account).await?;
 
     // ── Build transaction ────────────────────────────────────────────────
-    let current_height = client.latest_height().await?;
-    let target_height = current_height;
-
     let build_config = BuildConfig::Standard {
         sapling_anchor: if has_pool[1] {
             sapling_crypto::Anchor::from_bytes(sapling_anchor).into_option()
@@ -985,13 +1071,7 @@ pub async fn plan_transaction(
     // ── Add change output ────────────────────────────────────────────────
     let mut transparent_change_label: Option<TransparentChangeLabel> = None;
     if change > 0 {
-        let change_addr = if change_pool == 0 && tkeys.xvk.is_some() {
-            generate_next_change_address(network, connection, account)
-                .await?
-                .unwrap()
-        } else {
-            change_address.clone()
-        };
+        let change_addr = change_address.clone();
         match change_pool {
             0 => {
                 let to = get_transparent_address(network, &change_addr)?;
@@ -1066,11 +1146,12 @@ pub async fn plan_transaction(
         builder.set_zsa_builder(zsa);
     }
 
-    let r = builder.build_for_pczt(
-        UnwrapErr(SysRng),
-        &FeeRule::standard(),
-        |_asset: &AssetBase| false,
-    )?;
+    let wants_v5 = wants_hardware_v5(hw, hardware_signing);
+    let r = builder
+        .build_for_pczt(UnwrapErr(SysRng), &fee_rule(cost), |_asset: &AssetBase| {
+            false
+        })
+        .map_err(|error| build_error(wants_v5, error))?;
     let sapling_meta = &r.sapling_meta;
     let ironwood_meta = &r.ironwood_meta;
 
@@ -1824,6 +1905,20 @@ fn orchard_proving_key_kind(branch_id: BranchId) -> OrchardProvingKeyKind {
     }
 }
 
+/// A v5 transaction fails the build only by touching Ironwood, which the builder words as a
+/// version problem.
+fn build_error<FE>(wants_v5: bool, error: BuilderError<FE>) -> anyhow::Error
+where
+    BuilderError<FE>: std::error::Error + Send + Sync + 'static,
+{
+    match error {
+        BuilderError::TargetIncompatible(..) if wants_v5 => {
+            anyhow!("Hardware signing cannot spend or receive Ironwood funds")
+        }
+        error => error.into(),
+    }
+}
+
 /// Whether the transaction must be forced to v5 (ZIP-244): either the account is
 /// itself hardware-bound (`hw != 0`), or this specific plan is being prepared for an
 /// external hardware signer that only understands v5.
@@ -2181,13 +2276,12 @@ mod tests {
     };
     use super::{
         attach_asset_names, get_transparent_address, label_transparent_outputs,
-        orchard_note_version_at, orchard_proving_key_kind, wants_hardware_v5, BranchId, Creator,
-        OrchardProvingKeyKind, Signer, TransparentChangeLabel,
+        orchard_note_version_at, orchard_proving_key_kind, wants_hardware_v5, BranchId,
+        BuilderError, Creator, OrchardProvingKeyKind, Signer, TransparentChangeLabel,
     };
     use super::{
-        AssetBase, BlockHeight, BuildConfig, Builder, BundlePadding, FeeRule, IoFinalizer,
-        OutPoint, SpendInfo, TransparentAddress, TransparentInputInfo, TxOut, TxVersion, Updater,
-        Zatoshis,
+        AssetBase, BlockHeight, BuildConfig, Builder, BundlePadding, IoFinalizer, OutPoint,
+        SpendInfo, TransparentAddress, TransparentInputInfo, TxOut, TxVersion, Updater, Zatoshis,
     };
     use crate::account::tests::{restore, test_usk, watch_only_keys, TEST_PHRASE};
     use crate::account::{derive_spending_key, derive_transparent_sk};
@@ -2212,6 +2306,7 @@ mod tests {
     use zcash_keys::encoding::encode_extended_spending_key;
     use zcash_keys::encoding::AddressCodec as _;
     use zcash_keys::keys::{sapling::ExtendedSpendingKey, Era, UnifiedSpendingKey};
+    use zcash_primitives::transaction::fees::zip317::FeeRule;
     use zcash_protocol::consensus::Parameters as _;
     use zcash_protocol::memo::MemoBytes;
     use zcash_transparent::{keys::AccountPrivKey, pczt::Bip32Derivation};
@@ -3449,6 +3544,51 @@ mod tests {
         assert_eq!(branch, BranchId::Zsa);
         assert_eq!(u32::from(branch), 0x7719_0ad8);
         assert_ne!(branch, BranchId::Nu7);
+    }
+
+    #[test]
+    fn build_error_software_plan_keeps_the_builders_own_text() {
+        let incompatible = || {
+            BuilderError::<std::convert::Infallible>::TargetIncompatible(
+                BranchId::Nu7,
+                TxVersion::V5,
+                None,
+            )
+        };
+
+        assert_eq!(
+            super::build_error(false, incompatible()).to_string(),
+            incompatible().to_string()
+        );
+        assert_eq!(
+            super::build_error(true, incompatible()).to_string(),
+            "Hardware signing cannot spend or receive Ironwood funds"
+        );
+    }
+
+    #[test]
+    fn drop_zec_dust_floor_is_the_cost_passed_in() {
+        use crate::pay::fee::{LEGACY_COST_PER_ACTION, REDUCED_COST_PER_ACTION};
+        use crate::pay::InputNote;
+
+        let kept = |cost| {
+            let note = |amount| InputNote {
+                id: 0,
+                height: 0,
+                amount,
+                remaining: amount,
+                pool: 0,
+                id_asset: None,
+                asset_base: vec![],
+                taddress: None,
+            };
+            let mut pools = vec![vec![note(999), note(1_000), note(4_999), note(5_000)]];
+            super::drop_zec_dust(&mut pools, cost);
+            pools[0].iter().map(|n| n.amount).collect::<Vec<_>>()
+        };
+
+        assert_eq!(kept(LEGACY_COST_PER_ACTION), [5_000]);
+        assert_eq!(kept(REDUCED_COST_PER_ACTION), [1_000, 4_999, 5_000]);
     }
 
     #[test]

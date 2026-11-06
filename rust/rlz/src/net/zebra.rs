@@ -238,6 +238,7 @@ impl LwdServer for ZebraClient {
         Ok(BroadcastOutcome {
             error_code: 0,
             message: rep,
+            inputs_released: false,
         })
     }
 
@@ -712,6 +713,7 @@ mod tests {
             BroadcastOutcome {
                 error_code: 0,
                 message: TxId::from_bytes(local).to_string(),
+                inputs_released: false,
             }
         );
     }

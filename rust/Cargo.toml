@@ -36,21 +36,26 @@ sapling-crypto = { git = "https://github.com/zcash-shielded-assets/sapling-crypt
 zcash_note_encryption = { git = "https://github.com/zcash-shielded-assets/zcash_note_encryption.git", rev = "54d2360c3b16561d7c00167dc0af7358251469c9" }
 
 # -- lrz with official NU7 --
-pczt = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zcash_address = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zcash_encoding = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zcash_keys = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zcash_primitives = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zcash_proofs = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zcash_protocol = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zcash_transparent = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
-zip321 = { git = "https://github.com/zcash-shielded-assets/librustzcash.git", rev = "fb3b4de5c304d2f07b0d8bf96f87f0c8337c68d5" }
+pczt = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_address = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_encoding = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_keys = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_primitives = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_proofs = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_protocol = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_transparent = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zip321 = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
 
 # -- remaining transitive deps --
 zcash_spec = { git = "https://github.com/zcash-shielded-assets/zcash_spec", rev = "d5e84264d2ad0646b587a837f4e2424ca64d3a05" }
 halo2_gadgets = { git = "https://github.com/zcash-shielded-assets/halo2.git", rev = "0e3f1ea9dcba44fa4cd213b3f06b2aee3fc6e90e" }
 halo2_proofs = { git = "https://github.com/zcash-shielded-assets/halo2.git", rev = "0e3f1ea9dcba44fa4cd213b3f06b2aee3fc6e90e" }
 halo2_poseidon = { git = "https://github.com/zcash-shielded-assets/halo2.git", rev = "0e3f1ea9dcba44fa4cd213b3f06b2aee3fc6e90e" }
+
+[patch."https://github.com/zcash-shielded-assets/librustzcash"]
+zcash_encoding = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_protocol = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
+zcash_transparent = { git = "https://github.com/piratecash/librustzcash", rev = "2ad1b01f750cde7d573688991026f539cb8b829e" }
 
 [profile.release]
 # Debug symbols dominate the shipped .so; the wallet ships stripped binaries.

@@ -362,27 +362,29 @@ async fn current_migration_status(
     let mut connection = c.get_connection().await?;
     let all_notes =
         crate::pay::plan::fetch_unspent_notes_grouped_by_pool(&mut connection, c.account).await?;
+    let cost = crate::db::next_block_cost(&c.network(), &mut connection, c.account).await?;
+    let pad = crate::migrate::sd_fee_pad(cost);
     let orchard_zec: Vec<&crate::pay::InputNote> = all_notes
         .iter()
         .filter(|n| n.pool == 2 && n.asset_base == vec![0u8; 32])
         .collect();
     let sd_count = orchard_zec
         .iter()
-        .filter(|n| crate::migrate::is_sd(n.amount))
+        .filter(|n| crate::migrate::is_sd(n.amount, pad))
         .count() as u32;
     let non_sd_vals: Vec<u64> = orchard_zec
         .iter()
-        .filter(|n| !crate::migrate::is_sd(n.amount))
+        .filter(|n| !crate::migrate::is_sd(n.amount, pad))
         .map(|n| n.amount)
         .collect();
-    let has_split = crate::migrate::has_split_transaction(non_sd_vals.clone());
+    let has_split = crate::migrate::has_split_transaction(non_sd_vals.clone(), cost);
     let effective_non_sd = if has_split {
         non_sd_vals.len() as u32
     } else {
         0
     };
 
-    // Count Ironwood SD notes for phase 2 progress (amount is value - SD_FEE_PAD).
+    // Count Ironwood SD notes for phase 2 progress (amount is value - fee pad).
     let ironwood_sd = all_notes
         .iter()
         .filter(|n| {

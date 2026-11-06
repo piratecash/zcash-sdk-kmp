@@ -444,6 +444,32 @@ public class ZcashWallet private constructor(
         PreparedTransaction(bytes)
     }
 
+    /** What sending all spendable ZEC in [options] to [address] delivers; zero if it cannot pay the fee. */
+    public suspend fun maxSendable(
+        account: Int,
+        address: String,
+        memo: String? = null,
+        options: PaymentOptions = PaymentOptions(),
+    ): MaxSendable = withNative {
+        parseMaxSendable(
+            ZcashJni.maxSendable(
+                handle,
+                account,
+                encodeRecipients(listOf(Recipient(address, 0L, memo = memo))),
+                options.sourcePools.mask.toByte(),
+                options.confirmations,
+                options.hardwareSigning,
+                options.externalPcztSigning,
+            )
+        )
+    }
+
+    /** ZIP-317 marginal fee at [targetHeight]: a transaction built now targets [latestHeight] + 1. */
+    public suspend fun feePerAction(targetHeight: Int): Long {
+        require(targetHeight >= 0) { "Target height must not be negative: $targetHeight" }
+        return withNative { ZcashJni.feePerAction(handle, targetHeight) }
+    }
+
     /** What [transaction] would spend and send, without signing or broadcasting it. */
     public suspend fun plan(transaction: PreparedTransaction): TransactionPlan =
         withNative { parseTransactionPlan(ZcashJni.transactionPlan(handle, transaction.bytes)) }

@@ -458,11 +458,23 @@ internal fun parseMigrationStep(json: String): MigrationStep =
 internal data class BroadcastResultDto(
     val errorCode: Int,
     val message: String,
+    val inputsReleased: Boolean = false,
 )
 
 internal fun parseBroadcastResult(json: String): BroadcastResult =
     nativeJson.decodeFromString<BroadcastResultDto>(json).let {
-        BroadcastResult(errorCode = it.errorCode, message = it.message)
+        BroadcastResult(errorCode = it.errorCode, message = it.message, inputsReleased = it.inputsReleased)
+    }
+
+@Serializable
+internal data class MaxSendableDto(
+    val amount: Long,
+    val fee: Long,
+)
+
+internal fun parseMaxSendable(json: String): MaxSendable =
+    nativeJson.decodeFromString<MaxSendableDto>(json).let {
+        MaxSendable(amount = it.amount, fee = it.fee)
     }
 
 @Serializable

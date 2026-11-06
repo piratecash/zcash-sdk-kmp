@@ -19,6 +19,8 @@ pub mod error;
 pub mod external;
 pub mod fee;
 pub mod plan;
+#[cfg(test)]
+pub(crate) mod plan_tests;
 pub mod pool;
 pub mod prepare;
 pub mod reserve;

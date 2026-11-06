@@ -9,6 +9,7 @@ use rlz::api::coin::{DatabaseStats, PoolStats};
 use rlz::api::mempool::{MempoolAmount, MempoolMsg, MempoolNote};
 use rlz::api::migrate::{MigrationEvent, MigrationStatus};
 use rlz::api::network::ServerProbe;
+use rlz::api::pay::MaxSendable;
 use rlz::net::{BroadcastOutcome, NetworkStats};
 use rlz::pay::{Recipient, TxPlan, TxPlanIn, TxPlanOut};
 use serde::{Deserialize, Serialize};
@@ -217,6 +218,7 @@ impl From<&Tx> for TxDto {
 pub struct BroadcastResultDto {
     pub error_code: i32,
     pub message: String,
+    pub inputs_released: bool,
 }
 
 impl From<BroadcastOutcome> for BroadcastResultDto {
@@ -224,6 +226,23 @@ impl From<BroadcastOutcome> for BroadcastResultDto {
         BroadcastResultDto {
             error_code: outcome.error_code,
             message: outcome.message,
+            inputs_released: outcome.inputs_released,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaxSendableDto {
+    pub amount: u64,
+    pub fee: u64,
+}
+
+impl From<MaxSendable> for MaxSendableDto {
+    fn from(max: MaxSendable) -> Self {
+        MaxSendableDto {
+            amount: max.amount,
+            fee: max.fee,
         }
     }
 }
@@ -441,10 +460,12 @@ mod tests {
         let dto = BroadcastResultDto::from(BroadcastOutcome {
             error_code: -25,
             message: "missing inputs".to_string(),
+            inputs_released: true,
         });
         let json = serde_json::to_string(&dto).unwrap();
 
         assert!(json.contains("errorCode"));
+        assert!(json.contains(r#""inputsReleased":true"#));
         assert_eq!(
             dto,
             serde_json::from_str::<BroadcastResultDto>(&json).unwrap()

@@ -4,6 +4,7 @@ use bincode::{config::legacy, Decode, Encode};
 use crate::{
     api::coin::{network_from_coin, Coin},
     pay::{
+        fee::cost_per_action,
         plan::{plan_transaction, NO_SPENDING_KEY},
         reserve::OwnInputs,
         Recipient, TxPlan,
@@ -25,6 +26,37 @@ pub struct PaymentOptions {
     /// Plans for a device that signs the PCZT field by field (e.g. Ledger); see
     /// [`crate::pay::external`].
     pub external_pczt_signing: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MaxSendable {
+    pub amount: u64,
+    pub fee: u64,
+}
+
+/// ZIP-317 marginal fee for a transaction mined at `target_height`, normally the chain tip + 1.
+#[cfg_attr(feature = "flutter", frb)]
+pub fn fee_per_action(target_height: u32, c: &Coin) -> u64 {
+    cost_per_action(&c.network(), target_height)
+}
+
+#[cfg_attr(feature = "flutter", frb)]
+pub async fn max_sendable(
+    recipient: &Recipient,
+    options: PaymentOptions,
+    c: &Coin,
+) -> Result<MaxSendable> {
+    let mut connection = c.get_connection().await?;
+    let mut client = c.client().await?;
+    crate::pay::plan::max_sendable(
+        &c.network(),
+        &mut *connection,
+        &mut client,
+        c.account,
+        recipient,
+        &options,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "flutter", frb)]

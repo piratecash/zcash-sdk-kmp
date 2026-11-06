@@ -8,6 +8,8 @@ pub enum Error {
     NotEnoughFunds(String),
     #[error("No Signing Key")]
     NoSigningKey,
+    #[error("No feasible note selection found")]
+    NoFeasibleSelection,
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]

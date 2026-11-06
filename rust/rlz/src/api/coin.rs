@@ -245,7 +245,7 @@ impl Coin {
         db_filepath: String,
         password: Option<String>,
     ) -> Result<Coin> {
-        let key_pragma = password.map(|p| format!("'{}'", p.replace('\'', "''")));
+        let key_pragma = password.as_deref().map(password_key_pragma);
         self.open_with_key_pragma(db_filepath, key_pragma).await
     }
 
@@ -889,7 +889,11 @@ fn resolved_or_input(resolved: PathBuf, input: &str) -> PathBuf {
     }
 }
 
-fn get_connect_options(
+pub(crate) fn password_key_pragma(password: &str) -> String {
+    format!("'{}'", password.replace('\'', "''"))
+}
+
+pub(crate) fn get_connect_options(
     db_filepath: impl AsRef<Path>,
     key_pragma: &Option<String>,
 ) -> SqliteConnectOptions {

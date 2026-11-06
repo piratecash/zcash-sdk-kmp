@@ -93,7 +93,7 @@ struct Context<'a> {
     output_amounts: [u64; N_POOLS], // output value per pool (zats)
     n_outputs: [u32; N_POOLS], // number of fixed recipient outputs per pool
     orchard_asset_outputs: Vec<u32>, // fixed Orchard recipient outputs per asset
-    f_unit: u64,       // COST_PER_ACTION (5000)
+    f_unit: u64,       // cost per action
     migration: bool,   // orchard fee = inputs+outputs instead of max
     recipient_pays_fee: bool,
     first_recipient_amount: u64,
@@ -550,7 +550,7 @@ impl Ord for QueueItem {
 
 /// Select notes to cover `outputs`, minimizing privacy cost and then fee.
 ///
-/// `f_unit` is `COST_PER_ACTION` (5000). ZEC notes with `amount < f_unit`
+/// `f_unit` is the cost per action. ZEC notes with `amount < f_unit`
 /// are filtered out because they can never pay for their own marginal fee.
 /// ZSA notes are retained because their amounts are not denominated in
 /// zatoshis and cannot pay transaction fees.
@@ -993,6 +993,58 @@ mod tests {
         );
     }
 
+    // Another pool's note costs two actions, more than it adds, so a plain plan for the
+    // same delivered amount leaves it behind. Only recipient_pays_fee empties the wallet.
+    #[test]
+    fn test_select_notes_recipient_pays_fee_cross_pool_spends_what_a_plain_plan_skips() {
+        let notes = vec![
+            Note {
+                pool: 3,
+                amount: 100_000,
+                pool_index: 0,
+                asset_index: 0,
+            },
+            Note {
+                pool: 2,
+                amount: 6_000,
+                pool_index: 0,
+                asset_index: 0,
+            },
+        ];
+        let output = |amount| {
+            vec![Output {
+                pool: 3,
+                amount,
+                asset_index: 0,
+            }]
+        };
+        let f_unit = 5_000u64;
+
+        let everything = select_notes(
+            &notes,
+            &output(106_000),
+            f_unit,
+            false,
+            true,
+            106_000,
+            ALL_POOLS,
+        )
+        .expect("should find a feasible selection");
+        assert_eq!((everything.inputs.len(), everything.fee), (2, 20_000));
+
+        let plain = select_notes(
+            &notes,
+            &output(86_000),
+            f_unit,
+            false,
+            false,
+            86_000,
+            ALL_POOLS,
+        )
+        .expect("should find a feasible selection");
+        assert_eq!((plain.inputs.len(), plain.fee), (1, 10_000));
+    }
+
     #[test]
     fn test_select_notes_recipient_pays_fee_too_high() {
         let notes = vec![
@@ -1224,10 +1276,11 @@ mod tests {
 
     // ---- Pool-restricted maximum ------------------------------------------
 
+    use crate::api::coin::Network;
     use crate::db::confirmed_height;
     use crate::db::max_spendable_from_pools;
     use crate::db::tests::{delete_note, insert_note, memory_db, set_sync_height, ACCOUNT};
-    use crate::pay::fee::COST_PER_ACTION;
+    use crate::pay::fee::LEGACY_COST_PER_ACTION;
     use crate::pay::plan::{drop_zec_dust, fetch_unspent_notes_by_pool, restrict_to_source_pools};
     use crate::pay::pool::{PoolMask, ALL_POOLS};
     use crate::pay::InputNote;
@@ -1245,10 +1298,10 @@ mod tests {
     const FIXTURE_NOTES: [(u32, u8, u64); 9] = [
         (1, 0, 60_000),
         (2, 0, 40_000),
-        (3, 0, COST_PER_ACTION - 1),
+        (3, 0, LEGACY_COST_PER_ACTION - 1),
         (4, 1, 100_000),
         (5, 1, 3_000),
-        (6, 1, COST_PER_ACTION),
+        (6, 1, LEGACY_COST_PER_ACTION),
         (7, 2, 70_000),
         (8, 2, 30_000),
         (9, 3, 50_000),
@@ -1275,7 +1328,7 @@ mod tests {
             .await
             .expect("unspent notes");
         restrict_to_source_pools(&mut input_pools, mask.0, max_height);
-        drop_zec_dust(&mut input_pools);
+        drop_zec_dust(&mut input_pools, LEGACY_COST_PER_ACTION);
         for (pool, notes) in input_pools.iter().enumerate() {
             assert!(
                 notes.is_empty() || mask.0 & (1 << pool) != 0,
@@ -1294,7 +1347,7 @@ mod tests {
             .expect("confirmed height");
 
         for (name, mask) in PCASH_SOURCE_MASKS {
-            let max = max_spendable_from_pools(&mut connection, ACCOUNT, mask, 0)
+            let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, mask, 0)
                 .await
                 .expect("maximum");
             assert!(
@@ -1329,7 +1382,7 @@ mod tests {
                     select_notes(
                         &notes,
                         &outputs,
-                        COST_PER_ACTION,
+                        LEGACY_COST_PER_ACTION,
                         false,
                         false,
                         max,
@@ -1349,9 +1402,10 @@ mod tests {
             let max_height = confirmed_height(&mut connection, ACCOUNT, 0)
                 .await
                 .expect("confirmed height");
-            let advertised = max_spendable_from_pools(&mut connection, ACCOUNT, mask, 0)
-                .await
-                .expect("maximum");
+            let advertised =
+                max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, mask, 0)
+                    .await
+                    .expect("maximum");
 
             let kept: Vec<u32> = planner_candidates(&mut connection, mask, max_height)
                 .await
@@ -1365,9 +1419,10 @@ mod tests {
                 }
             }
 
-            let without_discarded = max_spendable_from_pools(&mut connection, ACCOUNT, mask, 0)
-                .await
-                .expect("maximum");
+            let without_discarded =
+                max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, mask, 0)
+                    .await
+                    .expect("maximum");
 
             assert_eq!(without_discarded, advertised, "{name}");
         }

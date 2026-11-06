@@ -126,6 +126,18 @@ internal object ZcashJni {
         externalPcztSigning: Boolean,
     ): ByteArray
 
+    external fun maxSendable(
+        handle: Long,
+        account: Int,
+        recipientJson: String,
+        srcPools: Byte,
+        confirmations: Int,
+        hardwareSigning: Boolean,
+        externalPcztSigning: Boolean,
+    ): String
+
+    external fun feePerAction(handle: Long, targetHeight: Int): Long
+
     external fun transactionPlan(handle: Long, pkg: ByteArray): String
 
     /** Stateless: needs no open wallet. The JSON payload an external signer (e.g. Trezor) reviews and signs. */

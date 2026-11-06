@@ -117,6 +117,7 @@ impl LwdServer for GRPCClient {
         Ok(BroadcastOutcome {
             error_code: rep.error_code,
             message,
+            inputs_released: false,
         })
     }
 

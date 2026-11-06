@@ -840,11 +840,25 @@ pub async fn generate_next_dindex(
     Ok(dindex)
 }
 
-pub async fn generate_next_change_address(
+/// The highest change index while nothing has paid it, else a new one: planning without
+/// broadcasting must not walk the unused change run past the restore gap limit.
+pub async fn unused_change_address(
     network: &Network,
     connection: &mut SqliteConnection,
     account: u32,
 ) -> Result<Option<String>> {
+    let highest: Option<String> = sqlx::query_scalar(
+        "SELECT address FROM transparent_address_accounts
+        WHERE account = ? AND scope = 1 ORDER BY dindex DESC LIMIT 1",
+    )
+    .bind(account)
+    .fetch_optional(&mut *connection)
+    .await?;
+    if let Some(address) = highest {
+        if !transparent_address_is_used(&mut *connection, account, &address).await? {
+            return Ok(Some(address));
+        }
+    }
     generate_next_transparent_address(network, connection, account, 1).await
 }
 
@@ -2270,18 +2284,82 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn generate_next_change_address_uses_the_change_scope() {
+    async fn unused_change_address_uses_the_change_scope() {
         let mut connection = memory_db().await;
         let account = restore(&mut connection, TEST_PHRASE, 0, None)
             .await
             .expect("restore");
 
-        let change = generate_next_change_address(&Network::Main, &mut connection, account)
+        let change = unused_change_address(&Network::Main, &mut connection, account)
             .await
             .expect("generate")
             .expect("some");
 
         assert_eq!(scope_of(&mut connection, &change).await, 1);
+    }
+
+    async fn highest_change_index(connection: &mut SqliteConnection, account: u32) -> u32 {
+        sqlx::query_scalar(
+            "SELECT MAX(dindex) FROM transparent_address_accounts WHERE account = ? AND scope = 1",
+        )
+        .bind(account)
+        .fetch_one(connection)
+        .await
+        .expect("change index")
+    }
+
+    #[tokio::test]
+    async fn unused_change_address_nothing_paid_it_returns_the_same_address() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let first = unused_change_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("generate");
+        let highest = highest_change_index(&mut connection, account).await;
+
+        let second = unused_change_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("generate");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            highest_change_index(&mut connection, account).await,
+            highest
+        );
+    }
+
+    #[tokio::test]
+    async fn unused_change_address_once_it_holds_a_note_returns_a_new_index() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let first = unused_change_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("generate");
+        let highest = highest_change_index(&mut connection, account).await;
+        sqlx::query(
+            "INSERT INTO notes(height, account, pool, nullifier, tx, value, taddress)
+            SELECT 100, account, 0, x'01', 0, 1000, id_taddress
+            FROM transparent_address_accounts WHERE account = ?1 AND scope = 1 AND dindex = ?2",
+        )
+        .bind(account)
+        .bind(highest)
+        .execute(&mut connection)
+        .await
+        .expect("note");
+
+        let second = unused_change_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("generate");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            highest_change_index(&mut connection, account).await,
+            highest + 1
+        );
     }
 
     #[tokio::test]

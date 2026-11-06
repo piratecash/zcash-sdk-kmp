@@ -6,10 +6,7 @@ use csv_async::AsyncWriter;
 use futures::TryStreamExt;
 use orchard::keys::{FullViewingKey, SpendingKey};
 use sapling_crypto::PaymentAddress;
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteRow},
-    Column, Connection, Row, SqliteConnection, TypeInfo,
-};
+use sqlx::{sqlite::SqliteRow, Column, Connection, Row, SqliteConnection, TypeInfo};
 use tracing::debug;
 use zcash_keys::{
     encoding::AddressCodec,
@@ -22,9 +19,9 @@ use zcash_transparent::keys::{AccountPrivKey, AccountPubKey};
 use crate::api::account::Folder;
 use crate::api::account::TAddressTxCount;
 use crate::api::account::{Account, Memo, Tx};
-use crate::api::coin::Network;
+use crate::api::coin::{get_connect_options, password_key_pragma, Network};
 use crate::api::sync::{Balance, PoolBalance, PoolBalanceBreakdown};
-use crate::pay::fee::COST_PER_ACTION;
+use crate::pay::fee::cost_per_action;
 use crate::pay::pool::{PoolMask, NUM_POOLS};
 use crate::sync::BlockHeader;
 use crate::{api::account::TxNote, tiu};
@@ -2513,11 +2510,8 @@ pub async fn change_db_password(
     old_password: &str,
     new_password: &str,
 ) -> Result<()> {
-    let mut options = SqliteConnectOptions::new().filename(db_filepath);
-    if !old_password.is_empty() {
-        let escaped_old_password = old_password.replace('\'', "''");
-        options = options.pragma("key", format!("'{escaped_old_password}'"));
-    }
+    let key_pragma = (!old_password.is_empty()).then(|| password_key_pragma(old_password));
+    let options = get_connect_options(db_filepath, &key_pragma).create_if_missing(false);
 
     let tmp_db_filepath = format!("{tmp_dir}/__tmp.db");
     File::create(&tmp_db_filepath)?;
@@ -2737,15 +2731,29 @@ pub async fn max_spendable(connection: &mut SqliteConnection, account: u32) -> R
     Ok(amount.unwrap_or_default())
 }
 
+/// The marginal fee a transaction built now pays, as far as this account has synced.
+pub(crate) async fn next_block_cost(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<u64> {
+    let sync_height = get_sync_height(connection, account)
+        .await?
+        .unwrap_or_default();
+    Ok(cost_per_action(network, sync_height.saturating_add(1)))
+}
+
 /// A conservative lower bound on what is spendable from `pools`, fundable for ANY
 /// single recipient pool. Not the exact maximum: a same-pool send can afford more.
 pub async fn max_spendable_from_pools(
+    network: &Network,
     connection: &mut SqliteConnection,
     account: u32,
     pools: PoolMask,
     confirmations: u32,
 ) -> Result<u64> {
     let confirmed_height = confirmed_height(&mut *connection, account, confirmations).await?;
+    let cost = next_block_cost(network, &mut *connection, account).await?;
     let query = format!(
         "SELECT n.pool, SUM(n.value), COUNT(*)
         {OWNED_UNSPENT_ZEC_NOTES} AND {AVAILABLE_NOTE} AND n.value >= ?3
@@ -2755,7 +2763,7 @@ pub async fn max_spendable_from_pools(
     let mut rows = sqlx::query(sqlx::AssertSqlSafe(query))
         .bind(account)
         .bind(confirmed_height)
-        .bind(COST_PER_ACTION as i64)
+        .bind(cost as i64)
         .map(|row: SqliteRow| {
             (
                 row.get::<u8, _>(0),
@@ -2783,13 +2791,14 @@ pub async fn max_spendable_from_pools(
 
     // At most two outputs (recipient and change) can land in pools outside the mask,
     // and each such bundle costs at most two more actions.
-    let fee_bound = (actions + 4).max(2) * COST_PER_ACTION;
+    let fee_bound = (actions + 4).max(2) * cost;
     Ok(available.saturating_sub(fee_bound))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::pay::fee::LEGACY_COST_PER_ACTION;
 
     /// Every column a pre-ECC database used for spending secrets.
     pub(crate) const SECRET_COLUMNS: [(&str, &str); 4] = [
@@ -4276,7 +4285,7 @@ pub(crate) mod tests {
         insert_note(&mut connection, 1, 0, 0, 80, 100_000, None).await;
         insert_note(&mut connection, 2, 0, 1, 80, 900_000, Some(0)).await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, T, 10)
             .await
             .expect("max");
 
@@ -4291,7 +4300,7 @@ pub(crate) mod tests {
             insert_note(&mut connection, id, 0, 0, 80, 100_000, None).await;
         }
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, T, 10)
             .await
             .expect("max");
 
@@ -4304,7 +4313,7 @@ pub(crate) mod tests {
         set_sync_height(&mut connection, 100).await;
         insert_note(&mut connection, 1, 0, 1, 80, 100_000, Some(0)).await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, S, 10)
             .await
             .expect("max");
 
@@ -4318,7 +4327,7 @@ pub(crate) mod tests {
         insert_note(&mut connection, 1, 0, 2, 80, 100_000, Some(0)).await;
         insert_note(&mut connection, 2, 0, 3, 80, 200_000, Some(0)).await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, OI, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, OI, 10)
             .await
             .expect("max");
 
@@ -4330,9 +4339,18 @@ pub(crate) mod tests {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, 100).await;
         insert_note(&mut connection, 1, 0, 1, 80, 100_000, Some(0)).await;
-        insert_note(&mut connection, 2, 0, 1, 80, COST_PER_ACTION - 1, Some(0)).await;
+        insert_note(
+            &mut connection,
+            2,
+            0,
+            1,
+            80,
+            LEGACY_COST_PER_ACTION - 1,
+            Some(0),
+        )
+        .await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, S, 10)
             .await
             .expect("max");
 
@@ -4344,9 +4362,18 @@ pub(crate) mod tests {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, 100).await;
         insert_note(&mut connection, 1, 0, 1, 80, 100_000, Some(0)).await;
-        insert_note(&mut connection, 2, 0, 1, 80, COST_PER_ACTION, Some(0)).await;
+        insert_note(
+            &mut connection,
+            2,
+            0,
+            1,
+            80,
+            LEGACY_COST_PER_ACTION,
+            Some(0),
+        )
+        .await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, S, 10)
             .await
             .expect("max");
 
@@ -4357,9 +4384,9 @@ pub(crate) mod tests {
     async fn max_spendable_from_pools_fee_bound_above_available_returns_zero() {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, 100).await;
-        insert_note(&mut connection, 1, 0, 0, 80, COST_PER_ACTION, None).await;
+        insert_note(&mut connection, 1, 0, 0, 80, LEGACY_COST_PER_ACTION, None).await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, T, 10)
             .await
             .expect("max");
 
@@ -4367,11 +4394,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn max_spendable_from_pools_dust_floor_and_fee_follow_the_next_block() {
+        // (sync height, value above the floor, actions counted with the four extra, cost)
+        let cases = [
+            (3_589_998, 1_005_000, 6, 5_000),
+            (3_589_999, 1_010_999, 8, 1_000),
+        ];
+        for (sync_height, kept, actions, cost) in cases {
+            let mut connection = memory_db().await;
+            for (id, value) in [(1, 1_000_000), (2, 999), (3, 1_000), (4, 4_999), (5, 5_000)] {
+                insert_note(&mut connection, id, 0, 0, 80, value, None).await;
+            }
+            set_sync_height(&mut connection, sync_height).await;
+
+            let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, T, 10)
+                .await
+                .expect("max");
+
+            assert_eq!(max, kept - actions * cost, "sync height {sync_height}");
+        }
+    }
+
+    #[tokio::test]
     async fn max_spendable_from_pools_empty_account_returns_zero() {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, 100).await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, S, 10)
             .await
             .expect("max");
 
@@ -4386,7 +4435,7 @@ pub(crate) mod tests {
         insert_note(&mut connection, 2, 0, 0, 80, 500_000, None).await;
         reserve_note(&mut connection, 2).await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, T, 10)
             .await
             .expect("max");
 
@@ -4398,10 +4447,19 @@ pub(crate) mod tests {
         let mut connection = memory_db().await;
         set_sync_height(&mut connection, 100).await;
         for id in 1..=4u32 {
-            insert_note(&mut connection, id, 0, 1, 80, COST_PER_ACTION - 1, Some(0)).await;
+            insert_note(
+                &mut connection,
+                id,
+                0,
+                1,
+                80,
+                LEGACY_COST_PER_ACTION - 1,
+                Some(0),
+            )
+            .await;
         }
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, S, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, S, 10)
             .await
             .expect("max");
 
@@ -4419,7 +4477,7 @@ pub(crate) mod tests {
         lock_note(&mut connection, 3).await;
         spend_note(&mut connection, 4, 0, 99).await;
 
-        let max = max_spendable_from_pools(&mut connection, ACCOUNT, T, 10)
+        let max = max_spendable_from_pools(&Network::Main, &mut connection, ACCOUNT, T, 10)
             .await
             .expect("max");
 

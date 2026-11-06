@@ -415,11 +415,12 @@ pub async fn transparent_receive_index(c: &Coin, address: &str) -> Result<Option
     crate::db::transparent_receive_index(&mut connection, c.account, address).await
 }
 
+/// Reuses a change address nothing has paid yet. Name kept for the generated bridge.
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn generate_next_change_address(c: &Coin) -> Result<Option<String>> {
     let mut connection = c.get_connection().await?;
 
-    crate::account::generate_next_change_address(&c.network(), &mut connection, c.account).await
+    crate::account::unused_change_address(&c.network(), &mut connection, c.account).await
 }
 
 #[cfg_attr(feature = "flutter", frb)]

@@ -10,8 +10,9 @@ mod registry;
 mod sqlite_log;
 
 use dto::{
-    AccountDto, AddressesDto, BroadcastResultDto, DatabaseStatsDto, MigrationStatusDto,
-    MigrationStepDto, NetworkStatsDto, RecipientDto, ServerProbeDto, TxDto, TxPlanDto,
+    AccountDto, AddressesDto, BroadcastResultDto, DatabaseStatsDto, MaxSendableDto,
+    MigrationStatusDto, MigrationStepDto, NetworkStatsDto, RecipientDto, ServerProbeDto, TxDto,
+    TxPlanDto,
 };
 use jni::errors::ErrorPolicy;
 use jni::objects::{JByteArray, JIntArray, JLongArray, JObject, JObjectArray, JString};
@@ -35,9 +36,9 @@ use rlz::api::migrate::{migration_status, migration_step};
 use rlz::api::network::{get_current_height, probe_server};
 use rlz::api::pay::{
     apply_external_signatures, apply_transparent_signatures, broadcast, external_signing_view,
-    extract_transaction, pack_transaction, prepare, prove_transaction, reserve_for_broadcast,
-    sign_transaction_with_key, to_plan, transaction_id, transparent_signing_request,
-    unpack_transaction, PaymentOptions, PcztPackage,
+    extract_transaction, fee_per_action, max_sendable, pack_transaction, prepare,
+    prove_transaction, reserve_for_broadcast, sign_transaction_with_key, to_plan, transaction_id,
+    transparent_signing_request, unpack_transaction, PaymentOptions, PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sqlite_log::{describe, record};
@@ -272,6 +273,28 @@ fn build_new_account(
 fn parse_recipients(json: &str) -> Result<Vec<Recipient>, BridgeError> {
     let recipients: Vec<RecipientDto> = serde_json::from_str(json)?;
     Ok(recipients.into_iter().map(Recipient::from).collect())
+}
+
+fn payment_options(
+    src_pools: jbyte,
+    confirmations: jint,
+    hardware_signing: bool,
+    external_pczt_signing: bool,
+) -> Result<PaymentOptions, BridgeError> {
+    if confirmations < 0 {
+        return Err(BridgeError(
+            "Confirmations must not be negative".to_string(),
+        ));
+    }
+    Ok(PaymentOptions {
+        src_pools: src_pools as u8,
+        recipient_pays_fee: false,
+        smart_transparent: false,
+        confirmations: confirmations as u32,
+        category: None,
+        hardware_signing,
+        external_pczt_signing,
+    })
 }
 
 fn unpack_package(env: &Env<'_>, pkg: &JByteArray<'_>) -> Result<PcztPackage, BridgeError> {
@@ -1148,23 +1171,63 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_prepare<'local>(
     unowned_env
         .with_env(|env| -> Result<JByteArray<'local>, BridgeError> {
             let recipients = parse_recipients(&recipients_json.try_to_string(env)?)?;
-            if confirmations < 0 {
-                return Err(BridgeError(
-                    "Confirmations must not be negative".to_string(),
-                ));
-            }
-            let coin = wallet_account(handle, account)?;
-            let options = PaymentOptions {
-                src_pools: src_pools as u8,
-                recipient_pays_fee,
-                smart_transparent,
-                confirmations: confirmations as u32,
-                category: None,
+            let mut options = payment_options(
+                src_pools,
+                confirmations,
                 hardware_signing,
                 external_pczt_signing,
-            };
+            )?;
+            options.recipient_pays_fee = recipient_pays_fee;
+            options.smart_transparent = smart_transparent;
+            let coin = wallet_account(handle, account)?;
             let package = runtime().block_on(prepare(&recipients, options, &coin))?;
             pack_package(env, &package)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_maxSendable<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    recipient_json: JString<'local>,
+    src_pools: jbyte,
+    confirmations: jint,
+    hardware_signing: jboolean,
+    external_pczt_signing: jboolean,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> Result<JString<'local>, BridgeError> {
+            let recipients = parse_recipients(&recipient_json.try_to_string(env)?)?;
+            let [recipient] = recipients.as_slice() else {
+                return Err(BridgeError("Expected one recipient".to_string()));
+            };
+            let options = payment_options(
+                src_pools,
+                confirmations,
+                hardware_signing,
+                external_pczt_signing,
+            )?;
+            let coin = wallet_account(handle, account)?;
+            let max = runtime().block_on(max_sendable(recipient, options, &coin))?;
+            to_json(env, &MaxSendableDto::from(max))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_feePerAction<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    target_height: jint,
+) -> jlong {
+    unowned_env
+        .with_env(|_env| -> Result<jlong, BridgeError> {
+            let coin = wallet(handle)?;
+            Ok(fee_per_action(target_height.max(0) as u32, &coin) as jlong)
         })
         .resolve::<ThrowNativeError>()
 }
