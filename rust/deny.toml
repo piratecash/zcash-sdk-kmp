@@ -1,0 +1,26 @@
+[graph]
+# The hosts the release publishes natives for; see the verify list in ci.yml.
+targets = [
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+exclude-dev = true
+
+# Before dropping or extending an entry, re-check its reason with `cargo tree -i` and the call sites.
+[advisories]
+version = 2
+ignore = [
+    # Re-evaluate if a JNI entry point starts resolving OpenAlias, or on a hickory 0.26 move.
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.24: resolver reached only from flutter-only OpenAlias API; fix needs 0.26" },
+    # Re-evaluate on an arti upgrade or if the SDK ever acts as a Tor relay.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via tor-llcrypto: client verifies public-key signatures only, no private-key timing; no patch exists" },
+
+    # Unmaintained, no known vulnerability. Re-evaluate on any advisory against them or when a replacement lands upstream.
+    { id = "RUSTSEC-2024-0436", reason = "paste: proc-macro through arti, compile time only" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: proc-macro through age, compile time only" },
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml: build-time i18n config through age's proc-macros" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 2: pinned format of stored witnesses and FROST messages; also used by zcash-trees" },
+]

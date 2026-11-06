@@ -77,7 +77,7 @@ zcash_encoding = "0.5"
 zcash_keys = {version = "0.17", features = ["sapling", "orchard", "transparent-inputs", "unstable"]}
 zcash_note_encryption = "0.5.1"
 zcash_primitives = {version = "0.31", features = ["transparent-inputs", "zsa", "non-standard-fees"]}
-zcash_proofs = {version = "0.31", features = ["download-params"]}
+zcash_proofs = "0.31"
 zcash_protocol = {version = "0.11", features = ["local-consensus"]}
 zcash_script = "0.6"
 zcash_transparent = {version = "0.11", features = ["transparent-inputs"]}
