@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
 use orchard::keys::{FullViewingKey, Scope};
-use rand_core::OsRng;
-use reddsa::frost::redpallas::{
+use rand_core_legacy::OsRng;
+use reddsa_legacy::frost::redpallas::{
     frost::keys::{KeyPackage, PublicKeyPackage},
     keys::dkg::{self, round1, round2},
     keys::EvenY,
@@ -799,7 +799,7 @@ pub async fn do_dkg_impl(
     fvkb[0..32].copy_from_slice(&pkb);
     let shared_fvk = FullViewingKey::from_bytes(&fvkb).expect("Failed to create shared FVK");
     let address = shared_fvk.address_at(0u64, Scope::External);
-    let ua = UnifiedAddress::from_receivers(Some(address), None, None).unwrap();
+    let ua = UnifiedAddress::from_receivers(Some(address), None, None, None, None).unwrap();
     let sua = ua.encode(network);
     info!("Shared address: {sua}");
 

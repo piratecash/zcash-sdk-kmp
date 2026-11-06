@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 #[cfg(feature = "flutter")]
 use flutter_rust_bridge::frb;
-use rand_core::{OsRng, RngCore as _};
+use rand::rngs::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 use zcash_keys::keys::UnifiedFullViewingKey;
 
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
 #[cfg_attr(feature = "flutter", frb(sync))]
 pub fn generate_seed() -> Result<String> {
     let mut entropy = [0u8; 32];
-    OsRng.fill_bytes(&mut entropy);
+    UnwrapErr(SysRng).fill_bytes(&mut entropy);
     let m = bip39::Mnemonic::from_entropy(&entropy)?;
     Ok(m.to_string())
 }
@@ -154,7 +155,7 @@ fn classify_key(key: &str, network: &Network) -> Result<KeyKind> {
         let ufvk = UnifiedFullViewingKey::decode(network, key)
             .map_err(|_| anyhow::anyhow!("Invalid UFVK"))?;
         let mut pools = 0;
-        if ufvk.transparent().is_some() {
+        if ufvk.p2pkh().is_some() {
             pools |= 1;
         }
         if ufvk.sapling().is_some() {
@@ -236,7 +237,7 @@ mod tests {
     use bech32::{Bech32m, Hrp};
     use secp256k1::PublicKey;
     use zcash_keys::encoding::encode_extended_spending_key;
-    use zcash_protocol::consensus::NetworkConstants as _;
+    use zcash_protocol::consensus::Parameters as _;
 
     const MAIN: u8 = 0;
 
@@ -271,7 +272,7 @@ mod tests {
     fn foreign_network_esk() -> String {
         let usk = test_usk(0);
         encode_extended_spending_key(
-            Network::Test.hrp_sapling_extended_spending_key(),
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Test.network_type()),
             usk.sapling(),
         )
     }

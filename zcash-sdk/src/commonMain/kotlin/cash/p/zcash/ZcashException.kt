@@ -21,7 +21,16 @@ public class ZcashException(
                 else -> FailureCategory.OTHER
             }
         }
+
+    /** Set when the native side refused a plan the external signing device cannot sign. */
+    public val externalSigningRefusal: ExternalSigningRefusal?
+        get() {
+            val code = EXTERNAL_SIGNING_MARKER.find(message.orEmpty())?.groupValues?.get(1)
+            return ExternalSigningRefusal.entries.firstOrNull { it.code == code }
+        }
 }
+
+private val EXTERNAL_SIGNING_MARKER = Regex("""\[external-signing:([a-z-]+)]""")
 
 /** Starts the tail the native side appends to a database error. */
 private const val SQLITE_LOG_MARKER = " [sqlite: "

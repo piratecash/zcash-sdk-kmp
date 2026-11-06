@@ -292,6 +292,30 @@ public fun ZcashSdk.addressReceivers(address: String, network: ZcashNetwork): Ad
 }
 
 /**
+ * The Orchard receiver of the unified [address] alone, encoded exactly as the Ledger Zcash app shows an Orchard or
+ * Ironwood recipient; `null` when [address] is not a unified address on [network] or carries no Orchard receiver.
+ *
+ * The very first call blocks while the native library loads, unless [ZcashSdk.initialize] or any
+ * other SDK call already did it.
+ */
+public fun ZcashSdk.orchardOnlyAddress(address: String, network: ZcashNetwork): String? {
+    NativeLibrary.ensureLoadedBlocking()
+    return mapNativeError { ZcashJni.orchardOnlyAddress(network.coin, address) }
+}
+
+/**
+ * The `t1…` address the ZIP-320 TEX [address] encodes — what the Ledger Zcash app shows for a TEX
+ * recipient — or `null` when [address] is not a TEX address on [network].
+ *
+ * The very first call blocks while the native library loads, unless [ZcashSdk.initialize] or any
+ * other SDK call already did it.
+ */
+public fun ZcashSdk.transparentAddressOfTex(address: String, network: ZcashNetwork): String? {
+    NativeLibrary.ensureLoadedBlocking()
+    return mapNativeError { ZcashJni.transparentAddressOfTex(network.coin, address) }
+}
+
+/**
  * The txid of a fully signed transaction, in the display order explorers use.
  *
  * Needs no [ZcashSdk.initialize] and no open wallet: the bytes carry everything. An offline

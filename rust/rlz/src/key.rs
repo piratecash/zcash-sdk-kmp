@@ -17,7 +17,7 @@ use zcash_keys::{
     },
     keys::UnifiedFullViewingKey,
 };
-use zcash_protocol::consensus::NetworkConstants as _;
+use zcash_protocol::consensus::Parameters as _;
 use zcash_transparent::address::TransparentAddress;
 
 use crate::{
@@ -84,10 +84,16 @@ pub async fn get_account_ufvk(
         }
     }
 
-    let ufvk = Ufvk::try_from_items(items)?;
+    let ufvk = Ufvk::try_from_items(
+        zcash_address::unified::Revision::R0,
+        items
+            .into_iter()
+            .map(zcash_address::unified::Uitem::Data)
+            .collect(),
+    )?;
     let ufvk = UnifiedFullViewingKey::parse(&ufvk)?;
 
-    Ok(ufvk.encode(network))
+    Ok(ufvk.encode(network)?)
 }
 
 /// Auto-detection rejects a phrase whose every word exists in two wordlists
@@ -138,24 +144,35 @@ pub fn is_account_xpub(network: &Network, key: &str) -> bool {
 
 /// A Sapling extended spending key (`secret-extended-key-main` on mainnet).
 pub fn is_sapling_esk(network: &Network, key: &str) -> bool {
-    decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), key).is_ok()
+    decode_extended_spending_key(
+        zcash_keys::constants::hrp_sapling_extended_spending_key(network.network_type()),
+        key,
+    )
+    .is_ok()
 }
 
 /// A Sapling extended full viewing key.
 pub fn is_sapling_efvk(network: &Network, key: &str) -> bool {
-    decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), key).is_ok()
+    decode_extended_full_viewing_key(
+        zcash_keys::constants::hrp_sapling_extended_full_viewing_key(network.network_type()),
+        key,
+    )
+    .is_ok()
 }
 
 /// The Sapling extended full viewing key for a Sapling extended spending key on `network`, or
 /// `None` when `key` does not decode as one.
 pub fn sapling_viewing_key(network: &Network, key: &str) -> Option<String> {
-    let esk =
-        decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), key).ok()?;
+    let esk = decode_extended_spending_key(
+        zcash_keys::constants::hrp_sapling_extended_spending_key(network.network_type()),
+        key,
+    )
+    .ok()?;
     // The zxviews encoding needs the extended form; a DFVK drops depth/tag/child index/chain code.
     #[allow(deprecated)]
     let efvk = esk.to_extended_full_viewing_key();
     Some(encode_extended_full_viewing_key(
-        network.hrp_sapling_extended_full_viewing_key(),
+        zcash_keys::constants::hrp_sapling_extended_full_viewing_key(network.network_type()),
         &efvk,
     ))
 }
@@ -282,7 +299,7 @@ mod tests {
         use zcash_keys::encoding::encode_extended_spending_key;
 
         encode_extended_spending_key(
-            network.hrp_sapling_extended_spending_key(),
+            zcash_keys::constants::hrp_sapling_extended_spending_key(network.network_type()),
             crate::account::tests::test_usk(0).sapling(),
         )
     }

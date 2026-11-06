@@ -1,8 +1,11 @@
 use anyhow::{ensure, Context as _, Result};
 use sqlx::{Connection as _, Row, Sqlite, SqliteConnection, Transaction as SqliteTransaction};
-use zcash_primitives::transaction::{Authorized, OrchardBundle, Transaction, TransactionData};
+use zcash_primitives::transaction::{
+    Authorized, OrchardBundle, Transaction, TransactionData, TxVersion,
+};
 use zcash_protocol::consensus::BranchId;
 
+use crate::api::{coin::Network, pay::DEFAULT_CONFIRMATIONS};
 use crate::db::get_sync_height;
 use crate::{net::BroadcastOutcome, Client};
 
@@ -11,10 +14,13 @@ pub(crate) struct ParsedTransaction {
     pub txid: Vec<u8>,
     pub expiry_height: u32,
     pub inputs: Vec<Vec<u8>>,
+    /// `None` before v5: an older format does not carry its branch.
+    pub branch: Option<BranchId>,
 }
 
 pub(crate) fn parse_transaction(raw: &[u8]) -> Result<ParsedTransaction> {
     for branch in [
+        BranchId::Zsa,
         BranchId::Nu7,
         BranchId::Nu6_3,
         BranchId::Nu6_2,
@@ -34,11 +40,14 @@ pub(crate) fn parse_transaction(raw: &[u8]) -> Result<ParsedTransaction> {
 fn parsed_transaction(tx: Transaction) -> ParsedTransaction {
     let txid = tx.txid().as_ref().to_vec();
     let expiry_height = u32::from(tx.expiry_height());
+    let branch =
+        matches!(tx.version(), TxVersion::V5 | TxVersion::V6).then(|| tx.consensus_branch_id());
     let inputs = transaction_inputs(&tx.into_data());
     ParsedTransaction {
         txid,
         expiry_height,
         inputs,
+        branch,
     }
 }
 
@@ -108,6 +117,7 @@ pub async fn reserve_transaction(
 }
 
 pub async fn reserve_and_send(
+    network: &Network,
     connection: &mut SqliteConnection,
     client: &mut Client,
     account: u32,
@@ -115,8 +125,76 @@ pub async fn reserve_and_send(
     raw: &[u8],
     own_inputs: OwnInputs,
 ) -> Result<BroadcastOutcome> {
-    reserve_transaction(connection, account, raw, own_inputs).await?;
-    crate::pay::send(client, height, raw).await
+    let parsed = parse_transaction(raw)?;
+    reserve_parsed_transaction(connection, account, &parsed, own_inputs).await?;
+    // An `Err` here is not a verdict: the bytes may have reached the node, so the inputs stay held.
+    let mut outcome = crate::pay::send(client, height, raw).await?;
+    if outcome.error_code != 0 && cannot_be_mined(network, client, &parsed, &outcome.message).await
+    {
+        outcome.inputs_released = release_reservation(connection, account, &parsed.txid).await;
+    }
+    Ok(outcome)
+}
+
+async fn release_reservation(connection: &mut SqliteConnection, account: u32, txid: &[u8]) -> bool {
+    delete_reservation(connection, account, txid)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(account, "Reserved inputs not released: {error:#}");
+            false
+        })
+}
+
+async fn delete_reservation(
+    connection: &mut SqliteConnection,
+    account: u32,
+    txid: &[u8],
+) -> Result<bool> {
+    let mut transaction = connection.begin().await?;
+    let released =
+        sqlx::query("DELETE FROM pending_spend_inputs WHERE account = ?1 AND owner_txid = ?2")
+            .bind(account)
+            .bind(txid)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+    sqlx::query("DELETE FROM pending_txs WHERE account = ?1 AND txid = ?2")
+        .bind(account)
+        .bind(txid)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(released > 0)
+}
+
+/// A fork from before the branch ended could still mine the transaction, and a deleted reservation
+/// cannot come back: wait out the depth the wallet already trusts for confirmations.
+const REORG_MARGIN: u32 = DEFAULT_CONFIRMATIONS;
+
+/// Zebra retries what it refused, so a wrong-branch answer proves nothing until that branch is well
+/// over for the next block. The tip is read here: the caller's `height` may be the expiry height.
+async fn cannot_be_mined(
+    network: &Network,
+    client: &mut Client,
+    parsed: &ParsedTransaction,
+    message: &str,
+) -> bool {
+    if !message
+        .to_lowercase()
+        .contains("incorrect consensus branch id")
+    {
+        return false;
+    }
+    let Some((_, Some(end))) = parsed
+        .branch
+        .and_then(|branch| branch.height_bounds(network))
+    else {
+        return false;
+    };
+    let Ok(tip) = client.latest_height().await else {
+        return false;
+    };
+    u32::from(end).saturating_add(REORG_MARGIN) <= tip.saturating_add(1)
 }
 
 async fn reserve_parsed_transaction(
@@ -292,7 +370,11 @@ pub(crate) mod tests {
             calculate_balance_breakdown, max_spendable, store_pending_tx,
             tests::{memory_db, set_pool_sync_height_for_account, ACCOUNT},
         },
-        pay::{plan::fetch_unspent_notes_by_pool, pool::NUM_POOLS},
+        pay::{
+            plan::fetch_unspent_notes_by_pool,
+            plan_tests::{BroadcastReply, ScriptedServer, NU7_ACTIVATION},
+            pool::NUM_POOLS,
+        },
     };
     use proptest::{
         strategy::{Strategy, ValueTree},
@@ -365,6 +447,7 @@ pub(crate) mod tests {
             txid: vec![txid; 32],
             expiry_height,
             inputs: vec![NOTE.to_vec()],
+            branch: Some(BranchId::Nu6_3),
         }
     }
 
@@ -379,7 +462,7 @@ pub(crate) mod tests {
         bytes
     }
 
-    pub(crate) fn transparent_transaction() -> (Vec<u8>, Vec<u8>) {
+    fn transparent_spend() -> (Bundle<TransparentAuthorized>, Vec<u8>) {
         let bundle = Bundle {
             vin: vec![TxIn::from_parts(
                 OutPoint::new([1; 32], 0),
@@ -394,8 +477,13 @@ pub(crate) mod tests {
             .prevout()
             .write(&mut input)
             .expect("serialize outpoint");
+        (bundle, input)
+    }
+
+    fn transparent_v6_transaction(branch: BranchId) -> (Vec<u8>, Vec<u8>) {
+        let (bundle, input) = transparent_spend();
         let raw = serialize(TransactionData::<Authorized>::from_parts_v6(
-            BranchId::Nu6_3,
+            branch,
             0,
             0u32.into(),
             Zatoshis::ZERO,
@@ -405,6 +493,10 @@ pub(crate) mod tests {
             None,
         ));
         (raw, input)
+    }
+
+    pub(crate) fn transparent_transaction() -> (Vec<u8>, Vec<u8>) {
+        transparent_v6_transaction(BranchId::Nu6_3)
     }
 
     #[test]
@@ -464,6 +556,36 @@ pub(crate) mod tests {
                 .await
                 .expect("merged metadata");
         assert_eq!(metadata, (2.5, 7));
+    }
+
+    #[test]
+    fn parse_transaction_nu7_transparent_spend_returns_serialized_outpoint() {
+        let (raw, expected) = transparent_v6_transaction(BranchId::Nu7);
+
+        assert!(parse_transaction(&raw)
+            .expect("parse")
+            .inputs
+            .contains(&expected));
+    }
+
+    #[test]
+    fn parse_transaction_zsa_transparent_spend_returns_serialized_outpoint() {
+        let (bundle, expected) = transparent_spend();
+        let raw = serialize(TransactionData::<Authorized>::from_parts_zsa(
+            BranchId::Zsa,
+            0,
+            0u32.into(),
+            Zatoshis::ZERO,
+            Some(bundle),
+            None,
+            None,
+            None,
+        ));
+
+        assert!(parse_transaction(&raw)
+            .expect("parse")
+            .inputs
+            .contains(&expected));
     }
 
     #[test]
@@ -968,6 +1090,268 @@ pub(crate) mod tests {
         .expect_err("an expired transaction must still fail");
 
         assert!(error.to_string().contains("expired"));
+    }
+
+    /// `raw` spends this account's note, is reserved and sent with the chain at `tips`.
+    async fn send_at_tips(
+        connection: &mut SqliteConnection,
+        (raw, input): (Vec<u8>, Vec<u8>),
+        tips: &[u32],
+        reply: BroadcastReply,
+    ) -> Result<BroadcastOutcome> {
+        set_sync_height(connection, ACCOUNT, 100).await;
+        insert_note(connection, ACCOUNT, &input, 50_000, 80).await;
+        let mut client = ScriptedServer::new(tips, reply).client();
+        reserve_and_send(
+            &Network::Main,
+            connection,
+            &mut client,
+            ACCOUNT,
+            100,
+            &raw,
+            OwnInputs::Required,
+        )
+        .await
+    }
+
+    /// The first tip at which NU6.3 is over by the whole reorg margin for the next block.
+    const BRANCH_OVER_TIP: u32 = NU7_ACTIVATION + REORG_MARGIN - 1;
+
+    /// An NU6.3 transaction with that branch over.
+    async fn send_own_transaction(
+        connection: &mut SqliteConnection,
+        reply: BroadcastReply,
+    ) -> Result<BroadcastOutcome> {
+        send_at_tips(
+            connection,
+            transparent_transaction(),
+            &[BRANCH_OVER_TIP],
+            reply,
+        )
+        .await
+    }
+
+    async fn assert_branch_id_rejection_keeps_the_reservation(
+        transaction: (Vec<u8>, Vec<u8>),
+        tips: &[u32],
+    ) {
+        let mut connection = memory_db().await;
+
+        let outcome = send_at_tips(
+            &mut connection,
+            transaction,
+            tips,
+            BroadcastReply::Verdict(-25, BRANCH_ID_REJECTION),
+        )
+        .await
+        .expect("a verdict");
+
+        assert!(!outcome.inputs_released, "tips {tips:?}");
+        assert_eq!(
+            pending_row_counts(&mut connection, ACCOUNT).await,
+            (1, 1),
+            "tips {tips:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_branch_still_current_keeps_the_reservation() {
+        assert_branch_id_rejection_keeps_the_reservation(
+            transparent_transaction(),
+            &[NU7_ACTIVATION - 2],
+        )
+        .await;
+        assert_branch_id_rejection_keeps_the_reservation(
+            transparent_v6_transaction(BranchId::Nu7),
+            &[NU7_ACTIVATION + 10],
+        )
+        .await;
+    }
+
+    // Reproduced on regtest: built ahead of the node, refused, then mined from Zebra's retry queue.
+    #[tokio::test]
+    async fn reserve_and_send_branch_ahead_of_the_node_keeps_the_reservation() {
+        assert_branch_id_rejection_keeps_the_reservation(
+            transparent_v6_transaction(BranchId::Nu7),
+            &[NU7_ACTIVATION - 2],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_branch_ended_within_the_reorg_margin_keeps_the_reservation() {
+        assert_branch_id_rejection_keeps_the_reservation(
+            transparent_transaction(),
+            &[BRANCH_OVER_TIP - 1],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_tip_unreadable_keeps_the_reservation() {
+        assert_branch_id_rejection_keeps_the_reservation(transparent_transaction(), &[]).await;
+    }
+
+    #[test]
+    fn parse_transaction_records_the_branch_of_v5_and_v6_only() {
+        let older_format = |version, branch| {
+            let (bundle, _) = transparent_spend();
+            serialize(TransactionData::<Authorized>::from_parts(
+                version,
+                branch,
+                0,
+                0u32.into(),
+                Zatoshis::ZERO,
+                Some(bundle),
+                None,
+                None,
+                None,
+            ))
+        };
+        let branch_of = |raw: &[u8]| parse_transaction(raw).expect("parse").branch;
+
+        assert_eq!(
+            branch_of(&older_format(TxVersion::V4, BranchId::Canopy)),
+            None
+        );
+        assert_eq!(
+            branch_of(&older_format(TxVersion::V5, BranchId::Nu6)),
+            Some(BranchId::Nu6)
+        );
+        assert_eq!(
+            branch_of(&transparent_v6_transaction(BranchId::Nu7).0),
+            Some(BranchId::Nu7)
+        );
+    }
+
+    const BRANCH_ID_REJECTION: &str = "failed to validate tx: WtxId(\"private\"), error: \
+        transaction did not pass consensus validation: \
+        transaction uses an incorrect consensus branch id";
+
+    #[tokio::test]
+    async fn reserve_and_send_incorrect_branch_id_releases_the_inputs_for_the_next_plan() {
+        for message in [BRANCH_ID_REJECTION, "INCORRECT CONSENSUS BRANCH ID"] {
+            let mut connection = memory_db().await;
+
+            let outcome =
+                send_own_transaction(&mut connection, BroadcastReply::Verdict(-25, message))
+                    .await
+                    .expect("a verdict");
+
+            assert!(outcome.inputs_released, "{message}");
+            assert_eq!(outcome.error_code, -25);
+            assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (0, 0));
+            assert_eq!(
+                fetch_unspent_notes_by_pool(&mut connection, ACCOUNT)
+                    .await
+                    .expect("notes")[1]
+                    .len(),
+                1
+            );
+        }
+    }
+
+    async fn assert_nonzero_verdict_keeps_the_reservation(message: &'static str) {
+        let mut connection = memory_db().await;
+
+        let outcome = send_own_transaction(&mut connection, BroadcastReply::Verdict(-25, message))
+            .await
+            .expect("a verdict");
+
+        assert!(!outcome.inputs_released, "{message}");
+        assert_eq!(
+            pending_row_counts(&mut connection, ACCOUNT).await,
+            (1, 1),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_unknown_rejection_text_keeps_the_reservation() {
+        for message in [
+            "something this wallet has never seen",
+            "failed to validate tx: bad anchor",
+        ] {
+            assert_nonzero_verdict_keeps_the_reservation(message).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_mempool_disabled_keeps_the_reservation() {
+        assert_nonzero_verdict_keeps_the_reservation(
+            "mempool is disabled since synchronization is behind the chain tip",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_transaction_already_known_keeps_the_reservation() {
+        for message in [
+            "transaction dropped because it is already in the mempool",
+            "18: txn-already-in-mempool",
+            "transaction was committed to the best chain",
+        ] {
+            assert_nonzero_verdict_keeps_the_reservation(message).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_transport_failure_keeps_the_reservation() {
+        let mut connection = memory_db().await;
+
+        send_own_transaction(&mut connection, BroadcastReply::TransportFailure)
+            .await
+            .expect_err("the bytes may have left");
+
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_accepted_keeps_the_reservation() {
+        let mut connection = memory_db().await;
+
+        let outcome = send_own_transaction(&mut connection, BroadcastReply::Verdict(0, "ok"))
+            .await
+            .expect("a verdict");
+
+        assert!(!outcome.inputs_released);
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn reserve_and_send_optional_without_own_inputs_rejected_deletes_nothing() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 120),
+            OwnInputs::Required,
+        )
+        .await
+        .expect("another transaction's reservation");
+        let (raw, _) = transparent_transaction();
+        let mut client = ScriptedServer::new(
+            &[BRANCH_OVER_TIP],
+            BroadcastReply::Verdict(-25, BRANCH_ID_REJECTION),
+        )
+        .client();
+
+        let outcome = reserve_and_send(
+            &Network::Main,
+            &mut connection,
+            &mut client,
+            ACCOUNT,
+            100,
+            &raw,
+            OwnInputs::Optional,
+        )
+        .await
+        .expect("a verdict");
+
+        assert!(!outcome.inputs_released);
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (1, 1));
     }
 
     #[tokio::test]

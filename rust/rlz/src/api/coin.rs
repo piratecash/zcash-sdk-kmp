@@ -212,11 +212,12 @@ pub(crate) fn network_from_coin(coin: u8) -> Network {
             nu6_1: Some(BlockHeight::from_u32(1)),
             nu6_2: Some(BlockHeight::from_u32(1)),
             nu6_3: Some(BlockHeight::from_u32(250)),
+            zsa: None,
             nu7: None,
             orchard_mode: OrchardMode::Normal,
         }),
         3 => {
-            // ZSA regtest: NU7 active, no Ironwood (NU6.3 not active).
+            // ZSA regtest: the ZSA protocol active, no Ironwood (NU6.3 not active).
             // Orchard protocol V2 with cross-address transfers enabled.
             Network::ZsaRegtest(LocalNetwork {
                 overwinter: Some(BlockHeight::from_u32(1)),
@@ -229,7 +230,8 @@ pub(crate) fn network_from_coin(coin: u8) -> Network {
                 nu6_1: Some(BlockHeight::from_u32(1)),
                 nu6_2: Some(BlockHeight::from_u32(1)),
                 nu6_3: None,
-                nu7: Some(BlockHeight::from_u32(1)),
+                zsa: Some(BlockHeight::from_u32(1)),
+                nu7: None,
                 orchard_mode: OrchardMode::Zsa,
             })
         }
@@ -243,7 +245,7 @@ impl Coin {
         db_filepath: String,
         password: Option<String>,
     ) -> Result<Coin> {
-        let key_pragma = password.map(|p| format!("'{}'", p.replace('\'', "''")));
+        let key_pragma = password.as_deref().map(password_key_pragma);
         self.open_with_key_pragma(db_filepath, key_pragma).await
     }
 
@@ -887,7 +889,11 @@ fn resolved_or_input(resolved: PathBuf, input: &str) -> PathBuf {
     }
 }
 
-fn get_connect_options(
+pub(crate) fn password_key_pragma(password: &str) -> String {
+    format!("'{}'", password.replace('\'', "''"))
+}
+
+pub(crate) fn get_connect_options(
     db_filepath: impl AsRef<Path>,
     key_pragma: &Option<String>,
 ) -> SqliteConnectOptions {

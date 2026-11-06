@@ -25,7 +25,8 @@ use pczt::{
     },
     Pczt,
 };
-use rand_core::{OsRng, RngCore};
+use rand::rngs::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 use ripemd::Ripemd160;
 use sapling_crypto::PaymentAddress;
 use secp256k1::{PublicKey, SecretKey};
@@ -39,8 +40,7 @@ use zcash_keys::{
 };
 use zcash_note_encryption::Domain;
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, Builder, BundlePadding},
-    fees::zip317::FeeRule,
+    builder::{BuildConfig, Builder, BundlePadding, Error as BuilderError},
     TxVersion,
 };
 use zcash_proofs::prover::LocalTxProver;
@@ -62,25 +62,56 @@ use zip321::{Payment, TransactionRequest};
 
 use crate::{
     account::{
-        derive_transparent_sk, generate_next_change_address, get_account_full_address,
-        get_orchard_note, get_orchard_vk, get_sapling_note, get_sapling_vk,
+        derive_transparent_sk, get_account_full_address, get_orchard_note, get_orchard_vk,
+        get_sapling_note, get_sapling_vk, unused_change_address,
     },
-    api::{coin::Network, issuance::IssuanceInfo, pay::PcztPackage},
+    api::{
+        coin::Network,
+        issuance::IssuanceInfo,
+        pay::{MaxSendable, PaymentOptions, PcztPackage},
+    },
     db::{get_account_can_sign, get_account_dindex, get_account_hw, select_account_transparent},
     keys::{sapling_pgk_for_scope, sapling_ssk_for_scope, SaplingFullViewingKey},
     pay::{
         error::Error,
-        fee::COST_PER_ACTION,
-        pool::{PoolMask, NUM_POOLS},
+        external,
+        fee::{cost_per_action, fee_rule},
+        pool::{PoolMask, ALL_POOLS, NUM_POOLS},
         prepare::to_zec,
         signing_key::SigningKey,
-        solve, DecomposedRecipient, InputNote, ReceiverOption, Recipient, RecipientState,
+        solve, DecomposedRecipient, InputNote, ReceiverOption, Recipient, RecipientState, TxPlan,
     },
     warp::hasher::{empty_roots, OrchardHasher, SaplingHasher},
     Client,
 };
 
 use zcash_primitives::transaction::zsa_builder::ZsaBuilder;
+
+fn is_zsa_at(network: &Network, height: u32) -> bool {
+    BranchId::for_height(network, BlockHeight::from_u32(height)) == BranchId::Zsa
+}
+
+fn orchard_note_version_at(network: &Network, height: u32) -> orchard::NoteVersion {
+    if is_zsa_at(network, height) {
+        orchard::NoteVersion::V3ZSA
+    } else {
+        orchard::NoteVersion::V2
+    }
+}
+
+pub(super) fn attach_asset_names(
+    updater: Updater,
+    network: &Network,
+    target_height: u32,
+    asset_names: &HashMap<[u8; 32], String>,
+) -> Result<Updater> {
+    if is_zsa_at(network, target_height) {
+        updater.update_orchard_zsa_with(|u| attach_orchard_asset_names(u, asset_names))
+    } else {
+        updater.update_orchard_with(|u| attach_orchard_asset_names(u, asset_names))
+    }
+    .map_err(|error| anyhow!("Failed to attach Orchard asset names: {error:?}"))
+}
 
 fn attach_orchard_asset_names<D: Domain>(
     mut updater: orchard::pczt::Updater<'_, D>,
@@ -149,7 +180,7 @@ fn build_zsa_builder(info: &IssuanceInfo, oaddress: orchard::Address) -> Result<
         oaddress,
         NoteValue::from_raw(info.amount),
         info.first_issuance,
-        &mut OsRng,
+        &mut UnwrapErr(SysRng),
     )
     .map_err(|e| anyhow!("Failed to add issue output: {e:?}"))?;
     if info.finalize {
@@ -267,12 +298,96 @@ pub(crate) fn restrict_to_source_pools(
 
 /// Drops ZEC notes too small to pay for a single logical action. ZSA amounts are
 /// denominated in their own asset and cannot pay fees, so the threshold ignores them.
-pub(crate) fn drop_zec_dust(input_pools: &mut [Vec<InputNote>]) {
+pub(crate) fn drop_zec_dust(input_pools: &mut [Vec<InputNote>], cost_per_action: u64) {
     for pool in input_pools.iter_mut() {
-        pool.retain(|n| {
-            let is_zec = n.asset_base.is_empty() || n.asset_base.iter().all(|&byte| byte == 0);
-            !is_zec || n.amount >= COST_PER_ACTION
-        });
+        pool.retain(|n| !is_zec_note(n) || n.amount >= cost_per_action);
+    }
+}
+
+fn is_zec_note(note: &InputNote) -> bool {
+    note.asset_base.is_empty() || note.asset_base.iter().all(|&byte| byte == 0)
+}
+
+fn usable_pools(external_pczt_signing: bool) -> u8 {
+    if external_pczt_signing {
+        external::USABLE_POOLS
+    } else {
+        ALL_POOLS
+    }
+}
+
+async fn notes_in_source_pools(
+    connection: &mut SqliteConnection,
+    account: u32,
+    src_pools: u8,
+    confirmations: u32,
+) -> Result<Vec<Vec<InputNote>>> {
+    let mut input_pools = fetch_unspent_notes_by_pool(connection, account).await?;
+    let max_height = crate::db::confirmed_height(&mut *connection, account, confirmations).await?;
+    restrict_to_source_pools(&mut input_pools, src_pools, max_height);
+    Ok(input_pools)
+}
+
+/// What sending every spendable ZEC note to `recipient` delivers. Reach it with
+/// `recipient_pays_fee` and `amount + fee`: a plain plan for `amount` may leave a note behind.
+pub async fn max_sendable(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    recipient: &Recipient,
+    options: &PaymentOptions,
+) -> Result<MaxSendable> {
+    let target_height = client.latest_height().await?.saturating_add(1);
+    let mut input_pools = notes_in_source_pools(
+        connection,
+        account,
+        options.src_pools & usable_pools(options.external_pczt_signing),
+        options.confirmations,
+    )
+    .await?;
+    drop_zec_dust(&mut input_pools, cost_per_action(network, target_height));
+    let total: u64 = input_pools
+        .iter()
+        .flatten()
+        .filter(|note| is_zec_note(note))
+        .map(|note| note.amount)
+        .sum();
+    let everything = Recipient {
+        amount: total,
+        ..recipient.clone()
+    };
+    let package = plan_transaction(
+        network,
+        connection,
+        client,
+        account,
+        options.src_pools,
+        &[everything],
+        true,
+        Some(options.confirmations),
+        false,
+        None,
+        None,
+        false,
+        None,
+        None,
+        options.hardware_signing,
+        options.external_pczt_signing,
+    )
+    .await;
+    match package {
+        Ok(package) => {
+            let fee = TxPlan::from_package(network, &package)?.fee;
+            Ok(MaxSendable {
+                amount: total - fee,
+                fee,
+            })
+        }
+        Err(error) if matches!(error.downcast_ref(), Some(Error::NoFeasibleSelection)) => {
+            Ok(MaxSendable { amount: 0, fee: 0 })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -295,12 +410,21 @@ pub async fn plan_transaction(
     // Forces a v5 (ZIP-244) transaction, the only version an external hardware signer
     // (e.g. Trezor) currently understands, regardless of the account's own `hw` flag.
     hardware_signing: bool,
+    // Plans for a signer that takes the PCZT field by field (e.g. Ledger): no Sapling, within
+    // the device's limits, and - unlike `hardware_signing` - the branch's own tx version.
+    external_pczt_signing: bool,
 ) -> Result<PcztPackage> {
-    let mut input_pools = fetch_unspent_notes_by_pool(connection, account).await?;
-    let height = client.latest_height().await?;
-    let confirmations = confirmations.unwrap_or_default();
-    let max_height = crate::db::confirmed_height(&mut *connection, account, confirmations).await?;
-    restrict_to_source_pools(&mut input_pools, src_pools, max_height);
+    let usable_pools = usable_pools(external_pczt_signing);
+    // The next block is the earliest this can be mined in, so it decides the branch and the fee.
+    let target_height = client.latest_height().await?.saturating_add(1);
+    let cost = cost_per_action(network, target_height);
+    let mut input_pools = notes_in_source_pools(
+        connection,
+        account,
+        src_pools & usable_pools,
+        confirmations.unwrap_or_default(),
+    )
+    .await?;
 
     // Preselected filter: restrict to specific note IDs (e.g. migration)
     if let Some(ids) = preselected {
@@ -323,7 +447,7 @@ pub async fn plan_transaction(
         let notes = if groups.is_empty() {
             vec![]
         } else {
-            let i = OsRng.next_u32() as usize % groups.len();
+            let i = UnwrapErr(SysRng).next_u32() as usize % groups.len();
             groups[i].clone()
         };
         let max = notes.iter().map(|n| n.amount).sum::<u64>();
@@ -339,13 +463,8 @@ pub async fn plan_transaction(
     };
 
     let ironwood_active =
-        network.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(height));
-    let orchard_note_version =
-        if BranchId::for_height(network, BlockHeight::from_u32(height)) == BranchId::Nu7 {
-            orchard::NoteVersion::V3ZSA
-        } else {
-            orchard::NoteVersion::V2
-        };
+        network.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(target_height));
+    let orchard_note_version = orchard_note_version_at(network, target_height);
     let decomposed: Vec<DecomposedRecipient> = recipients
         .iter()
         .map(|r| {
@@ -412,7 +531,7 @@ pub async fn plan_transaction(
             .await?;
 
     let before_dust: [usize; NUM_POOLS] = std::array::from_fn(|p| input_pools[p].len());
-    drop_zec_dust(&mut input_pools);
+    drop_zec_dust(&mut input_pools, cost);
     info!(
         "plan: after dust filter — t:{}→{}, s:{}→{}, o:{}→{}, iw:{}→{}",
         before_dust[0],
@@ -495,6 +614,9 @@ pub async fn plan_transaction(
                 .unwrap_or(dr.receiver.pool)
         })
         .collect();
+    if external_pczt_signing {
+        external::check_recipient_pools(&pool_prefs)?;
+    }
 
     let select_outputs: Vec<solve::Output> = pool_prefs
         .iter()
@@ -521,12 +643,13 @@ pub async fn plan_transaction(
     let selection = solve::select_notes(
         &select_notes_input,
         &select_outputs,
-        COST_PER_ACTION,
+        cost,
         migration,
         recipient_pays_fee,
         recipients.first().map(|r| r.amount).unwrap_or(0),
+        usable_pools,
     )
-    .ok_or_else(|| anyhow!("No feasible note selection found"))?;
+    .ok_or(Error::NoFeasibleSelection)?;
 
     info!(
         "plan: select_notes succeeded — fee={}, change_pool={}, selected_inputs={}",
@@ -612,7 +735,7 @@ pub async fn plan_transaction(
     // Issuance actions add separate logical actions on top of regular pool
     // actions (ZIP-233). First issuance: 2 notes (reference + real), reissuance: 1.
     let issuance_fee = issuance
-        .map(|info| if info.first_issuance { 2 } else { 1 } * COST_PER_ACTION)
+        .map(|info| if info.first_issuance { 2 } else { 1 } * cost)
         .unwrap_or(0);
     let fee = selection.fee + issuance_fee;
     info!("Fee (select_notes + issuance): {}", to_zec(fee));
@@ -688,7 +811,7 @@ pub async fn plan_transaction(
         get_account_full_address(network, connection, account, change_scope, hw).await?;
     let tkeys = select_account_transparent(connection, account, dindex).await?;
     if change_pool == 0 && tkeys.xvk.is_some() {
-        change_address = generate_next_change_address(network, connection, account)
+        change_address = unused_change_address(network, connection, account)
             .await?
             .unwrap();
     }
@@ -706,9 +829,6 @@ pub async fn plan_transaction(
     let can_sign = account_can_sign(connection, account).await?;
 
     // ── Build transaction ────────────────────────────────────────────────
-    let current_height = client.latest_height().await?;
-    let target_height = current_height;
-
     let build_config = BuildConfig::Standard {
         sapling_anchor: if has_pool[1] {
             sapling_crypto::Anchor::from_bytes(sapling_anchor).into_option()
@@ -732,9 +852,9 @@ pub async fn plan_transaction(
 
     // Hardware (Ledger) wallets only support v5 (ZIP-244) transaction signing.
     // The Zondax "Zcash Shielded" app predates NU6.3 and cannot sign v6/Ironwood
-    // transactions, so force a v5 tx while keeping consensus_branch_id = Nu6_3
-    // (V5 is valid in Nu6_3 per TxVersion::valid_in_branch). A v5 tx carrying the
-    // current Nu6_3 branch id is valid on the network.
+    // transactions, so force a v5 tx while keeping the current consensus_branch_id
+    // (V5 is valid in Nu6_3 and Nu7 per TxVersion::valid_in_branch). A v5 tx carrying
+    // the current branch id is valid on the network.
     if wants_hardware_v5(hw, hardware_signing) {
         builder
             .propose_version::<()>(TxVersion::V5)
@@ -950,13 +1070,7 @@ pub async fn plan_transaction(
     // ── Add change output ────────────────────────────────────────────────
     let mut transparent_change_label: Option<TransparentChangeLabel> = None;
     if change > 0 {
-        let change_addr = if change_pool == 0 && tkeys.xvk.is_some() {
-            generate_next_change_address(network, connection, account)
-                .await?
-                .unwrap()
-        } else {
-            change_address.clone()
-        };
+        let change_addr = change_address.clone();
         match change_pool {
             0 => {
                 let to = get_transparent_address(network, &change_addr)?;
@@ -1031,7 +1145,12 @@ pub async fn plan_transaction(
         builder.set_zsa_builder(zsa);
     }
 
-    let r = builder.build_for_pczt(OsRng, &FeeRule::standard(), |_asset: &AssetBase| false)?;
+    let wants_v5 = wants_hardware_v5(hw, hardware_signing);
+    let r = builder
+        .build_for_pczt(UnwrapErr(SysRng), &fee_rule(cost), |_asset: &AssetBase| {
+            false
+        })
+        .map_err(|error| build_error(wants_v5, error))?;
     let sapling_meta = &r.sapling_meta;
     let ironwood_meta = &r.ironwood_meta;
 
@@ -1108,13 +1227,7 @@ pub async fn plan_transaction(
         })
         .unwrap();
 
-    let updater =
-        if BranchId::for_height(network, BlockHeight::from_u32(target_height)) == BranchId::Nu7 {
-            updater.update_orchard_zsa_with(|u| attach_orchard_asset_names(u, &asset_names))
-        } else {
-            updater.update_orchard_with(|u| attach_orchard_asset_names(u, &asset_names))
-        }
-        .map_err(|error| anyhow!("Failed to attach Orchard asset names: {error:?}"))?;
+    let updater = attach_asset_names(updater, network, target_height, &asset_names)?;
 
     let pczt = updater.finish();
 
@@ -1126,14 +1239,19 @@ pub async fn plan_transaction(
             .address_at(dindex, Scope::External);
         let zsa_builder = build_zsa_builder(info, oaddress)?;
         Issuer::new(pczt)
-            .build_awaiting_sighash(zsa_builder, OsRng)
+            .build_awaiting_sighash(zsa_builder, UnwrapErr(SysRng))
             .map_err(|e| anyhow!("Issuer (phase 1) failed: {e:?}"))?
     } else {
         pczt
     };
 
-    let (pczt, shielded_sighash) = IoFinalizer::new(pczt).finalize_io().unwrap();
+    let (pczt, shielded_sighash) = IoFinalizer::new(pczt)
+        .finalize_io(UnwrapErr(SysRng))
+        .unwrap();
     info!("IO Finalized");
+    if external_pczt_signing {
+        external::check_device_limits(&pczt)?;
+    }
 
     // Issuer phase 2: sign the issue bundle
     let pczt = if let Some(info) = issuance {
@@ -1285,7 +1403,10 @@ async fn verify_spending_key(
     let mut compared = 0;
     for (table, expected) in derived {
         let stored: Option<Option<Vec<u8>>> =
-            sqlx::query_scalar(&format!("SELECT xvk FROM {table} WHERE account = ?"))
+            // `table` is one of the literals above.
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT xvk FROM {table} WHERE account = ?"
+            )))
                 .bind(account)
                 .fetch_optional(&mut *connection)
                 .await?;
@@ -1357,8 +1478,10 @@ pub async fn sign_transaction(
         updater
     } else {
         let esk = require_sapling_key(&key)?;
-        let pgk = esk.expsk.proof_generation_key();
-        let internal_pgk = esk.derive_internal().expsk.proof_generation_key();
+        let pgk = esk.expsk().proof_generation_key();
+        let internal_pgk = sapling_ssk_for_scope(1u8, esk)?
+            .expsk()
+            .proof_generation_key();
         updater
             .update_sapling_with(|mut u| {
                 for (bundle_index, scope) in &sapling_scopes {
@@ -1434,8 +1557,7 @@ pub async fn sign_transaction(
         let sk = SecretKey::from_bytes(&sk).map_err(|_| Error::NoSigningKey)?;
 
         // Derive pubkey from secret key to check
-        let secp = secp256k1::Secp256k1::new();
-        let derived_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let derived_pubkey = secp256k1::PublicKey::from_secret_key(&sk);
         let derived_compressed = derived_pubkey.serialize();
         let derived_uncompressed = derived_pubkey.serialize_uncompressed();
         let hash_compressed = zcash_transparent::util::hash160::hash(&derived_compressed);
@@ -1456,7 +1578,7 @@ pub async fn sign_transaction(
             anyhow!("failed to compute sighash for transparent input {index}: {e:?}")
         })?;
         let msg = secp256k1::Message::from_digest(sighash);
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        let sig = secp256k1::ecdsa::sign(msg, &sk);
 
         // Append the signature - the pubkey will be retrieved from hash160_preimages
         info!("Appending signature for input {}", index);
@@ -1469,9 +1591,9 @@ pub async fn sign_transaction(
     for (index, (bundle_index, scope)) in sapling_scopes.iter().enumerate() {
         info!("signing sapling {index}");
         let esk = require_sapling_key(&key)?;
-        let ssk = sapling_ssk_for_scope(*scope, esk);
+        let ssk = sapling_ssk_for_scope(*scope, esk)?;
         signer
-            .sign_sapling(*bundle_index, &ssk.expsk.ask)
+            .sign_sapling(UnwrapErr(SysRng), *bundle_index, ssk.expsk().ask())
             .map_err(|e| {
                 anyhow!(
                     "failed to sign sapling spend {bundle_index} (selected spend {index}): {e:?}"
@@ -1481,39 +1603,31 @@ pub async fn sign_transaction(
     for (index, bundle_index) in orchard_indices.iter().enumerate() {
         info!("signing orchard {index}");
         let osak = require_orchard_key(&key, "orchard")?;
-        signer.sign_orchard(*bundle_index, &osak).map_err(|e| {
-            anyhow!("failed to sign Orchard action {bundle_index} (selected spend {index}): {e:?}")
-        })?;
+        signer
+            .sign_orchard(UnwrapErr(SysRng), *bundle_index, &osak)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to sign Orchard action {bundle_index} (selected spend {index}): {e:?}"
+                )
+            })?;
     }
     for (index, bundle_index) in ironwood_indices.iter().enumerate() {
         info!("signing ironwood {index}");
         let osak = require_orchard_key(&key, "ironwood")?;
-        signer.sign_ironwood(*bundle_index, &osak).map_err(|e| {
-            anyhow!("failed to sign Ironwood action {bundle_index} (selected spend {index}): {e:?}")
-        })?;
+        signer
+            .sign_ironwood(UnwrapErr(SysRng), *bundle_index, &osak)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to sign Ironwood action {bundle_index} (selected spend {index}): {e:?}"
+                )
+            })?;
     }
     let pczt = signer.finish();
 
     span.in_scope(|| {
         info!("Adding Proofs to PCZT");
     });
-    let prover = Prover::new(pczt);
-    let prover = if prover.requires_sapling_proofs() {
-        let sapling_prover = get_sapling_prover().await?;
-        prover
-            .create_sapling_proofs(sapling_prover, sapling_prover)
-            .map_err(|error| anyhow!("failed to create Sapling proofs: {error:?}"))?
-    } else {
-        prover
-    };
-
-    let pczt = prover
-        .create_orchard_proof(orchard_pk)
-        .map_err(|error| anyhow!("failed to create Orchard proof: {error:?}"))?
-        .create_ironwood_proof(&IRONWOOD_PK)
-        .map_err(|error| anyhow!("failed to create Ironwood proof: {error:?}"))?
-        .finish();
-    info!("Proved");
+    let pczt = prove(pczt, orchard_pk).await?;
 
     let pczt = SpendFinalizer::new(pczt)
         .finalize_spends()
@@ -1536,6 +1650,28 @@ pub async fn sign_transaction(
     })
 }
 
+/// The Prover role: needs no spending key, only the PCZT and the circuit parameters.
+pub(super) async fn prove(pczt: Pczt, orchard_pk: &ProvingKey) -> Result<Pczt> {
+    let prover = Prover::new(pczt);
+    let prover = if prover.requires_sapling_proofs() {
+        let sapling_prover = get_sapling_prover().await?;
+        prover
+            .create_sapling_proofs(UnwrapErr(SysRng), sapling_prover, sapling_prover)
+            .map_err(|error| anyhow!("failed to create Sapling proofs: {error:?}"))?
+    } else {
+        prover
+    };
+
+    let pczt = prover
+        .create_orchard_proof(UnwrapErr(SysRng), orchard_pk)
+        .map_err(|error| anyhow!("failed to create Orchard proof: {error:?}"))?
+        .create_ironwood_proof(UnwrapErr(SysRng), &IRONWOOD_PK)
+        .map_err(|error| anyhow!("failed to create Ironwood proof: {error:?}"))?
+        .finish();
+    info!("Proved");
+    Ok(pczt)
+}
+
 pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
     let span = span!(Level::INFO, "transaction");
     span.in_scope(|| {
@@ -1555,7 +1691,7 @@ pub async fn extract_transaction(package: &PcztPackage) -> Result<Vec<u8>> {
     if let Some((svk, ovk)) = &keys {
         tx_extractor = tx_extractor.with_sapling(svk, ovk);
     }
-    match tx_extractor.extract() {
+    match tx_extractor.extract(UnwrapErr(SysRng)) {
         Ok(tx) => {
             if let Some(bundle) = tx.sapling_bundle() {
                 let vb: i64 = (*bundle.value_balance()).into();
@@ -1762,9 +1898,23 @@ enum OrchardProvingKeyKind {
 
 fn orchard_proving_key_kind(branch_id: BranchId) -> OrchardProvingKeyKind {
     match branch_id {
-        BranchId::Nu7 => OrchardProvingKeyKind::Zsa,
-        BranchId::Nu6_3 => OrchardProvingKeyKind::Ironwood,
+        BranchId::Zsa => OrchardProvingKeyKind::Zsa,
+        BranchId::Nu6_3 | BranchId::Nu7 => OrchardProvingKeyKind::Ironwood,
         _ => OrchardProvingKeyKind::Vanilla,
+    }
+}
+
+/// A v5 transaction fails the build only by touching Ironwood, which the builder words as a
+/// version problem.
+fn build_error<FE>(wants_v5: bool, error: BuilderError<FE>) -> anyhow::Error
+where
+    BuilderError<FE>: std::error::Error + Send + Sync + 'static,
+{
+    match error {
+        BuilderError::TargetIncompatible(..) if wants_v5 => {
+            anyhow!("Hardware signing cannot spend or receive Ironwood funds")
+        }
+        error => error.into(),
     }
 }
 
@@ -1777,11 +1927,11 @@ fn wants_hardware_v5(hw: u8, hardware_signing: bool) -> bool {
 
 /// The change output's own derivation path, so an external signer can recognise the
 /// output as its own change rather than a payment to a third party.
-struct TransparentChangeLabel {
-    pubkey: PublicKey,
-    scope: u32,
-    dindex: u32,
-    address: String,
+pub(super) struct TransparentChangeLabel {
+    pub(super) pubkey: PublicKey,
+    pub(super) scope: u32,
+    pub(super) dindex: u32,
+    pub(super) address: String,
 }
 
 async fn load_transparent_change_label(
@@ -1809,7 +1959,7 @@ async fn load_transparent_change_label(
 /// Labels a planned transparent bundle's outputs for an external signer: each recipient
 /// output gets the user-facing address it pays, and the change output (if any) gets its
 /// own BIP-32 derivation so the signer can recognise it as change rather than a payment.
-fn label_transparent_outputs(
+pub(super) fn label_transparent_outputs(
     mut u: zcash_transparent::pczt::Updater<'_>,
     recipient_addresses: Vec<String>,
     change: Option<TransparentChangeLabel>,
@@ -2005,33 +2155,13 @@ pub fn apply_transparent_signatures(
         ));
     }
 
-    let expected = package.n_spends[0];
-    let mut seen = vec![false; expected];
-    for &index in indices {
-        let index = index as usize;
-        if index >= expected {
-            return Err(anyhow!(
-                "transparent input index {index} is out of range: only {expected} transparent input(s)"
-            ));
-        }
-        if seen[index] {
-            return Err(anyhow!("duplicate signature for transparent input {index}"));
-        }
-        seen[index] = true;
-    }
-    if let Some(index) = seen.iter().position(|signed| !signed) {
-        return Err(anyhow!("missing a signature for transparent input {index}"));
-    }
+    let expected: Vec<usize> = (0..package.n_spends[0]).collect();
+    check_signature_cover(indices, &expected, "transparent input")?;
 
     let signatures = indices
         .iter()
         .zip(sigs.iter())
-        .map(|(&index, sig)| {
-            let signature = secp256k1::ecdsa::Signature::from_der(sig).map_err(|error| {
-                anyhow!("signature for transparent input {index} is not valid DER: {error}")
-            })?;
-            Ok((index as usize, signature))
-        })
+        .map(|(&index, sig)| Ok((index as usize, parse_transparent_signature(index, sig)?)))
         .collect::<Result<Vec<_>>>()?;
 
     let pczt =
@@ -2039,36 +2169,85 @@ pub fn apply_transparent_signatures(
     let mut signer =
         Signer::new(pczt).map_err(|error| anyhow!("failed to start signing session: {error:?}"))?;
     for (index, signature) in signatures {
-        signer
-            .append_transparent_signature(index, signature)
-            .map_err(|error| match error {
-                pczt::roles::signer::Error::InvalidIndex => {
-                    anyhow!("transparent input index {index} is out of range")
-                }
-                pczt::roles::signer::Error::TransparentSign(error) => anyhow!(
-                    "signature for transparent input {index} failed sighash verification: {error:?}"
-                ),
-                other => {
-                    anyhow!("failed to apply signature for transparent input {index}: {other:?}")
-                }
-            })?;
+        append_transparent_signature(&mut signer, index, signature)?;
     }
+    finalize_signed(package, signer)
+}
 
-    let pczt = signer.finish();
-    let pczt = SpendFinalizer::new(pczt)
+/// Every index in `indices` is one of `expected`, none repeats, and none of `expected` is left out.
+pub(super) fn check_signature_cover(indices: &[u32], expected: &[usize], what: &str) -> Result<()> {
+    let mut seen = vec![false; expected.len()];
+    for &index in indices {
+        let slot = expected
+            .iter()
+            .position(|&e| e == index as usize)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{what} index {index} is out of range: the {what}s to sign are {expected:?}"
+                )
+            })?;
+        if seen[slot] {
+            return Err(anyhow!("duplicate signature for {what} {index}"));
+        }
+        seen[slot] = true;
+    }
+    if let Some(slot) = seen.iter().position(|signed| !signed) {
+        return Err(anyhow!("missing a signature for {what} {}", expected[slot]));
+    }
+    Ok(())
+}
+
+pub(super) fn parse_transparent_signature(
+    index: u32,
+    der: &[u8],
+) -> Result<secp256k1::ecdsa::Signature> {
+    secp256k1::ecdsa::Signature::from_der(der).map_err(|error| {
+        anyhow!("signature for transparent input {index} is not valid DER: {error}")
+    })
+}
+
+pub(super) fn append_transparent_signature(
+    signer: &mut Signer,
+    index: usize,
+    signature: secp256k1::ecdsa::Signature,
+) -> Result<()> {
+    signer
+        .append_transparent_signature(index, signature)
+        .map_err(|error| match error {
+            pczt::roles::signer::Error::InvalidIndex => {
+                anyhow!("transparent input index {index} is out of range")
+            }
+            pczt::roles::signer::Error::TransparentSign(error) => anyhow!(
+                "signature for transparent input {index} failed sighash verification: {error:?}"
+            ),
+            other => anyhow!("failed to apply signature for transparent input {index}: {other:?}"),
+        })
+}
+
+/// Finalizes the spends of a fully signed PCZT; the result is ready for [`extract_transaction`].
+pub(super) fn finalize_signed(package: &PcztPackage, signer: Signer) -> Result<PcztPackage> {
+    let pczt = SpendFinalizer::new(signer.finish())
         .finalize_spends()
         .map_err(|error| anyhow!("failed to finalize PCZT spends: {error:?}"))?;
+    repackage(package, pczt, true)
+}
 
+/// `package` with its PCZT replaced; every other field is carried over.
+pub(super) fn repackage(
+    package: &PcztPackage,
+    pczt: Pczt,
+    can_broadcast: bool,
+) -> Result<PcztPackage> {
     Ok(PcztPackage {
         pczt: pczt
             .serialize()
-            .map_err(|error| anyhow!("failed to serialize signed PCZT: {error:?}"))?,
+            .map_err(|error| anyhow!("failed to serialize PCZT: {error:?}"))?,
         n_spends: package.n_spends,
         sapling_indices: package.sapling_indices.clone(),
         orchard_indices: package.orchard_indices.clone(),
         ironwood_indices: package.ironwood_indices.clone(),
         can_sign: package.can_sign,
-        can_broadcast: true,
+        can_broadcast,
         price: package.price,
         category: package.category,
         is_issuance: package.is_issuance,
@@ -2095,21 +2274,22 @@ mod tests {
         transparent_signing_request, verify_spending_key, Pczt, PcztPackage, NO_SPENDING_KEY,
     };
     use super::{
-        get_transparent_address, label_transparent_outputs, orchard_proving_key_kind,
-        wants_hardware_v5, BranchId, Creator, OrchardProvingKeyKind, Signer,
-        TransparentChangeLabel,
+        attach_asset_names, get_transparent_address, label_transparent_outputs,
+        orchard_note_version_at, orchard_proving_key_kind, wants_hardware_v5, BranchId,
+        BuilderError, Creator, OrchardProvingKeyKind, Signer, TransparentChangeLabel,
     };
     use super::{
-        AssetBase, BlockHeight, BuildConfig, Builder, BundlePadding, FeeRule, IoFinalizer,
-        OutPoint, SpendInfo, TransparentAddress, TransparentInputInfo, TxOut, TxVersion, Updater,
-        Zatoshis,
+        AssetBase, BlockHeight, BuildConfig, Builder, BundlePadding, IoFinalizer, OutPoint,
+        SpendInfo, TransparentAddress, TransparentInputInfo, TxOut, TxVersion, Updater, Zatoshis,
     };
     use crate::account::tests::{restore, test_usk, watch_only_keys, TEST_PHRASE};
     use crate::account::{derive_spending_key, derive_transparent_sk};
     use crate::api::coin::Network;
     use crate::db::tests::memory_db;
     use crate::keys::SaplingFullViewingKey as _;
+    use crate::pay::external::tests::{planned_package, speculos_keys, Fixture};
     use crate::pay::signing_key::{self, SigningKey};
+    use crate::pay::TxPlan;
     use bip32::{ExtendedPrivateKey, Prefix};
     use incrementalmerkletree::{Hashable, Level, Position};
     use pczt::roles::verifier::{TransparentError, Verifier};
@@ -2119,12 +2299,15 @@ mod tests {
     };
     use secp256k1::{PublicKey, SecretKey};
     use sha2::{Digest as _, Sha256};
+    use std::collections::HashMap;
     use std::convert::Infallible;
     use std::str::FromStr as _;
     use zcash_keys::encoding::encode_extended_spending_key;
     use zcash_keys::encoding::AddressCodec as _;
     use zcash_keys::keys::{sapling::ExtendedSpendingKey, Era, UnifiedSpendingKey};
-    use zcash_protocol::consensus::NetworkConstants as _;
+    use zcash_primitives::transaction::fees::zip317::FeeRule;
+    use zcash_protocol::consensus::Parameters as _;
+    use zcash_protocol::memo::MemoBytes;
     use zcash_transparent::{keys::AccountPrivKey, pczt::Bip32Derivation};
 
     /// A second seed, built from entropy rather than a literal so it cannot rot.
@@ -2140,7 +2323,7 @@ mod tests {
         let seed = bip39::Mnemonic::from_str(phrase)
             .expect("phrase")
             .to_seed("");
-        let xprv = ExtendedPrivateKey::<SecretKey>::new(seed)
+        let xprv = ExtendedPrivateKey::<SecretKey>::new(&seed)
             .expect("xprv")
             .to_string(Prefix::XPRV)
             .to_string();
@@ -2157,7 +2340,7 @@ mod tests {
     fn sapling_key_bytes_of(phrase: &str, aindex: u32) -> Vec<u8> {
         let usk = usk_of(phrase, aindex);
         let esk = encode_extended_spending_key(
-            Network::Main.hrp_sapling_extended_spending_key(),
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
             usk.sapling(),
         );
         signing_key::encode_sapling(&esk, &Network::Main).expect("encode")
@@ -2187,7 +2370,7 @@ mod tests {
         let seed = bip39::Mnemonic::from_str(TEST_PHRASE)
             .expect("phrase")
             .to_seed("");
-        ExtendedPrivateKey::<SecretKey>::new(seed)
+        ExtendedPrivateKey::<SecretKey>::new(&seed)
             .expect("xprv")
             .to_string(Prefix::XPRV)
             .to_string()
@@ -2215,8 +2398,9 @@ mod tests {
         set_hash160_preimage: bool,
     ) -> Vec<u8> {
         let sk_bytes = derive_transparent_sk(tsk, scope, dindex).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
-        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&sk);
 
         let build_config = BuildConfig::Standard {
             sapling_anchor: None,
@@ -2246,7 +2430,7 @@ mod tests {
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -2277,7 +2461,9 @@ mod tests {
             .expect("update transparent")
             .finish();
 
-        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        let (pczt, _sighash) = IoFinalizer::new(pczt)
+            .finalize_io(rand_core::UnwrapErr(rand::rngs::SysRng))
+            .expect("finalize_io");
         pczt.serialize().expect("serialize")
     }
 
@@ -2306,13 +2492,15 @@ mod tests {
         change_dindex: u32,
     ) -> Vec<u8> {
         let sk_bytes = derive_transparent_sk(tsk, scope, dindex).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
-        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&sk);
 
         let change_sk_bytes =
             derive_transparent_sk(tsk, change_scope, change_dindex).expect("derive change sk");
-        let change_sk = SecretKey::from_slice(&change_sk_bytes).expect("change secret key");
-        let change_pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &change_sk);
+        let change_sk = SecretKey::from_secret_bytes(change_sk_bytes.try_into().expect("32 bytes"))
+            .expect("change secret key");
+        let change_pubkey = PublicKey::from_secret_key(&change_sk);
 
         let build_config = BuildConfig::Standard {
             sapling_anchor: None,
@@ -2352,7 +2540,7 @@ mod tests {
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -2384,7 +2572,9 @@ mod tests {
             .expect("update transparent")
             .finish();
 
-        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        let (pczt, _sighash) = IoFinalizer::new(pczt)
+            .finalize_io(rand_core::UnwrapErr(rand::rngs::SysRng))
+            .expect("finalize_io");
         pczt.serialize().expect("serialize")
     }
 
@@ -2430,8 +2620,9 @@ mod tests {
         );
 
         let change_sk_bytes = derive_transparent_sk(&tsk, 1, 3).expect("derive change sk");
-        let change_sk = SecretKey::from_slice(&change_sk_bytes).expect("change secret key");
-        let change_pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &change_sk);
+        let change_sk = SecretKey::from_secret_bytes(change_sk_bytes.try_into().expect("32 bytes"))
+            .expect("change secret key");
+        let change_pubkey = PublicKey::from_secret_key(&change_sk);
         Verifier::new(pczt)
             .with_transparent(|bundle| {
                 let derivations = bundle.outputs()[1].bip32_derivation();
@@ -2450,7 +2641,7 @@ mod tests {
     /// A sapling spending key built directly from raw seed bytes, unrelated to any
     /// mnemonic-derived account: a genuinely "imported" ESK.
     fn sapling_only_esk() -> ExtendedSpendingKey {
-        ExtendedSpendingKey::master(b"phase2b sapling fixture seed 32")
+        ExtendedSpendingKey::master(b"phase2b sapling fixture seed 32").expect("master key")
     }
 
     /// A structurally valid PCZT with a single sapling spend from `esk`'s default address
@@ -2510,7 +2701,7 @@ mod tests {
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
@@ -2530,7 +2721,9 @@ mod tests {
             .expect("update sapling")
             .finish();
 
-        let (pczt, _sighash) = IoFinalizer::new(pczt).finalize_io().expect("finalize_io");
+        let (pczt, _sighash) = IoFinalizer::new(pczt)
+            .finalize_io(rand_core::UnwrapErr(rand::rngs::SysRng))
+            .expect("finalize_io");
         pczt.serialize().expect("serialize")
     }
 
@@ -3007,8 +3200,10 @@ mod tests {
     async fn sign_transaction_signs_a_sapling_only_account_with_an_imported_esk() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3106,8 +3301,10 @@ mod tests {
     async fn sign_transaction_rejects_a_sapling_spend_missing_its_scope_field() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3137,8 +3334,10 @@ mod tests {
     async fn sign_transaction_rejects_a_sapling_scope_field_of_the_wrong_length() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3168,8 +3367,10 @@ mod tests {
     async fn sign_transaction_propagates_a_failed_sapling_signature_as_an_error() {
         let mut connection = memory_db().await;
         let esk = sapling_only_esk();
-        let key_str =
-            encode_extended_spending_key(Network::Main.hrp_sapling_extended_spending_key(), &esk);
+        let key_str = encode_extended_spending_key(
+            zcash_keys::constants::hrp_sapling_extended_spending_key(Network::Main.network_type()),
+            &esk,
+        );
         let account = restore(&mut connection, &key_str, 0, None)
             .await
             .expect("restore");
@@ -3298,9 +3499,95 @@ mod tests {
     #[test]
     fn zsa_selects_zsa_orchard_proving_key() {
         assert_eq!(
-            orchard_proving_key_kind(BranchId::Nu7),
+            orchard_proving_key_kind(BranchId::Zsa),
             OrchardProvingKeyKind::Zsa,
         );
+    }
+
+    #[test]
+    fn official_nu7_selects_ironwood_not_zsa() {
+        assert_eq!(
+            orchard_proving_key_kind(BranchId::Nu7),
+            OrchardProvingKeyKind::Ironwood,
+        );
+    }
+
+    #[test]
+    fn orchard_note_version_at_official_nu7_height_is_v2() {
+        assert_eq!(
+            orchard_note_version_at(&Network::Main, MAINNET_NU7_HEIGHT),
+            orchard::NoteVersion::V2,
+        );
+    }
+
+    #[test]
+    fn orchard_note_version_at_coin_three_is_v3_zsa() {
+        let zsa_network = crate::api::coin::Coin::new(Some(3)).network();
+        assert_eq!(
+            orchard_note_version_at(&zsa_network, 1),
+            orchard::NoteVersion::V3ZSA,
+        );
+    }
+
+    #[test]
+    fn coin_two_stays_on_nu6_3_branch() {
+        let regtest = crate::api::coin::Coin::new(Some(2)).network();
+        let branch = BranchId::for_height(&regtest, BlockHeight::from_u32(250));
+        assert_eq!(branch, BranchId::Nu6_3);
+    }
+
+    #[test]
+    fn coin_three_retains_deployed_zsa_branch_id() {
+        let zsa_network = crate::api::coin::Coin::new(Some(3)).network();
+        let branch = BranchId::for_height(&zsa_network, BlockHeight::from_u32(1));
+        assert_eq!(branch, BranchId::Zsa);
+        assert_eq!(u32::from(branch), 0x7719_0ad8);
+        assert_ne!(branch, BranchId::Nu7);
+    }
+
+    #[test]
+    fn build_error_software_plan_keeps_the_builders_own_text() {
+        let incompatible = || {
+            BuilderError::<std::convert::Infallible>::TargetIncompatible(
+                BranchId::Nu7,
+                TxVersion::V5,
+                None,
+            )
+        };
+
+        assert_eq!(
+            super::build_error(false, incompatible()).to_string(),
+            incompatible().to_string()
+        );
+        assert_eq!(
+            super::build_error(true, incompatible()).to_string(),
+            "Hardware signing cannot spend or receive Ironwood funds"
+        );
+    }
+
+    #[test]
+    fn drop_zec_dust_floor_is_the_cost_passed_in() {
+        use crate::pay::fee::{LEGACY_COST_PER_ACTION, REDUCED_COST_PER_ACTION};
+        use crate::pay::InputNote;
+
+        let kept = |cost| {
+            let note = |amount| InputNote {
+                id: 0,
+                height: 0,
+                amount,
+                remaining: amount,
+                pool: 0,
+                id_asset: None,
+                asset_base: vec![],
+                taddress: None,
+            };
+            let mut pools = vec![vec![note(999), note(1_000), note(4_999), note(5_000)]];
+            super::drop_zec_dust(&mut pools, cost);
+            pools[0].iter().map(|n| n.amount).collect::<Vec<_>>()
+        };
+
+        assert_eq!(kept(LEGACY_COST_PER_ACTION), [5_000]);
+        assert_eq!(kept(REDUCED_COST_PER_ACTION), [1_000, 4_999, 5_000]);
     }
 
     #[test]
@@ -3323,6 +3610,12 @@ mod tests {
     /// version is `V6` — only `hardware_signing` can force `V5` here. Returns
     /// `(tx_version, version_group_id)` from the built header.
     fn built_pczt_header(hardware_signing: bool) -> (u32, u32) {
+        let pczt = built_pczt(3_500_000, hardware_signing);
+        let global = pczt.global();
+        (*global.tx_version(), *global.version_group_id())
+    }
+
+    fn built_pczt(target_height: u32, hardware_signing: bool) -> Pczt {
         let build_config = BuildConfig::Standard {
             sapling_anchor: None,
             orchard_anchor: None,
@@ -3332,7 +3625,7 @@ mod tests {
         };
         let mut builder = Builder::new(
             &Network::Main,
-            BlockHeight::from_u32(3_500_000),
+            BlockHeight::from_u32(target_height),
             build_config,
         );
         if wants_hardware_v5(0, hardware_signing) {
@@ -3341,30 +3634,167 @@ mod tests {
                 .expect("propose v5");
         }
 
-        let sk = SecretKey::from_slice(&[7u8; 32]).expect("secret key");
-        let pubkey = PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
-        let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
-        let addr = TransparentAddress::PublicKeyHash(pkh);
-        let coin = TxOut::new(Zatoshis::const_from_u64(20_000), addr.script().into());
-        let utxo = OutPoint::new([9u8; 32], 0);
-        builder.add_transparent_input(
-            TransparentInputInfo::from_parts(utxo, coin, SpendInfo::P2pkh { pubkey })
-                .expect("input"),
-        );
+        let (input, addr) = transparent_coin(20_000);
+        builder.add_transparent_input(input);
         builder
             .add_transparent_output(&addr, Zatoshis::const_from_u64(10_000))
             .expect("output");
 
         let r = builder
             .build_for_pczt(
-                rand_core::OsRng,
+                rand_core::UnwrapErr(rand::rngs::SysRng),
+                &FeeRule::standard(),
+                |_asset: &AssetBase| false,
+            )
+            .expect("build_for_pczt");
+        Creator::build_from_parts(r.pczt_parts).expect("creator")
+    }
+
+    fn transparent_coin(value: u64) -> (TransparentInputInfo, TransparentAddress) {
+        let sk = SecretKey::from_secret_bytes([7u8; 32]).expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&sk);
+        let pkh: [u8; 20] = Ripemd160::digest(Sha256::digest(pubkey.serialize())).into();
+        let addr = TransparentAddress::PublicKeyHash(pkh);
+        let coin = TxOut::new(Zatoshis::const_from_u64(value), addr.script().into());
+        let utxo = OutPoint::new([9u8; 32], 0);
+        let input = TransparentInputInfo::from_parts(utxo, coin, SpendInfo::P2pkh { pubkey })
+            .expect("input");
+        (input, addr)
+    }
+
+    /// A payment into Orchard on coin 3, whose bundle is in the ZSA format.
+    fn coin_three_orchard_output_package() -> (PcztPackage, Network) {
+        let network = crate::api::coin::Coin::new(Some(3)).network();
+        let build_config = BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: Some(orchard::Anchor::empty_tree()),
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        };
+        let mut builder = Builder::new(&network, BlockHeight::from_u32(1), build_config);
+        let (input, _) = transparent_coin(75_000);
+        builder.add_transparent_input(input);
+        let sk = orchard::keys::SpendingKey::from_bytes([9u8; 32]).expect("sk");
+        let recipient = orchard::keys::FullViewingKey::from(&sk)
+            .address_at(0u32, orchard::keys::Scope::External);
+        builder
+            .add_orchard_output::<Infallible>(
+                None,
+                recipient,
+                Zatoshis::const_from_u64(60_000),
+                AssetBase::zatoshi(),
+                MemoBytes::empty(),
+            )
+            .expect("output");
+        let r = builder
+            .build_for_pczt(
+                rand_core::UnwrapErr(rand::rngs::SysRng),
                 &FeeRule::standard(),
                 |_asset: &AssetBase| false,
             )
             .expect("build_for_pczt");
         let pczt = Creator::build_from_parts(r.pczt_parts).expect("creator");
+        let package = PcztPackage {
+            pczt: pczt.serialize().expect("serialize"),
+            n_spends: [1, 0, 0, 0],
+            sapling_indices: vec![],
+            orchard_indices: vec![],
+            ironwood_indices: vec![],
+            can_sign: false,
+            can_broadcast: false,
+            price: None,
+            category: None,
+            is_issuance: false,
+        };
+        (package, network)
+    }
+
+    fn nu7_orchard_spend_package() -> PcztPackage {
+        planned_package(&speculos_keys(), Fixture::Nu7OrchardToIronwood)
+    }
+
+    #[test]
+    fn from_package_nu7_orchard_spend_reads_the_vanilla_orchard_bundle() {
+        let plan =
+            TxPlan::from_package(&Network::Main, &nu7_orchard_spend_package()).expect("plan");
+
+        assert!(plan
+            .inputs
+            .iter()
+            .any(|input| input.pool == 2 && input.amount == Some(100_000)));
+    }
+
+    #[test]
+    fn from_package_zsa_orchard_output_reads_the_zsa_bundle() {
+        let (package, network) = coin_three_orchard_output_package();
+
+        let plan = TxPlan::from_package(&network, &package).expect("plan");
+
+        assert!(plan
+            .outputs
+            .iter()
+            .any(|output| output.pool == 2 && output.amount == 60_000));
+    }
+
+    #[test]
+    fn attach_asset_names_nu7_orchard_spend_uses_the_vanilla_orchard_path() {
+        let pczt = Pczt::parse(&nu7_orchard_spend_package().pczt).expect("parse");
+
+        let result = attach_asset_names(
+            Updater::new(pczt),
+            &Network::Main,
+            MAINNET_NU7_HEIGHT,
+            &HashMap::new(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn attach_asset_names_zsa_orchard_output_uses_the_zsa_path() {
+        let (package, network) = coin_three_orchard_output_package();
+        let pczt = Pczt::parse(&package.pczt).expect("parse");
+
+        let result = attach_asset_names(Updater::new(pczt), &network, 1, &HashMap::new());
+
+        assert!(result.is_ok());
+    }
+
+    const MAINNET_NU7_HEIGHT: u32 = 3_543_405;
+    const NU7_WIRE_BRANCH_ID: u32 = 0x7719_0ad9;
+    const NU6_3_WIRE_BRANCH_ID: u32 = 0x37a5_165b;
+
+    #[test]
+    fn build_for_pczt_at_nu7_height_gives_v6_nu7_branch_and_expiry_120() {
+        let pczt = built_pczt(MAINNET_NU7_HEIGHT, false);
         let global = pczt.global();
-        (*global.tx_version(), *global.version_group_id())
+
+        assert_eq!(*global.tx_version(), 6);
+        assert_eq!(*global.version_group_id(), 0xD884_B698);
+        assert_eq!(*global.consensus_branch_id(), NU7_WIRE_BRANCH_ID);
+        assert_eq!(*global.expiry_height(), MAINNET_NU7_HEIGHT + 120);
+    }
+
+    #[test]
+    fn build_for_pczt_one_block_before_nu7_gives_nu6_3_branch_and_expiry_40() {
+        let target_height = MAINNET_NU7_HEIGHT - 1;
+        let pczt = built_pczt(target_height, false);
+        let global = pczt.global();
+
+        assert_eq!(*global.tx_version(), 6);
+        assert_eq!(*global.consensus_branch_id(), NU6_3_WIRE_BRANCH_ID);
+        assert_eq!(*global.expiry_height(), target_height + 40);
+    }
+
+    #[test]
+    fn build_for_pczt_hardware_signing_at_nu7_height_gives_v5_on_the_nu7_branch() {
+        let pczt = built_pczt(MAINNET_NU7_HEIGHT, true);
+        let global = pczt.global();
+
+        assert_eq!(*global.tx_version(), 5);
+        assert_eq!(*global.consensus_branch_id(), NU7_WIRE_BRANCH_ID);
+        assert_eq!(*global.expiry_height(), MAINNET_NU7_HEIGHT + 120);
     }
 
     #[test]
@@ -3473,12 +3903,12 @@ mod tests {
         let bytes = transparent_pczt_bytes(&tsk, 0, 0);
 
         let sk_bytes = derive_transparent_sk(&tsk, 0, 0).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
         let pczt = Pczt::parse(&bytes).expect("parse pczt");
         let signer = Signer::new(pczt).expect("signer");
         let sighash = signer.transparent_sighash(0).expect("sighash");
-        let signature =
-            secp256k1::Secp256k1::new().sign_ecdsa(&secp256k1::Message::from_digest(sighash), &sk);
+        let signature = secp256k1::ecdsa::sign(secp256k1::Message::from_digest(sighash), &sk);
 
         let mut package = empty_package();
         package.pczt = bytes;
@@ -3504,12 +3934,12 @@ mod tests {
         let bytes = transparent_pczt_bytes(&tsk, 0, 0);
 
         let sk_bytes = derive_transparent_sk(&tsk, 0, 0).expect("derive sk");
-        let sk = SecretKey::from_slice(&sk_bytes).expect("secret key");
+        let sk = SecretKey::from_secret_bytes(sk_bytes.try_into().expect("32 bytes"))
+            .expect("secret key");
         let pczt = Pczt::parse(&bytes).expect("parse pczt");
         let signer = Signer::new(pczt).expect("signer");
         let sighash = signer.transparent_sighash(0).expect("sighash");
-        let signature =
-            secp256k1::Secp256k1::new().sign_ecdsa(&secp256k1::Message::from_digest(sighash), &sk);
+        let signature = secp256k1::ecdsa::sign(secp256k1::Message::from_digest(sighash), &sk);
         let mut der = signature.serialize_der()[..].to_vec();
         let last = der.len() - 1;
         der[last] ^= 0xFF;

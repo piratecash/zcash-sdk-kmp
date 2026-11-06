@@ -1,0 +1,11 @@
+zcash-sdk-kmp
+Licensed under the MIT License (see LICENSE).
+
+This product includes code adapted from the following project, licensed under the Apache License,
+Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+LedgerHQ/ledger-zcash-utils — Copyright 2026-present Ledger
+https://github.com/LedgerHQ/ledger-zcash-utils
+  - rust/rlz/src/pay/external.rs: the extraction of the PCZT fields the Ledger Zcash app signs
+    (global fields, transparent inputs and outputs, Orchard and Ironwood actions) in
+    external_signing_view is adapted from crates/zcash-crypto/src/parse.rs

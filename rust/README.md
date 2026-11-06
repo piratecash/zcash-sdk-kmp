@@ -67,8 +67,7 @@ second `librlz.so` we do not need. `CargoNdkTask` drops it rather than patching 
 
 | Feature | Pulls in | On in the artifact |
 | --- | --- | --- |
-| `flutter` | `flutter_rust_bridge` + `voting`, `plugin`, `contacts`, `raptor`, `nym` | no |
-| `voting` | `zcash_voting` | no |
+| `flutter` | `flutter_rust_bridge` + `plugin`, `contacts`, `raptor`, `nym`; regenerate `frb_generated.rs` first, it still names the removed voting API | no |
 | `plugin` | `rhai`, `zip` | no |
 | `contacts` | `vcard4` | no |
 | `raptor` | `raptorq`, `qrcode` | no |
@@ -89,7 +88,7 @@ carry an explicit `bail!`, pinned by tests that assert the guard's own message.
 
 - `rlz/Cargo.toml` — `default = []`; eleven dependencies made `optional`. `httparse` stays
   unconditional: the Tor path shares it.
-- `#[cfg(feature = ...)]` on the `voting` / `plugin` / `contacts` / `raptor` / `nym` modules
+- `#[cfg(feature = ...)]` on the `plugin` / `contacts` / `raptor` / `nym` modules
   and on the flutter-only bindings (`api/vault.rs`, `vault/dart.rs`, the ledger signing
   entry point, the `StreamSink` imports).
 - `net::is_nym_url` + `NYM_URL_SCHEME` live ungated in `net/mod.rs`: the classification must
@@ -107,7 +106,7 @@ back as `NULL` and `account::get_account_seed` returns `None`.
 
 This is a behavioural change, not a `cfg` line, and it breaks upstream code that assumes the
 column is populated. None of that code is reachable here — `zcash-jni` takes `rlz` with
-`default-features = false` and references neither `frost`, `io`, `voting`, `issuance` nor
+`default-features = false` and references neither `frost`, `io`, `issuance` nor
 `print_keys`; our only reader of the row is `list_accounts`, whose `AccountDto` drops both
 columns. In upstream's Flutter build it breaks, worst first:
 
@@ -119,14 +118,14 @@ columns. In upstream's Flutter build it breaks, worst first:
 - `frost::protocol::get_mailbox_account` — panics at `.expect("Seed should be set")` on first
   use, from FROST signing as well as DKG; `frost::dkg::dkg_finalize` panics the same way.
 - `api::account::print_keys` — panics on `seed.unwrap()`.
-- `api::account::get_account_seed` (frb), `api::issuance`, `voting` — degrade to `None` or an
+- `api::account::get_account_seed` (frb), `api::issuance` — degrade to `None` or an
   `anyhow` error.
 
 `io.rs` still writes `seed` on the import path, so the no-plaintext-seed property holds
 because that path is unreachable from JNI, not because the column cannot be written.
 
 On re-vendor this hunk is a **decision** — our property or upstream FROST/backup — never an
-automatic merge. Gating the seed-dependent modules behind `flutter`, the way `voting` and
+automatic merge. Gating the seed-dependent modules behind `flutter`, the way `plugin` and
 friends already are, would turn the conflict into a compile-time fact; follow-up, not done.
 
 ### Not additive — spending keys are no longer stored

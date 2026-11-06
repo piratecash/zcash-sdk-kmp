@@ -66,6 +66,31 @@ class ZcashExceptionTest {
         assertNull(ZcashException("failure", RuntimeException("cause")).stage)
     }
 
+    @Test
+    fun externalSigningRefusal_nativeRefusal_mapsEveryCode() {
+        ExternalSigningRefusal.entries.forEach { refusal ->
+            val message = "[external-signing:${refusal.code}] the signing device refuses"
+            assertEquals(refusal, ZcashException(message).externalSigningRefusal, message)
+        }
+    }
+
+    @Test
+    fun externalSigningRefusal_wrappedNativeMessage_isStillFound() {
+        val message = "prepare failed: [external-signing:shielded-recipients] the signing device " +
+            "reviews at most 4 shielded recipients"
+
+        val error = ZcashException(message)
+
+        assertEquals(ExternalSigningRefusal.SHIELDED_RECIPIENTS, error.externalSigningRefusal)
+        assertEquals(FailureCategory.OTHER, error.category)
+    }
+
+    @Test
+    fun externalSigningRefusal_otherFailureOrUnknownCode_isNull() {
+        assertNull(ZcashException("No feasible note selection found").externalSigningRefusal)
+        assertNull(ZcashException("[external-signing:teleport] no").externalSigningRefusal)
+    }
+
     private fun assertCategory(expected: FailureCategory, vararg messages: String) {
         messages.forEach { message ->
             assertEquals(expected, ZcashException(message).category, message)

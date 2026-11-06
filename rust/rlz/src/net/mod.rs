@@ -16,8 +16,6 @@ pub mod lwd;
 pub mod nym;
 #[cfg(feature = "nym")]
 pub mod nym_service;
-#[cfg(feature = "voting")]
-pub mod votechain;
 pub mod zebra;
 
 pub const NYM_URL_SCHEME: &str = "nym://";
@@ -155,6 +153,8 @@ pub fn is_nym_url(url: &str) -> bool {
 pub struct BroadcastOutcome {
     pub error_code: i32,
     pub message: String,
+    /// The rejection freed this transaction's reserved inputs: they are spendable again.
+    pub inputs_released: bool,
 }
 
 #[async_trait]

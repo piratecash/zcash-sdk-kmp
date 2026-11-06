@@ -5,7 +5,7 @@ use bincode::{config, Decode, Encode};
 use bip39::Mnemonic;
 use futures::TryStreamExt;
 use orchard::keys::{FullViewingKey, Scope};
-use reddsa::frost::redpallas::{
+use reddsa_legacy::frost::redpallas::{
     frost::{
         keys::{KeyPackage, PublicKeyPackage},
         round1::{SigningCommitments, SigningNonces},
@@ -544,6 +544,7 @@ pub async fn publish(
         None,  // preselected
         None,  // anchor_height
         false, // hardware_signing
+        false, // external_pczt_signing
     )
     .await
     .context("plan_transaction in DKG publish")?;
@@ -631,7 +632,8 @@ pub async fn get_mailbox_account(
                     .await?
                     .expect("Mailbox account should have orchard");
                 let address = fvk.address_at(0u64, Scope::External);
-                let ua = UnifiedAddress::from_receivers(Some(address), None, None).unwrap();
+                let ua =
+                    UnifiedAddress::from_receivers(Some(address), None, None, None, None).unwrap();
                 let ua = ua.encode(network);
                 sqlx::query(
                     "INSERT INTO dkg_addresses (account, from_id, address)
@@ -724,7 +726,8 @@ pub async fn get_coordinator_broadcast_account(
                 let fvk = FullViewingKey::from_bytes(&xvk.try_into().unwrap())
                     .expect("Failed to create shared FVK");
                 let address = fvk.address_at(0u64, Scope::External);
-                let ua = UnifiedAddress::from_receivers(Some(address), None, None).unwrap();
+                let ua =
+                    UnifiedAddress::from_receivers(Some(address), None, None, None, None).unwrap();
                 let broadcast_address = ua.encode(network);
                 info!("Broadcast address: {broadcast_address}");
                 break (account, broadcast_address);

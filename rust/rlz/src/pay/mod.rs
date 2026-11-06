@@ -16,8 +16,11 @@ use zcash_protocol::consensus::BranchId;
 use zcash_transparent::address::TransparentAddress;
 
 pub mod error;
+pub mod external;
 pub mod fee;
 pub mod plan;
+#[cfg(test)]
+pub(crate) mod plan_tests;
 pub mod pool;
 pub mod prepare;
 pub mod reserve;
@@ -197,7 +200,7 @@ impl TxPlan {
         let pczt = Pczt::parse(&package.pczt)
             .map_err(|error| anyhow::anyhow!("Failed to parse PCZT: {error:?}"))?;
         let is_zsa = BranchId::try_from(*pczt.global().consensus_branch_id())
-            .is_ok_and(|branch_id| branch_id == BranchId::Nu7);
+            .is_ok_and(|branch_id| branch_id == BranchId::Zsa);
         let height = *pczt.global().expiry_height();
         let mut fee = 0i64;
         let verifier = Verifier::new(pczt);

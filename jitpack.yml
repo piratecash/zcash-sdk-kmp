@@ -3,6 +3,42 @@ jdk:
 
 before_install:
   - |
+    # Maven Central answers JitPack's builders with 429 and Gradle fails hard on it, so every build here, buildSrc
+    # included, tries Google's mirror of Central first.
+    init_dir="${GRADLE_USER_HOME:-$HOME/.gradle}/init.d"
+    mkdir -p "$init_dir"
+    cat > "$init_dir/central-mirror.gradle" <<'GRADLE'
+    def mirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
+    def preferMirror = { RepositoryHandler repositories ->
+        def repository = repositories.maven { name = 'GoogleCentralMirror'; url = mirror }
+        repositories.remove(repository)
+        repositories.addFirst(repository)
+    }
+
+    // Every build, buildSrc included, gets the mirror ahead of the repositories its settings declare.
+    beforeSettings { settings ->
+        preferMirror(settings.pluginManagement.repositories)
+        preferMirror(settings.dependencyResolutionManagement.repositories)
+    }
+
+    // The mirror alone would hide the implicit plugin portal from a build that declares no plugin repositories.
+    settingsEvaluated { settings ->
+        def plugins = settings.pluginManagement.repositories
+        if (plugins.size() == 1) plugins.gradlePluginPortal()
+    }
+
+    allprojects {
+        preferMirror(buildscript.repositories)
+        // Project repositories override the settings ones, so only a project that declares its own gets the mirror.
+        afterEvaluate {
+            if (!repositories.empty) preferMirror(repositories)
+        }
+    }
+    GRADLE
+    # JitPack joins the steps with ";", so the heredoc must not end the step.
+    echo "wrote $init_dir/central-mirror.gradle"
+  - |
     (
       echo "== wrapper diagnostics"; pwd; ls -la gradle/wrapper; sha256sum gradle/wrapper/gradle-wrapper.jar || true
       unzip -l gradle/wrapper/gradle-wrapper.jar 2>&1 | head -5 || true; file gradle/wrapper/gradle-wrapper.jar || true

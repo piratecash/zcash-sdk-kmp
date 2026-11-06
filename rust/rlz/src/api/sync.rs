@@ -71,7 +71,14 @@ pub async fn max_spendable_from_pools(confirmations: u32, pool_mask: u8, c: &Coi
     let mut connection = c.get_connection().await?;
     let account = c.account;
 
-    db_max_spendable_from_pools(&mut connection, account, PoolMask(pool_mask), confirmations).await
+    db_max_spendable_from_pools(
+        &c.network(),
+        &mut connection,
+        account,
+        PoolMask(pool_mask),
+        confirmations,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "flutter", frb)]

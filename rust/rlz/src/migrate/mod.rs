@@ -8,7 +8,7 @@ use crate::{
     db::get_account_hw,
     net::BroadcastOutcome,
     pay::{
-        fee::{FeeManager, COST_PER_ACTION},
+        fee::{cost_per_action, FeeManager},
         plan::{extract_transaction, plan_transaction, sign_transaction},
         pool::PoolMask,
         reserve::{reserve_and_send, OwnInputs},
@@ -17,10 +17,12 @@ use crate::{
     Client,
 };
 
-/// Minimum spendable chunk: 100 × COST_PER_ACTION (500,000 zats).
+/// Minimum spendable chunk: 100 logical actions.
 /// Below this threshold, non-SD notes are left alone — splitting them
 /// would cost more in fees than the value recovered.
-pub const MIN_SD: u64 = 100 * COST_PER_ACTION;
+pub const fn min_sd(cost_per_action: u64) -> u64 {
+    100 * cost_per_action
+}
 
 /// Maximum number of non-SD notes to split in a single transaction.
 /// Caps transaction size to avoid oversized bundles that nodes reject.
@@ -35,19 +37,21 @@ const TARGET_BLOCK_SPACING_MS: u64 = 75_000;
 
 /// Fee padding embedded in each standard denomination.
 /// Covers Orchard input + change (2 actions in sum mode) and Ironwood
-/// output (2 actions, padded) = 4 × COST_PER_ACTION = 20,000 zats.
-const SD_FEE_PAD: u64 = 4 * COST_PER_ACTION;
+/// output (2 actions, padded).
+/// It follows the marginal fee, so a note padded before ZIP 2009 stops matching [`is_sd`]
+/// after it and is split again at the new pad.
+pub(crate) const fn sd_fee_pad(cost_per_action: u64) -> u64 {
+    4 * cost_per_action
+}
 
 /// Decompose a total amount into standard denomination notes with embedded fees.
 ///
-/// Each standard denomination is `10^k + P` where P = 2*COST_PER_ACTION:
-/// 1_000_010_000, 100_010_000, …, 110_000.
+/// Each standard denomination is `10^k + p` for the fee pad `p`.
 ///
 /// Greedy from largest to smallest. Returns sparse `(denom, count)` pairs
 /// and any leftover below the smallest denomination.
-pub fn decompose_to_sd(total: u64) -> (Vec<(u64, u8)>, u64) {
-    let p = SD_FEE_PAD;
-    let d_min = 10u64.pow(5) + p; // 110_000
+pub fn decompose_to_sd(total: u64, p: u64) -> (Vec<(u64, u8)>, u64) {
+    let d_min = 10u64.pow(5) + p;
     let k_min = 5u32;
     let k_max = 16u32; // 10^16 + P covers 100M ZEC
     let mut result = Vec::new();
@@ -68,11 +72,9 @@ pub fn decompose_to_sd(total: u64) -> (Vec<(u64, u8)>, u64) {
     (result, remainder)
 }
 
-/// Check if a value is a fee-inclusive standard denomination:
-/// `10^(i+5) + 2*COST_PER_ACTION` (110_000, 1_010_000, 10_010_000, …).
 /// Check whether `value` is a standard denomination: exactly `10^(i+5)`, i ≥ 0.
 /// Ironwood notes are minted at the pure denomination; Orchard SD notes include
-/// an additional `SD_FEE_PAD`.
+/// an additional fee pad, see [`is_sd`].
 pub fn is_iw_sd(value: u64) -> bool {
     value >= 100_000 && value % 100_000 == 0 && {
         let mut x = value / 100_000;
@@ -83,8 +85,9 @@ pub fn is_iw_sd(value: u64) -> bool {
     }
 }
 
-pub fn is_sd(value: u64) -> bool {
-    value > SD_FEE_PAD && is_iw_sd(value - SD_FEE_PAD)
+/// Check whether `value` is a fee-inclusive standard denomination, `10^(i+5) + p`.
+pub fn is_sd(value: u64, p: u64) -> bool {
+    value > p && is_iw_sd(value - p)
 }
 
 /// A split action's planned outputs. `total` is carried so `step` can log it without
@@ -97,24 +100,28 @@ struct SplitPlan {
 
 /// The SD outputs a split action would actually produce for `values`, or `None` when it would
 /// produce none. `step` and `has_split_transaction` must never disagree, so both go through here.
-fn plan_split(values: &[u64]) -> Option<SplitPlan> {
+fn plan_split(values: &[u64], cost_per_action: u64) -> Option<SplitPlan> {
     let mut sorted = values.to_vec();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
     sorted.truncate(MAX_SPLIT_INPUTS);
     let num_inputs = sorted.len() as u64;
     let total: u64 = sorted.iter().sum();
-    if total < MIN_SD {
+    let min_sd = min_sd(cost_per_action);
+    if total < min_sd {
         return None;
     }
 
-    let (mut digits, mut remainder) = decompose_to_sd(total);
+    let pad = sd_fee_pad(cost_per_action);
+    let (mut digits, mut remainder) = decompose_to_sd(total, pad);
 
-    // If the natural remainder is too small to cover the transaction fee, carve out MIN_SD
-    // from the decomposable pool as a fee buffer.
-    if remainder < MIN_SD / 2 {
-        let (d, r) = decompose_to_sd(total.saturating_sub(MIN_SD));
-        digits = d;
-        remainder = r + MIN_SD;
+    // If the natural remainder is too small to cover the transaction fee, carve out the minimum
+    // chunk from the decomposable pool as a fee buffer.
+    if remainder < min_sd / 2 {
+        let (d, r) = decompose_to_sd(total.saturating_sub(min_sd), pad);
+        if !d.is_empty() {
+            digits = d;
+            remainder = r + min_sd;
+        }
     }
     let mut num_outputs: u64 = digits.iter().map(|&(_, c)| c as u64).sum();
 
@@ -122,7 +129,7 @@ fn plan_split(values: &[u64]) -> Option<SplitPlan> {
     // estimate is exact.
     let mut fm = FeeManager {
         migration: true,
-        ..FeeManager::default()
+        ..FeeManager::new(cost_per_action)
     };
     for _ in 0..num_inputs {
         fm.add_input(2);
@@ -132,9 +139,10 @@ fn plan_split(values: &[u64]) -> Option<SplitPlan> {
     }
     fm.add_output(2); // change output
 
-    // Trim the lowest denomination until the fee fits, or until nothing is left to send.
+    // Trim the lowest denomination until the fee fits, or until nothing is left to send. Strict:
+    // the fee counts a change output, and a remainder equal to it would leave none to build.
     loop {
-        if fm.fee() <= remainder || num_outputs == 0 {
+        if fm.fee() < remainder || num_outputs == 0 {
             break;
         }
         if let Some((denom, count)) = digits.last_mut() {
@@ -160,8 +168,8 @@ fn plan_split(values: &[u64]) -> Option<SplitPlan> {
 }
 
 /// Whether the next migration action can split the currently known non-SD notes.
-pub(crate) fn has_split_transaction(values: Vec<u64>) -> bool {
-    plan_split(&values).is_some()
+pub(crate) fn has_split_transaction(values: Vec<u64>, cost_per_action: u64) -> bool {
+    plan_split(&values, cost_per_action).is_some()
 }
 
 /// Result of a migration step.
@@ -276,6 +284,7 @@ fn broadcast_txid(outcome: BroadcastOutcome) -> Result<String> {
 }
 
 async fn broadcast(
+    network: &Network,
     connection: &mut SqliteConnection,
     client: &mut Client,
     account: u32,
@@ -283,7 +292,16 @@ async fn broadcast(
     tx: &[u8],
 ) -> Result<String> {
     broadcast_txid(
-        reserve_and_send(connection, client, account, height, tx, OwnInputs::Required).await?,
+        reserve_and_send(
+            network,
+            connection,
+            client,
+            account,
+            height,
+            tx,
+            OwnInputs::Required,
+        )
+        .await?,
     )
 }
 
@@ -300,6 +318,8 @@ pub async fn step(
     usk_bytes: &[u8],
 ) -> Result<MigrationEvent> {
     let height = client.latest_height().await?;
+    let cost = cost_per_action(network, height.saturating_add(1));
+    let pad = sd_fee_pad(cost);
     let checkpoint_height = crate::sync::get_db_height(&mut *connection, account)
         .await?
         .height;
@@ -332,9 +352,12 @@ pub async fn step(
     }
 
     // Separate SD vs non-SD
-    let sd_notes: Vec<&OrchardZecNote> = orchard_zec.iter().filter(|n| is_sd(n.value)).collect();
-    let non_sd_notes: Vec<&OrchardZecNote> =
-        orchard_zec.iter().filter(|n| !is_sd(n.value)).collect();
+    let sd_notes: Vec<&OrchardZecNote> =
+        orchard_zec.iter().filter(|n| is_sd(n.value, pad)).collect();
+    let non_sd_notes: Vec<&OrchardZecNote> = orchard_zec
+        .iter()
+        .filter(|n| !is_sd(n.value, pad))
+        .collect();
     info!(
         "SD notes: {:?}, non-SD notes: {:?}",
         sd_notes.iter().map(|n| n.value).collect::<Vec<_>>(),
@@ -358,7 +381,7 @@ pub async fn step(
         digits,
         remainder,
         total,
-    }) = plan_split(&split_values)
+    }) = plan_split(&split_values, cost)
     {
         // Build recipients from (denom, count) pairs.
         let mut recipients: Vec<Recipient> = Vec::new();
@@ -399,6 +422,7 @@ pub async fn step(
             Some(&preselected),
             None,  // anchor_height
             false, // hardware_signing
+            false, // external_pczt_signing
         )
         .await?;
 
@@ -407,7 +431,15 @@ pub async fn step(
             .unwrap_or(0);
         let pczt = sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
         let tx_bytes = extract_transaction(&pczt).await?;
-        let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
+        let txid = broadcast(
+            network,
+            &mut *connection,
+            client,
+            account,
+            height,
+            &tx_bytes,
+        )
+        .await?;
 
         return Ok(MigrationEvent::SplitComplete { fee, txid });
     }
@@ -454,10 +486,10 @@ pub async fn step(
             a_cmx.cmp(b_cmx)
         });
 
-        // Pick one SD note (largest cmx). Its value embeds 2*COST_PER_ACTION
+        // Pick one SD note (largest cmx). Its value embeds the fee pad
         // for Orchard fees; the Ironwood output is the "real" denomination.
         let note = sorted_sd.last().unwrap();
-        let ironwood_amount = note.value - SD_FEE_PAD;
+        let ironwood_amount = note.value - pad;
 
         // One Ironwood output (dummy output for padding is handled by the
         // builder, as is the dummy Orchard input).
@@ -491,6 +523,7 @@ pub async fn step(
             Some(&preselected),
             Some(anchor_height),
             false, // hardware_signing
+            false, // external_pczt_signing
         )
         .await?;
 
@@ -499,7 +532,15 @@ pub async fn step(
             .unwrap_or(0);
         let pczt = sign_transaction(&mut *connection, account, network, &pczt, usk_bytes).await?;
         let tx_bytes = extract_transaction(&pczt).await?;
-        let txid = broadcast(&mut *connection, client, account, height, &tx_bytes).await?;
+        let txid = broadcast(
+            network,
+            &mut *connection,
+            client,
+            account,
+            height,
+            &tx_bytes,
+        )
+        .await?;
 
         return Ok(MigrationEvent::MigrateComplete { fee, txid });
     }
@@ -512,6 +553,10 @@ pub async fn step(
 mod tests {
     use super::*;
     use crate::db::tests::{memory_db, ACCOUNT};
+    use crate::pay::fee::{LEGACY_COST_PER_ACTION, REDUCED_COST_PER_ACTION};
+
+    const COST: u64 = LEGACY_COST_PER_ACTION;
+    const PAD: u64 = sd_fee_pad(COST);
 
     #[tokio::test]
     async fn fetch_unspent_orchard_notes_unconfirmed_note_excludes_value() {
@@ -539,17 +584,73 @@ mod tests {
 
     #[test]
     fn test_is_sd() {
-        // SD_FEE_PAD = 20_000, so SD = 10^k + 20_000
-        assert!(!is_sd(10_001)); // not a multiple of 10,000
-        assert!(!is_sd(20_001)); // (20001-20000) % 100000 = 1 ≠ 0
-        assert!(is_sd(120_000)); // 10^5 + 20_000
-        assert!(is_sd(1_020_000)); // 10^6 + 20_000
-        assert!(is_sd(10_020_000)); // 10^7 + 20_000
-        assert!(!is_sd(1_000_000)); // missing +base
-        assert!(!is_sd(120_001)); // (120001-20000) % 100000 = 1 ≠ 0
-                                  // Old P=10_000 values are no longer SD
-        assert!(!is_sd(110_000));
-        assert!(!is_sd(1_010_000));
+        // PAD = 20_000, so SD = 10^k + 20_000
+        assert!(!is_sd(10_001, PAD)); // not a multiple of 10,000
+        assert!(!is_sd(20_001, PAD)); // (20001-20000) % 100000 = 1 ≠ 0
+        assert!(is_sd(120_000, PAD)); // 10^5 + 20_000
+        assert!(is_sd(1_020_000, PAD)); // 10^6 + 20_000
+        assert!(is_sd(10_020_000, PAD)); // 10^7 + 20_000
+        assert!(!is_sd(1_000_000, PAD)); // missing +base
+        assert!(!is_sd(120_001, PAD)); // (120001-20000) % 100000 = 1 ≠ 0
+                                       // Old P=10_000 values are no longer SD
+        assert!(!is_sd(110_000, PAD));
+        assert!(!is_sd(1_010_000, PAD));
+    }
+
+    #[test]
+    fn is_sd_legacy_pad_note_after_the_reduction_is_split_again() {
+        let pad = sd_fee_pad(REDUCED_COST_PER_ACTION);
+
+        assert_eq!(pad, 4_000);
+        assert_eq!(min_sd(REDUCED_COST_PER_ACTION), 100_000);
+        assert!(is_sd(104_000, pad));
+        assert!(is_sd(1_004_000, pad));
+        assert!(!is_sd(120_000, pad));
+        assert!(!is_sd(1_020_000, pad));
+        assert!(has_split_transaction(
+            vec![1_020_000],
+            REDUCED_COST_PER_ACTION
+        ));
+    }
+
+    #[test]
+    fn decompose_to_sd_reduced_pad_uses_the_reduced_denominations() {
+        let (pairs, leftover) = decompose_to_sd(550_000, sd_fee_pad(REDUCED_COST_PER_ACTION));
+
+        assert_eq!(pairs, vec![(104_000, 5)]);
+        assert_eq!(leftover, 30_000);
+    }
+
+    #[test]
+    fn plan_split_at_either_rate_emits_denominations_of_that_rate() {
+        for cost in [LEGACY_COST_PER_ACTION, REDUCED_COST_PER_ACTION] {
+            let plan = plan_split(&[5_000_000], cost).expect("a split");
+
+            assert!(!plan.digits.is_empty());
+            for (denom, _) in plan.digits {
+                assert!(is_sd(denom, sd_fee_pad(cost)), "{denom} at {cost}");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_split_legacy_denomination_at_the_reduced_rate_is_split_again() {
+        let plan = plan_split(&[120_000], REDUCED_COST_PER_ACTION).expect("a split");
+
+        assert_eq!(plan.digits, vec![(104_000, 1)]);
+        assert_eq!(plan.remainder, 16_000);
+        assert!(has_split_transaction(
+            vec![120_000],
+            REDUCED_COST_PER_ACTION
+        ));
+    }
+
+    #[test]
+    fn plan_split_above_the_buffer_band_at_the_legacy_rate_still_carves_the_buffer() {
+        let plan = plan_split(&[620_000], COST).expect("a split");
+
+        assert_eq!(plan.digits, vec![(120_000, 1)]);
+        assert_eq!(plan.remainder, 500_000);
     }
 
     #[test]
@@ -573,39 +674,63 @@ mod tests {
 
     #[test]
     fn test_has_split_transaction_applies_input_cap() {
-        assert!(!has_split_transaction(vec![MIN_SD - 1]));
-        assert!(!has_split_transaction(vec![MIN_SD / 100; 100]));
+        assert!(!has_split_transaction(vec![min_sd(COST) - 1], COST));
+        assert!(!has_split_transaction(vec![min_sd(COST) / 100; 100], COST));
     }
 
     #[test]
-    fn test_plan_split_reserve_can_consume_every_output() {
-        assert!(plan_split(&[MIN_SD]).is_none());
-        assert_eq!(decompose_to_sd(MIN_SD), (vec![(120_000, 4)], 20_000));
-        assert_eq!(decompose_to_sd(0), (vec![], 0));
+    fn test_plan_split_min_sd_trims_one_output_to_pay_the_fee() {
+        let plan = plan_split(&[min_sd(COST)], COST).expect("a split");
+        assert_eq!(plan.digits, vec![(120_000, 3)]);
+        assert_eq!(plan.remainder, 140_000);
+        assert_eq!(
+            decompose_to_sd(min_sd(COST), PAD),
+            (vec![(120_000, 4)], 20_000)
+        );
+        assert_eq!(decompose_to_sd(0, PAD), (vec![], 0));
     }
 
     #[test]
-    fn test_has_split_transaction_matches_reserve_boundary() {
-        assert!(!has_split_transaction(vec![619_999]));
-        assert!(has_split_transaction(vec![620_000]));
+    fn test_has_split_transaction_boundary_is_min_sd() {
+        assert!(!has_split_transaction(vec![499_999], COST));
+        assert!(has_split_transaction(vec![500_000], COST));
+        assert!(has_split_transaction(vec![619_999], COST));
+        assert!(has_split_transaction(vec![620_000], COST));
+    }
+
+    // The fee estimate counts a change output: an exact remainder leaves none and the builder
+    // refuses, so the output is trimmed instead.
+    #[test]
+    fn plan_split_remainder_equal_to_the_fee_is_trimmed() {
+        assert!(plan_split(&[107_000], REDUCED_COST_PER_ACTION).is_none());
+        assert_eq!(
+            plan_split(&[107_001], REDUCED_COST_PER_ACTION)
+                .expect("a split")
+                .digits,
+            vec![(104_000, 1)]
+        );
+
+        let plan = plan_split(&[510_000], COST).expect("a smaller split");
+        assert_eq!(plan.digits, vec![(120_000, 3)]);
+        assert_eq!(plan.remainder, 150_000);
     }
 
     #[test]
     fn test_has_split_transaction_still_true_above_band() {
-        assert!(has_split_transaction(vec![1_000_000]));
+        assert!(has_split_transaction(vec![1_000_000], COST));
     }
 
     #[test]
     fn test_decompose_below_min_denom() {
         // Below d_min (120_000).
-        let (pairs, leftover) = decompose_to_sd(10_000);
+        let (pairs, leftover) = decompose_to_sd(10_000, PAD);
         assert!(pairs.is_empty());
         assert_eq!(leftover, 10_000);
     }
 
     #[test]
     fn test_decompose_zero() {
-        let (pairs, leftover) = decompose_to_sd(0);
+        let (pairs, leftover) = decompose_to_sd(0, PAD);
         assert!(pairs.is_empty());
         assert_eq!(leftover, 0);
     }
@@ -613,7 +738,7 @@ mod tests {
     #[test]
     fn test_decompose_exact_sd() {
         // 120_000 = 10^5 + 20_000.
-        let (pairs, leftover) = decompose_to_sd(120_000);
+        let (pairs, leftover) = decompose_to_sd(120_000, PAD);
         assert_eq!(pairs, vec![(120_000, 1)]);
         assert_eq!(leftover, 0);
     }
@@ -621,7 +746,7 @@ mod tests {
     #[test]
     fn test_decompose_multiple() {
         // 4 × 120_000 = 480_000, leftover 20_000.
-        let (pairs, leftover) = decompose_to_sd(500_000);
+        let (pairs, leftover) = decompose_to_sd(500_000, PAD);
         assert_eq!(pairs, vec![(120_000, 4)]);
         assert_eq!(leftover, 20_000);
     }
@@ -629,7 +754,7 @@ mod tests {
     #[test]
     fn test_decompose_two_positions() {
         // 1_140_000 → 1×1_020_000 + 1×120_000.
-        let (pairs, leftover) = decompose_to_sd(1_140_000);
+        let (pairs, leftover) = decompose_to_sd(1_140_000, PAD);
         assert_eq!(pairs, vec![(1_020_000, 1), (120_000, 1)]);
         assert_eq!(leftover, 0);
     }
@@ -637,7 +762,7 @@ mod tests {
     #[test]
     fn test_decompose_with_remainder() {
         // 130_000 → 1×120_000, leftover 10_000 (below d_min).
-        let (pairs, leftover) = decompose_to_sd(130_000);
+        let (pairs, leftover) = decompose_to_sd(130_000, PAD);
         assert_eq!(pairs, vec![(120_000, 1)]);
         assert_eq!(leftover, 10_000);
     }
@@ -647,7 +772,7 @@ mod tests {
     fn test_decompose_round_trip() {
         let cases = &[0, 10_000, 120_000, 500_000, 1_140_000, 130_000, 5_000_000];
         for &total in cases {
-            let (pairs, leftover) = decompose_to_sd(total);
+            let (pairs, leftover) = decompose_to_sd(total, PAD);
             let represented: u64 = pairs.iter().map(|&(d, c)| d * c as u64).sum();
             assert_eq!(
                 represented + leftover,
@@ -662,6 +787,7 @@ mod tests {
         let outcome = BroadcastOutcome {
             error_code: 0,
             message: "9f3c".to_string(),
+            inputs_released: false,
         };
 
         assert_eq!("9f3c", broadcast_txid(outcome).unwrap());
@@ -672,6 +798,7 @@ mod tests {
         let outcome = BroadcastOutcome {
             error_code: -25,
             message: "missing inputs".to_string(),
+            inputs_released: false,
         };
 
         let error = broadcast_txid(outcome).unwrap_err().to_string();

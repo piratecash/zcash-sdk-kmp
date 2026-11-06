@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context as _, Result};
 use orchard::{
     keys::Scope,
@@ -11,13 +13,19 @@ use tracing::debug;
 use zcash_keys::{address::UnifiedAddress, encoding::AddressCodec};
 use zcash_note_encryption::note_bytes::NoteBytesData;
 use zcash_note_encryption::{try_note_decryption, try_output_recovery_with_ovk};
-use zcash_primitives::transaction::{components::sapling::zip212_enforcement, OrchardBundle};
-use zcash_protocol::memo::Memo;
+use zcash_primitives::transaction::{
+    components::sapling::zip212_enforcement, Authorized, OrchardBundle, TransactionData,
+};
+use zcash_protocol::{
+    memo::Memo,
+    value::{BalanceError, Zatoshis},
+};
+use zcash_transparent::bundle::OutPoint;
 
 use crate::{
     account::{get_orchard_vk, get_sapling_vk},
     api::coin::Network,
-    pay::fee::FeeManager,
+    pay::fee::{cost_per_action, FeeManager},
     Client,
 };
 
@@ -41,22 +49,59 @@ pub async fn fetch_tx_details(
             .fetch_all(&mut *connection)
             .await?;
 
+    // A failed transaction stays pending for the next pass; only a pass where
+    // nothing succeeded reports an error, so a dead server is still noticed.
+    let mut succeeded = false;
+    let mut failure = None;
     for (id_tx, txid) in txids.iter() {
-        decrypt_memo(network, connection, client, account, txid).await?;
-        let (tpe, value, asset_id, zsa_value) = summarize_tx(connection, *id_tx).await?;
-        sqlx::query(
-            "UPDATE transactions SET details = TRUE, tpe = ?, value = ?, zsa_value = ?, asset_id = ? WHERE id_tx = ?",
-        )
-        .bind(tpe)
-        .bind(value)
-        .bind(zsa_value)
-        .bind(asset_id)
-        .bind(*id_tx)
-        .execute(&mut *connection)
-        .await?;
+        match store_tx_details(network, connection, client, account, *id_tx, txid).await {
+            Ok(()) => succeeded = true,
+            Err(e) if server_stopped_answering(&e) => return Err(e),
+            Err(e) => {
+                tracing::warn!("details of {} not fetched: {e:#}", hex::encode(txid));
+                failure = Some(e);
+            }
+        }
     }
+    match failure {
+        Some(e) if !succeeded => Err(e.context("no transaction's details could be fetched")),
+        _ => Ok(()),
+    }
+}
 
-    Ok(())
+/// Every further request would wait out its own deadline, holding back the sync and server failover.
+fn server_stopped_answering(error: &anyhow::Error) -> bool {
+    matches!(
+        error
+            .downcast_ref::<tonic::Status>()
+            .map(tonic::Status::code),
+        Some(tonic::Code::DeadlineExceeded | tonic::Code::Unavailable)
+    )
+}
+
+async fn store_tx_details(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    id_tx: u32,
+    txid: &[u8],
+) -> Result<()> {
+    let fetched = decrypt_memo(network, connection, client, account, txid).await;
+    // Summarized from local notes and spends, so history stays right while details are pending.
+    let (tpe, value, asset_id, zsa_value) = summarize_tx(connection, id_tx).await?;
+    sqlx::query(
+        "UPDATE transactions SET details = ?, tpe = ?, value = ?, zsa_value = ?, asset_id = ? WHERE id_tx = ?",
+    )
+    .bind(fetched.is_ok())
+    .bind(tpe)
+    .bind(value)
+    .bind(zsa_value)
+    .bind(asset_id)
+    .bind(id_tx)
+    .execute(&mut *connection)
+    .await?;
+    fetched
 }
 
 async fn summarize_tx(
@@ -226,7 +271,7 @@ pub async fn decrypt_memo(
             .await
             .context("Failed to find transaction")?;
 
-    let mut fee_manager = FeeManager::default();
+    let mut fee_manager = FeeManager::new(cost_per_action(network, height));
     let svk = get_sapling_vk(connection, account).await?;
 
     let zip212_enforcement = zip212_enforcement(network, height.into());
@@ -380,7 +425,7 @@ pub async fn decrypt_memo(
                         &action.encrypted_note().out_ciphertext,
                     ) {
                         let address =
-                            UnifiedAddress::from_receivers(Some(address), None, None).unwrap();
+                            UnifiedAddress::from_receivers(Some(address), None, None, None, None).unwrap();
                         let id_output = store_output(
                             connection,
                             account,
@@ -431,7 +476,7 @@ pub async fn decrypt_memo(
                                 .await?;
                             } else {
                                 let address = UnifiedAddress::from_receivers(
-                                    Some(address), None, None,
+                                    Some(address), None, None, None, None,
                                 )
                                 .unwrap();
                                 let id_output = store_output(
@@ -478,7 +523,8 @@ pub async fn decrypt_memo(
             hex::encode(txid)
         );
     }
-    let fee = fee_manager.fee();
+    let prevouts = own_prevout_values(connection, account, &tx_data).await?;
+    let fee = fee_actually_paid(&tx_data, &prevouts).unwrap_or_else(|| fee_manager.fee());
     sqlx::query("UPDATE transactions SET fee = ? WHERE id_tx = ?")
         .bind(fee as i64)
         .bind(id_tx)
@@ -486,6 +532,47 @@ pub async fn decrypt_memo(
         .await?;
 
     Ok(())
+}
+
+async fn own_prevout_values(
+    connection: &mut SqliteConnection,
+    account: u32,
+    tx: &TransactionData<Authorized>,
+) -> Result<HashMap<OutPoint, Zatoshis>> {
+    let mut values = HashMap::new();
+    let Some(bundle) = tx.transparent_bundle() else {
+        return Ok(values);
+    };
+    for input in &bundle.vin {
+        // The "nullifier" of a transparent note is the outpoint that spends it.
+        let mut nullifier = vec![];
+        input.prevout().write(&mut nullifier)?;
+        let value: Option<i64> = sqlx::query_scalar(
+            "SELECT value FROM notes WHERE account = ? AND pool = 0 AND nullifier = ?",
+        )
+        .bind(account)
+        .bind(&nullifier)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if let Some(value) = value {
+            values.insert(
+                input.prevout().clone(),
+                Zatoshis::from_nonnegative_i64(value)?,
+            );
+        }
+    }
+    Ok(values)
+}
+
+/// `None` when a foreign transparent input hides the value, or the stored values do not add up.
+fn fee_actually_paid(
+    tx: &TransactionData<Authorized>,
+    prevouts: &HashMap<OutPoint, Zatoshis>,
+) -> Option<u64> {
+    tx.fee_paid::<BalanceError, _>(|outpoint| Ok(prevouts.get(outpoint).copied()))
+        .ok()
+        .flatten()
+        .map(Zatoshis::into_u64)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -587,6 +674,375 @@ async fn store_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::tests::memory_db;
+    use crate::lwd::CompactBlock;
+    use crate::net::{BroadcastOutcome, LwdServer};
+    use std::sync::{Arc, Mutex};
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::async_trait;
+    use zcash_primitives::transaction::Transaction;
+    use zcash_protocol::consensus::BranchId;
+    use zcash_transparent::{
+        address::{Script, TransparentAddress},
+        bundle::{Authorized as TransparentAuthorized, Bundle, OutPoint, TxIn, TxOut},
+    };
+
+    const ACCOUNT: u32 = 1;
+    const FAILING_TXID: u8 = 7;
+    const SERVED_TXID: u8 = 8;
+    const TIMED_OUT_TXID: u8 = 9;
+    const UNAVAILABLE_TXID: u8 = 10;
+    /// Sorts after the unanswered ids: pending transactions come back in txid order.
+    const LAST_TXID: u8 = 11;
+
+    /// Serves one transaction under `SERVED_TXID` if it has one, recording every txid asked for.
+    #[derive(Clone)]
+    struct OneTransactionServer {
+        served: Option<Vec<u8>>,
+        served_height: u32,
+        asked: Arc<Mutex<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl LwdServer for OneTransactionServer {
+        fn duplicate(&self) -> Client {
+            Box::new(self.clone())
+        }
+
+        async fn latest_height(&mut self) -> Result<u32> {
+            unimplemented!()
+        }
+
+        async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {
+            unimplemented!()
+        }
+
+        type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
+        async fn block_range(
+            &mut self,
+            _network: &Network,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::CompactBlockStream> {
+            unimplemented!()
+        }
+
+        async fn transaction(
+            &mut self,
+            _network: &Network,
+            txid: &[u8],
+        ) -> Result<(u32, Transaction)> {
+            self.asked.lock().unwrap().push(txid[0]);
+            match txid[0] {
+                TIMED_OUT_TXID => return Err(tonic::Status::deadline_exceeded("timed out").into()),
+                UNAVAILABLE_TXID => return Err(tonic::Status::unavailable("gone").into()),
+                _ => {}
+            }
+            match &self.served {
+                Some(raw) if txid[0] == SERVED_TXID => Ok((
+                    self.served_height,
+                    Transaction::read(&raw[..], BranchId::Nu6_3)?,
+                )),
+                _ => anyhow::bail!("not found"),
+            }
+        }
+
+        async fn post_transaction(&mut self, _height: u32, _tx: &[u8]) -> Result<BroadcastOutcome> {
+            unimplemented!()
+        }
+
+        type TransactionStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn taddress_txs(
+            &mut self,
+            _network: &Network,
+            _taddress: &str,
+            _start: u32,
+            _end: u32,
+        ) -> Result<Self::TransactionStream> {
+            unimplemented!()
+        }
+
+        type MempoolStream = ReceiverStream<Result<(u32, Transaction, usize)>>;
+        async fn mempool_stream(&mut self, _network: &Network) -> Result<Self::MempoolStream> {
+            unimplemented!()
+        }
+
+        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            unimplemented!()
+        }
+
+        async fn chain_anchor(&mut self, _height: u32) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+    }
+
+    async fn db_with_pending_transactions() -> SqliteConnection {
+        db_with_pending(&[FAILING_TXID, SERVED_TXID]).await
+    }
+
+    async fn db_with_pending(txids: &[u8]) -> SqliteConnection {
+        let mut connection = memory_db().await;
+        for txid in txids.iter().copied() {
+            sqlx::query("INSERT INTO transactions(txid, height, account) VALUES (?, 100, ?)")
+                .bind(vec![txid])
+                .bind(ACCOUNT)
+                .execute(&mut connection)
+                .await
+                .expect("insert transaction");
+        }
+        connection
+    }
+
+    async fn details_done(connection: &mut SqliteConnection, txid: u8) -> bool {
+        sqlx::query_scalar("SELECT details FROM transactions WHERE txid = ?")
+            .bind(vec![txid])
+            .fetch_one(connection)
+            .await
+            .expect("details")
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_nothing_succeeds_asks_for_every_transaction_and_returns_error() {
+        let mut connection = db_with_pending_transactions().await;
+        let asked = Arc::new(Mutex::new(vec![]));
+        let mut client: Client = Box::new(OneTransactionServer {
+            served: None,
+            served_height: 100,
+            asked: asked.clone(),
+        });
+
+        let result = fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT).await;
+
+        let error = format!("{:#}", result.expect_err("nothing succeeded"));
+        assert!(
+            error.contains("no transaction's details could be fetched"),
+            "{error}"
+        );
+        assert_eq!(*asked.lock().unwrap(), vec![FAILING_TXID, SERVED_TXID]);
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_server_stops_answering_returns_error_and_asks_no_further() {
+        for unanswered in [TIMED_OUT_TXID, UNAVAILABLE_TXID] {
+            let mut connection = db_with_pending(&[SERVED_TXID, unanswered, LAST_TXID]).await;
+            let asked = Arc::new(Mutex::new(vec![]));
+            let (raw, _) = crate::pay::reserve::tests::transparent_transaction();
+            let mut client: Client = Box::new(OneTransactionServer {
+                served: Some(raw),
+                served_height: 100,
+                asked: asked.clone(),
+            });
+
+            let result =
+                fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT).await;
+
+            assert!(result.is_err(), "txid {unanswered}");
+            assert!(details_done(&mut connection, SERVED_TXID).await);
+            assert_eq!(*asked.lock().unwrap(), vec![SERVED_TXID, unanswered]);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_one_transaction_fails_stores_the_next_and_retries_only_the_failed() {
+        let mut connection = db_with_pending_transactions().await;
+        let asked = Arc::new(Mutex::new(vec![]));
+        let (raw, _) = crate::pay::reserve::tests::transparent_transaction();
+        let mut client: Client = Box::new(OneTransactionServer {
+            served: Some(raw),
+            served_height: 100,
+            asked: asked.clone(),
+        });
+
+        fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT)
+            .await
+            .expect("one transaction succeeded");
+
+        assert!(!details_done(&mut connection, FAILING_TXID).await);
+        assert!(details_done(&mut connection, SERVED_TXID).await);
+        assert_eq!(*asked.lock().unwrap(), vec![FAILING_TXID, SERVED_TXID]);
+
+        asked.lock().unwrap().clear();
+        let retry = fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT).await;
+
+        assert!(retry.is_err());
+        assert_eq!(*asked.lock().unwrap(), vec![FAILING_TXID]);
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_transaction_fails_summarizes_it_from_local_notes_and_keeps_it_pending(
+    ) {
+        let mut connection = db_with_pending_transactions().await;
+        let id_tx: u32 = sqlx::query_scalar("SELECT id_tx FROM transactions WHERE txid = ?")
+            .bind(vec![FAILING_TXID])
+            .fetch_one(&mut connection)
+            .await
+            .expect("id_tx");
+        for (note, tx, value) in [(1, 999, 100_000), (2, id_tx, 30_000)] {
+            sqlx::query(
+                "INSERT INTO notes(id_note, height, account, pool, nullifier, tx, value)
+                VALUES (?, 100, ?, 2, ?, ?, ?)",
+            )
+            .bind(note)
+            .bind(ACCOUNT)
+            .bind(vec![note as u8])
+            .bind(tx)
+            .bind(value)
+            .execute(&mut connection)
+            .await
+            .expect("insert note");
+        }
+        sqlx::query(
+            "INSERT INTO spends(id_note, height, account, pool, tx, value)
+            VALUES (1, 100, ?, 2, ?, -100000)",
+        )
+        .bind(ACCOUNT)
+        .bind(id_tx)
+        .execute(&mut connection)
+        .await
+        .expect("insert spend");
+        let (raw, _) = crate::pay::reserve::tests::transparent_transaction();
+        let mut client: Client = Box::new(OneTransactionServer {
+            served: Some(raw),
+            served_height: 100,
+            asked: Arc::new(Mutex::new(vec![])),
+        });
+
+        fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT)
+            .await
+            .expect("one transaction succeeded");
+
+        let (value, tpe): (i64, Option<u8>) =
+            sqlx::query_as("SELECT value, tpe FROM transactions WHERE id_tx = ?")
+                .bind(id_tx)
+                .fetch_one(&mut connection)
+                .await
+                .expect("summary");
+        assert_eq!((value, tpe), (-70_000, Some(2)));
+        assert!(!details_done(&mut connection, FAILING_TXID).await);
+    }
+
+    const SPENT_OUTPOINT_HASH: [u8; 32] = [1; 32];
+    const INPUT_VALUE: i64 = 30_000;
+    const OUTPUT_VALUE: u64 = 20_000;
+
+    fn spent_outpoint() -> Vec<u8> {
+        let mut outpoint = SPENT_OUTPOINT_HASH.to_vec();
+        outpoint.extend_from_slice(&0u32.to_le_bytes());
+        outpoint
+    }
+
+    /// One transparent input and one output: two logical actions.
+    fn transparent_transfer() -> Vec<u8> {
+        let bundle = Bundle {
+            vin: vec![TxIn::from_parts(
+                OutPoint::new(SPENT_OUTPOINT_HASH, 0),
+                Script::default(),
+                u32::MAX,
+            )],
+            vout: vec![TxOut::new(
+                Zatoshis::const_from_u64(OUTPUT_VALUE),
+                TransparentAddress::PublicKeyHash([7; 20]).script().into(),
+            )],
+            authorization: TransparentAuthorized,
+        };
+        let tx = TransactionData::<Authorized>::from_parts_v6(
+            BranchId::Nu6_3,
+            0,
+            0u32.into(),
+            Zatoshis::ZERO,
+            Some(bundle),
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .expect("freeze");
+        let mut raw = vec![];
+        tx.write(&mut raw).expect("serialize");
+        raw
+    }
+
+    /// Stores the details of `transparent_transfer` mined at `height`; `input_value` is what
+    /// the account knows of the spent output, `None` when it is not this account's.
+    async fn stored_fee_and_type(height: u32, input_value: Option<i64>) -> (i64, Option<u8>) {
+        let mut connection = db_with_pending(&[SERVED_TXID]).await;
+        let id_tx: u32 = sqlx::query_scalar("SELECT id_tx FROM transactions WHERE txid = ?")
+            .bind(vec![SERVED_TXID])
+            .fetch_one(&mut connection)
+            .await
+            .expect("id_tx");
+        if let Some(value) = input_value {
+            sqlx::query(
+                "INSERT INTO notes(id_note, height, account, pool, nullifier, tx, value)
+                VALUES (1, 90, ?, 0, ?, 999, ?)",
+            )
+            .bind(ACCOUNT)
+            .bind(spent_outpoint())
+            .bind(value)
+            .execute(&mut connection)
+            .await
+            .expect("spent note");
+            sqlx::query(
+                "INSERT INTO spends(id_note, height, account, pool, tx, value)
+                VALUES (1, ?, ?, 0, ?, ?)",
+            )
+            .bind(height)
+            .bind(ACCOUNT)
+            .bind(id_tx)
+            .bind(-value)
+            .execute(&mut connection)
+            .await
+            .expect("spend");
+        }
+        sqlx::query(
+            "INSERT INTO notes(id_note, height, account, pool, nullifier, tx, value)
+            VALUES (2, ?, ?, 0, ?, ?, ?)",
+        )
+        .bind(height)
+        .bind(ACCOUNT)
+        .bind(vec![2u8; 36])
+        .bind(id_tx)
+        .bind(OUTPUT_VALUE as i64)
+        .execute(&mut connection)
+        .await
+        .expect("received note");
+        let mut client: Client = Box::new(OneTransactionServer {
+            served: Some(transparent_transfer()),
+            served_height: height,
+            asked: Arc::new(Mutex::new(vec![])),
+        });
+
+        fetch_tx_details(&Network::Main, &mut connection, &mut client, ACCOUNT)
+            .await
+            .expect("details");
+
+        sqlx::query_as("SELECT fee, tpe FROM transactions WHERE id_tx = ?")
+            .bind(id_tx)
+            .fetch_one(&mut connection)
+            .await
+            .expect("stored summary")
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_old_rate_mined_after_the_boundary_stores_the_fee_it_paid() {
+        let (fee, tpe) = stored_fee_and_type(3_590_000, Some(INPUT_VALUE)).await;
+
+        assert_eq!(fee, 10_000);
+        assert_eq!(tpe, Some(12), "a transfer to self stays one");
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_foreign_transparent_input_estimates_at_the_block_rate() {
+        assert_eq!(stored_fee_and_type(3_590_000, None).await.0, 2_000);
+        assert_eq!(stored_fee_and_type(3_589_999, None).await.0, 10_000);
+    }
+
+    #[tokio::test]
+    async fn fetch_tx_details_input_worth_less_than_the_outputs_estimates_at_the_block_rate() {
+        let (fee, _) = stored_fee_and_type(3_590_000, Some(OUTPUT_VALUE as i64 - 1)).await;
+
+        assert_eq!(fee, 2_000);
+    }
 
     #[test]
     fn orchard_to_ironwood_fee_only_transfer_is_migration() {
