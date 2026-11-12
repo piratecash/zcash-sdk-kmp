@@ -30,7 +30,8 @@ Rust triples: `aarch64-linux-android` + `armv7-linux-androideabi` (matching pcas
     zcash-sdk/src/commonMain      pure API — pools, balances, addresses, sync state
     zcash-sdk/src/jvmSharedMain   the single JNI binding + native library loading
     zcash-sdk/src/androidMain     System.loadLibrary
-    zcash-sdk/src/desktopMain     unpack the binary from the jar, then System.load
+    zcash-sdk/src/desktopMain     unpack the binary from the jar, then System.load; or load it from
+                                  the directory in ZcashNativeLibrary.NATIVE_DIR_PROPERTY
     rust/rlz                      vendored fork of zkool's Rust core
     rust/zcash-jni                the JNI bridge, built into libzcash_sdk_kmp.so
     sample-shared                 the demo app — one Compose Multiplatform UI
