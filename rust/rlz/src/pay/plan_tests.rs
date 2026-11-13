@@ -42,15 +42,21 @@ pub(crate) enum BroadcastReply {
 }
 
 /// Reports heights from a script, its last entry repeating, and answers a broadcast as told.
+/// A `None` entry is a height read that fails.
 #[derive(Clone)]
 pub(crate) struct ScriptedServer {
-    heights: Arc<Mutex<VecDeque<u32>>>,
+    heights: Arc<Mutex<VecDeque<Option<u32>>>>,
     height_reads: Arc<AtomicUsize>,
     reply: BroadcastReply,
 }
 
 impl ScriptedServer {
     pub(crate) fn new(heights: &[u32], reply: BroadcastReply) -> Self {
+        let script: Vec<_> = heights.iter().copied().map(Some).collect();
+        Self::scripted(&script, reply)
+    }
+
+    pub(crate) fn scripted(heights: &[Option<u32>], reply: BroadcastReply) -> Self {
         Self {
             heights: Arc::new(Mutex::new(heights.iter().copied().collect())),
             height_reads: Arc::new(AtomicUsize::new(0)),
@@ -76,13 +82,12 @@ impl LwdServer for ScriptedServer {
     async fn latest_height(&mut self) -> Result<u32> {
         self.height_reads.fetch_add(1, Ordering::SeqCst);
         let mut heights = self.heights.lock().unwrap();
-        if heights.len() > 1 {
-            return Ok(heights.pop_front().expect("scripted height"));
-        }
-        heights
-            .front()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("height unavailable"))
+        let height = if heights.len() > 1 {
+            heights.pop_front().expect("scripted height")
+        } else {
+            heights.front().copied().flatten()
+        };
+        height.ok_or_else(|| anyhow::anyhow!("height unavailable"))
     }
 
     async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {

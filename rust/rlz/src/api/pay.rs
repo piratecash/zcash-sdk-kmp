@@ -269,7 +269,14 @@ pub async fn broadcast(
 #[cfg_attr(feature = "flutter", frb)]
 pub async fn reserve_for_broadcast(tx_bytes: &[u8], c: &Coin, own_inputs: OwnInputs) -> Result<()> {
     let mut connection = c.get_connection().await?;
-    crate::pay::reserve::reserve_transaction(&mut connection, c.account, tx_bytes, own_inputs).await
+    crate::pay::reserve::reserve_transaction(
+        &mut connection,
+        c.account,
+        tx_bytes,
+        own_inputs,
+        async || c.client().await?.latest_height().await,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "flutter", frb(sync))]

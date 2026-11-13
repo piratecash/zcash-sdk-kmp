@@ -584,7 +584,8 @@ public class ZcashWallet private constructor(
     }
 
     /**
-     * Reserves wallet-owned inputs before a caller starts network I/O. Idempotent for the same tx.
+     * Reserves wallet-owned inputs before a caller broadcasts, reading the chain tip only when the
+     * tx spends this account's inputs. Idempotent for the same tx.
      * Pass `requireOwnInputs = false` for a transaction of unknown origin: it then reserves nothing
      * instead of being refused for spending no input of this account.
      */
