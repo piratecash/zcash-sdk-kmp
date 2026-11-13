@@ -144,6 +144,8 @@ internal fun parseAddresses(json: String): Addresses =
 internal fun encodeRecipients(recipients: List<Recipient>): String =
     nativeJson.encodeToString(recipients.map(Recipient::toDto))
 
+internal fun encodeAddresses(addresses: List<String>): String = nativeJson.encodeToString(addresses)
+
 internal fun parseTransactionPlan(json: String): TransactionPlan =
     nativeJson.decodeFromString<TxPlanDto>(json).toTransactionPlan()
 

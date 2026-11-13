@@ -279,6 +279,18 @@ pub async fn reserve_for_broadcast(tx_bytes: &[u8], c: &Coin, own_inputs: OwnInp
     .await
 }
 
+#[cfg_attr(feature = "flutter", frb)]
+pub async fn remember_sent_addresses(
+    tx_bytes: &[u8],
+    addresses: &[String],
+    c: &Coin,
+) -> Result<()> {
+    let txid = crate::pay::reserve::parse_transaction(tx_bytes)?.txid;
+    let mut connection = c.get_connection().await?;
+    crate::db::store_sent_addresses(&mut connection, c.account, &c.network(), &txid, addresses)
+        .await
+}
+
 #[cfg_attr(feature = "flutter", frb(sync))]
 pub fn to_plan(package: &PcztPackage, c: &Coin) -> Result<TxPlan> {
     TxPlan::from_package(&c.network(), package)

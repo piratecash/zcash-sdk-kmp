@@ -37,8 +37,9 @@ use rlz::api::network::{get_current_height, probe_server};
 use rlz::api::pay::{
     apply_external_signatures, apply_transparent_signatures, broadcast, external_signing_view,
     extract_transaction, fee_per_action, max_sendable, pack_transaction, prepare,
-    prove_transaction, reserve_for_broadcast, sign_transaction_with_key, to_plan, transaction_id,
-    transparent_signing_request, unpack_transaction, PaymentOptions, PcztPackage,
+    prove_transaction, remember_sent_addresses, reserve_for_broadcast, sign_transaction_with_key,
+    to_plan, transaction_id, transparent_signing_request, unpack_transaction, PaymentOptions,
+    PcztPackage,
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sqlite_log::{describe, record};
@@ -1539,6 +1540,26 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_reserveForBroadcast<'local>(
                 &coin,
                 own_inputs(require_own_inputs),
             ))?;
+            Ok(())
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_rememberSentAddresses<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    tx: JByteArray<'local>,
+    addresses_json: JString<'local>,
+) {
+    unowned_env
+        .with_env(|env| -> Result<(), BridgeError> {
+            let raw = env.convert_byte_array(&tx)?;
+            let addresses: Vec<String> = serde_json::from_str(&addresses_json.try_to_string(env)?)?;
+            let coin = wallet_account(handle, account)?;
+            runtime().block_on(remember_sent_addresses(&raw, &addresses, &coin))?;
             Ok(())
         })
         .resolve::<ThrowNativeError>()

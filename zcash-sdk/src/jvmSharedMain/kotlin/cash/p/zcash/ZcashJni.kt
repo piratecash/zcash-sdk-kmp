@@ -249,6 +249,8 @@ internal object ZcashJni {
         requireOwnInputs: Boolean,
     )
 
+    external fun rememberSentAddresses(handle: Long, account: Int, tx: ByteArray, addressesJson: String)
+
     external fun broadcastTransaction(
         handle: Long,
         account: Int,
