@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
 use tracing::info;
@@ -9,12 +9,6 @@ fn is_valid_zcash_address(s: &str) -> bool {
     zcash_address::ZcashAddress::try_from_encoded(s).is_ok()
 }
 use vcard4::Vcard;
-use zcash_address::unified::{Address as UnifiedAddress, Container, Encoding, Receiver};
-use zcash_address::ZcashAddress;
-use zcash_keys::encoding::AddressCodec;
-use zcash_protocol::consensus::Parameters;
-use zcash_protocol::{PoolType, ShieldedPool};
-use zcash_transparent::address::TransparentAddress;
 
 use crate::api::coin::Network;
 
@@ -26,73 +20,7 @@ pub struct Contact {
     pub notes: String,
 }
 
-/// Expand an address to a list of (receiver, pool) pairs.
-/// Pool: 0 = transparent, 1 = sapling, 2 = orchard.
-///
-/// If the address is a unified address, it is decomposed into individual
-/// receivers (one per pool), each assigned the appropriate pool id.
-/// If it's a single-pool address, it is returned as-is with its pool.
-pub fn expand_address_to_receivers_with_pool(
-    addr: &str,
-    network: &Network,
-) -> Result<Vec<(String, u8)>> {
-    // Try to parse as a unified address first
-    if let Ok((net, _revision, ua)) = UnifiedAddress::decode(addr) {
-        if net != network.network_type() {
-            anyhow::bail!("Invalid network for address");
-        }
-        let mut results = Vec::new();
-        for item in ua.items() {
-            match item {
-                Receiver::P2pkh(pkh) => {
-                    let taddr = TransparentAddress::PublicKeyHash(pkh);
-                    results.push((taddr.encode(&network), 0u8));
-                }
-                Receiver::P2sh(sh) => {
-                    let taddr = TransparentAddress::ScriptHash(sh);
-                    results.push((taddr.encode(&network), 0u8));
-                }
-                Receiver::Sapling(s) => {
-                    let saddr = sapling_crypto::PaymentAddress::from_bytes(&s).unwrap();
-                    results.push((saddr.encode(&network), 1u8));
-                }
-                Receiver::Orchard(o) => {
-                    let oaddr = orchard::Address::from_raw_address_bytes(&o)
-                        .into_option()
-                        .unwrap();
-                    let oaddr_ua = zcash_keys::address::UnifiedAddress::from_receivers(
-                        Some(oaddr),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .unwrap();
-                    results.push((oaddr_ua.encode(&network), 2u8));
-                }
-                _ => {}
-            }
-        }
-        if results.is_empty() {
-            anyhow::bail!("Address has no recognizable receivers");
-        }
-        return Ok(results);
-    }
-
-    // Fallback: single-pool address (transparent, sapling)
-    let zaddr =
-        ZcashAddress::try_from_encoded(addr).map_err(|e| anyhow!("Invalid address: {e}"))?;
-    let pool = if zaddr.can_receive_as(PoolType::Transparent) {
-        0u8
-    } else if zaddr.can_receive_as(PoolType::Shielded(ShieldedPool::Sapling)) {
-        1u8
-    } else if zaddr.can_receive_as(PoolType::Shielded(ShieldedPool::Orchard)) {
-        2u8
-    } else {
-        anyhow::bail!("Unrecognized address pool");
-    };
-    Ok(vec![(addr.to_string(), pool)])
-}
+pub use crate::memo::expand_address_to_receivers_with_pool;
 
 // ---------------------------------------------------------------------------
 // CRUD

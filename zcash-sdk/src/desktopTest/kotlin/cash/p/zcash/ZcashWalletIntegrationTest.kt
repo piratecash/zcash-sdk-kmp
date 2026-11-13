@@ -1243,6 +1243,32 @@ class ZcashWalletIntegrationTest {
         }
 
     @Test
+    fun rememberSentAddresses_unifiedAddress_succeeds() = withWallet { wallet ->
+        val account = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val address = assertNotNull(wallet.addresses(account).unified)
+
+        wallet.rememberSentAddresses(account, FOREIGN_TRANSACTION_HEX.hexToBytes(), listOf(address))
+    }
+
+    @Test
+    fun rememberSentAddresses_blankAddress_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val account = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> {
+            wallet.rememberSentAddresses(account, FOREIGN_TRANSACTION_HEX.hexToBytes(), listOf(" "))
+        }
+    }
+
+    @Test
+    fun rememberSentAddresses_invalidAddress_fails() = withWallet { wallet ->
+        val account = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<ZcashException> {
+            wallet.rememberSentAddresses(account, FOREIGN_TRANSACTION_HEX.hexToBytes(), listOf("not-an-address"))
+        }
+    }
+
+    @Test
     fun reserveForBroadcast_foreignTransactionByDefault_isRejected() = withWallet { wallet ->
         val account =
             wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)

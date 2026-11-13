@@ -584,7 +584,8 @@ public class ZcashWallet private constructor(
     }
 
     /**
-     * Reserves wallet-owned inputs before a caller starts network I/O. Idempotent for the same tx.
+     * Reserves wallet-owned inputs before a caller broadcasts, reading the chain tip only when the
+     * tx spends this account's inputs. Idempotent for the same tx.
      * Pass `requireOwnInputs = false` for a transaction of unknown origin: it then reserves nothing
      * instead of being refused for spending no input of this account.
      */
@@ -594,6 +595,19 @@ public class ZcashWallet private constructor(
         requireOwnInputs: Boolean = true,
     ): Unit = withNative {
         ZcashJni.reserveForBroadcast(handle, account, rawTransaction, requireOwnInputs)
+    }
+
+    /**
+     * Remembers the [addresses] [rawTransaction] pays, so history shows them instead of the single
+     * receiver the chain reveals. Only a send from this device can know them: a restored wallet cannot.
+     */
+    public suspend fun rememberSentAddresses(
+        account: Int,
+        rawTransaction: ByteArray,
+        addresses: List<String>,
+    ): Unit {
+        require(addresses.none(String::isBlank)) { "Sent addresses must not be blank" }
+        withNative { ZcashJni.rememberSentAddresses(handle, account, rawTransaction, encodeAddresses(addresses)) }
     }
 
     /** Hands [rawTransaction] to the node and reports its verdict without interpreting it. */

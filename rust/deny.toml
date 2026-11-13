@@ -13,8 +13,6 @@ exclude-dev = true
 [advisories]
 version = 2
 ignore = [
-    # Re-evaluate if a JNI entry point starts resolving OpenAlias, or on a hickory 0.26 move.
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.24: resolver reached only from flutter-only OpenAlias API; fix needs 0.26" },
     # Re-evaluate on an arti upgrade or if the SDK ever acts as a Tor relay.
     { id = "RUSTSEC-2023-0071", reason = "rsa via tor-llcrypto: client verifies public-key signatures only, no private-key timing; no patch exists" },
 
