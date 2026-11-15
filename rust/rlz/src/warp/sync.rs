@@ -33,6 +33,44 @@ pub use zcash_trees::types::SyncError;
 
 mod shielded;
 
+pub use shielded::SubtreeRoots;
+
+/// Below this many blocks a scan rarely completes a subtree: not worth three round trips.
+const SUBTREE_ROOTS_MIN_BLOCKS: u32 = 1_000;
+
+/// The server's completed subtrees of each pool from its frontier on. The first failure (Zebra,
+/// an old lightwalletd, a timeout) stops asking: the pools left without roots are hashed.
+pub async fn fetch_subtree_roots(
+    client: &mut Client,
+    states: [&CommitmentTreeFrontier; 3],
+    blocks: u32,
+) -> [SubtreeRoots; 3] {
+    let mut fetched: [SubtreeRoots; 3] = Default::default();
+    if blocks < SUBTREE_ROOTS_MIN_BLOCKS {
+        return fetched;
+    }
+    for (protocol, (state, roots)) in states.into_iter().zip(&mut fetched).enumerate() {
+        let first = (state.size() >> shielded::SUBTREE_DEPTH) as u32;
+        match client.subtree_roots(protocol as i32, first).await {
+            Ok(served) => {
+                *roots = SubtreeRoots {
+                    first,
+                    roots: served,
+                }
+            }
+            Err(error) => {
+                debug!("subtree roots not served: {error:#}");
+                break;
+            }
+        }
+    }
+    debug!(
+        "subtree roots: {:?}",
+        fetched.each_ref().map(|roots| roots.roots.len())
+    );
+    fetched
+}
+
 const MAX_BLOCKS_PER_CHUNK: usize = 1000;
 
 /// Waits before each reopen of a broken compact-block stream; once they run out the scan fails.
@@ -129,11 +167,13 @@ pub async fn warp_sync(
     sapling_state: &CommitmentTreeFrontier,
     orchard_state: &CommitmentTreeFrontier,
     ironwood_state: &CommitmentTreeFrontier,
+    subtree_roots: [SubtreeRoots; 3],
     tx_decrypted: Sender<WarpSyncMessage>,
     rx_cancel: broadcast::Receiver<()>,
     fetch: Option<FetchPlan>,
     scan_wait: Arc<ScanWait>,
 ) -> Result<(), SyncError> {
+    let [sapling_roots, orchard_roots, ironwood_roots] = subtree_roots;
     let sap_hasher = SaplingHasher::default();
 
     let mut sap_dec = SaplingSync::new(
@@ -147,6 +187,7 @@ pub async fn warp_sync(
         sapling_state.to_edge(&sap_hasher),
     )
     .await?;
+    sap_dec.subtree_roots = sapling_roots;
 
     let orch_hasher = OrchardHasher::default();
     let mut orch_dec = OrchardSync::new(
@@ -160,6 +201,7 @@ pub async fn warp_sync(
         orchard_state.to_edge(&orch_hasher),
     )
     .await?;
+    orch_dec.subtree_roots = orchard_roots;
 
     let ironwood_active = network.activation_height(NetworkUpgrade::Nu6_3).is_some();
     let ironwood_hasher = OrchardHasher::default();
@@ -175,7 +217,11 @@ pub async fn warp_sync(
                 ironwood_state.size() as u32,
                 ironwood_state.to_edge(&ironwood_hasher),
             )
-            .await?,
+            .await
+            .map(|mut dec| {
+                dec.subtree_roots = ironwood_roots;
+                dec
+            })?,
         )
     } else {
         None
@@ -195,7 +241,7 @@ pub async fn warp_sync(
         .unwrap();
 
     let account_ids = accounts.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-    let (tx_blocks, mut rx_blocks) = tokio::sync::mpsc::channel::<BlockMessage>(2);
+    let (tx_blocks, rx_blocks) = tokio::sync::mpsc::channel::<BlockMessage>(2);
     let source = ResumableBlocks {
         blocks,
         client,
@@ -219,6 +265,8 @@ pub async fn warp_sync(
     );
 
     let block_processor = async {
+        // Owned here so a scan error closes the channel and ends the reader instead of blocking it.
+        let mut rx_blocks = rx_blocks;
         while let Some(bm) = scan_wait.timed(rx_blocks.recv()).await {
             match bm {
                 BlockMessage::Chunk(bs) => {
@@ -492,7 +540,7 @@ mod tests {
     use super::*;
     use crate::account::tests::{restore, TEST_PHRASE};
     use crate::api::sync::file_backed_coin;
-    use crate::net::{BroadcastOutcome, LwdServer, NetworkStats};
+    use crate::net::{BroadcastOutcome, CompletedSubtree, LwdServer, NetworkStats};
     use crate::sync::fetch::tests::{cfg, eventually, factory, new_breaks, Fake};
     use crate::sync::fetch::FetchConfig;
     use crate::sync::{get_tree_state, shielded_sync};
@@ -531,6 +579,8 @@ mod tests {
         replies: Arc<Mutex<VecDeque<Reply>>>,
         starts: Arc<Mutex<Vec<u32>>>,
         stalled: Arc<Mutex<Vec<Sender<Result<CompactBlock>>>>>,
+        roots: Arc<Mutex<VecDeque<Result<Vec<CompletedSubtree>>>>>,
+        roots_asked: Arc<Mutex<Vec<(i32, u32)>>>,
     }
 
     impl ScriptedRanges {
@@ -539,7 +589,14 @@ mod tests {
                 replies: Arc::new(Mutex::new(replies.into())),
                 starts: Arc::new(Mutex::new(vec![])),
                 stalled: Arc::new(Mutex::new(vec![])),
+                roots: Arc::new(Mutex::new(VecDeque::new())),
+                roots_asked: Arc::new(Mutex::new(vec![])),
             }
+        }
+
+        fn serving_roots(self, roots: Vec<Result<Vec<CompletedSubtree>>>) -> Self {
+            *self.roots.lock().expect("lock") = roots.into();
+            self
         }
 
         fn starts(&self) -> Vec<u32> {
@@ -627,6 +684,19 @@ mod tests {
 
         async fn chain_anchor(&mut self, _height: u32) -> Result<Vec<u8>> {
             unimplemented!()
+        }
+
+        async fn subtree_roots(
+            &mut self,
+            protocol: i32,
+            start: u32,
+        ) -> Result<Vec<CompletedSubtree>> {
+            self.roots_asked
+                .lock()
+                .expect("lock")
+                .push((protocol, start));
+            let reply = self.roots.lock().expect("lock").pop_front();
+            reply.expect("an unscripted subtree roots request")
         }
     }
 
@@ -1271,6 +1341,7 @@ mod tests {
             &sapling,
             &orchard,
             &ironwood,
+            Default::default(),
             decrypted,
             cancellation,
             None,
@@ -1284,6 +1355,93 @@ mod tests {
             "{:?}",
             gauge.total()
         );
+    }
+
+    #[tokio::test]
+    async fn warp_sync_scan_fails_with_chunks_still_coming_returns_the_error() {
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let mut client: Client = Box::new(ScriptedRanges::new(vec![]));
+        let (sapling, orchard, ironwood) = get_tree_state(&Network::Main, &mut client, 2_000_000)
+            .await
+            .expect("tree state");
+        let (sender, receiver) = tokio::sync::mpsc::channel(10);
+        for height in 2_000_001..=2_000_010 {
+            sender.send(Ok(chained(height))).await.expect("queue block");
+        }
+        drop(sender);
+        // The processor fails on its first chunk: nothing takes its messages.
+        let (decrypted, _) = tokio::sync::mpsc::channel(100);
+        let (_cancel, cancellation) = broadcast::channel(1);
+
+        let accounts = [(account, false)];
+        let scan = warp_sync(
+            &Network::Main,
+            &mut connection,
+            2_000_001,
+            2_000_010,
+            &accounts,
+            ReceiverStream::new(receiver),
+            client,
+            HashSet::new(),
+            0,
+            &sapling,
+            &orchard,
+            &ironwood,
+            Default::default(),
+            decrypted,
+            cancellation,
+            None,
+            ScanWait::new(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("the scan error ends the sync");
+
+        let error = format!("{:#}", result.expect_err("the scan error"));
+        assert!(error.contains("channel closed"), "{error}");
+    }
+
+    fn completed(root: u8) -> CompletedSubtree {
+        CompletedSubtree {
+            root: [root; 32],
+            height: 1,
+            hash: [root; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_subtree_roots_first_failure_stops_asking() {
+        let server = ScriptedRanges::new(vec![]).serving_roots(vec![
+            Ok(vec![completed(1)]),
+            Err(anyhow::anyhow!("unimplemented")),
+        ]);
+        let asked = server.roots_asked.clone();
+        let mut client: Client = Box::new(server);
+        let empty = CommitmentTreeFrontier::default();
+
+        let [sapling, orchard, ironwood] =
+            fetch_subtree_roots(&mut client, [&empty, &empty, &empty], 1_000).await;
+
+        assert_eq!(*asked.lock().expect("lock"), vec![(0, 0), (1, 0)]);
+        assert_eq!(sapling.roots, vec![completed(1)]);
+        assert!(orchard.roots.is_empty() && ironwood.roots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_subtree_roots_short_range_asks_nothing() {
+        let server = ScriptedRanges::new(vec![]);
+        let asked = server.roots_asked.clone();
+        let mut client: Client = Box::new(server);
+        let empty = CommitmentTreeFrontier::default();
+
+        let roots = fetch_subtree_roots(&mut client, [&empty, &empty, &empty], 999).await;
+
+        assert!(asked.lock().expect("lock").is_empty());
+        assert!(roots.iter().all(|roots| roots.roots.is_empty()));
     }
 
     #[tokio::test]

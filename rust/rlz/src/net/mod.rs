@@ -9,7 +9,7 @@ use zcash_primitives::transaction::Transaction;
 
 use tonic::async_trait;
 
-use crate::{api::coin::Network, lwd::*, Client};
+use crate::{api::coin::Network, lwd::*, Client, Hash32};
 
 pub mod lwd;
 #[cfg(feature = "nym")]
@@ -212,7 +212,37 @@ pub trait LwdServer: Send {
     async fn lightd_info(&mut self) -> Result<LightdInfo> {
         anyhow::bail!("lightd info is not available on this server")
     }
+
+    /// Completed subtrees of a pool's note commitment tree from subtree `start` on (`protocol` 0 is
+    /// Sapling, 1 Orchard, 2 Ironwood): `roots[i]` is subtree `start + i`. Only lightwalletd serves them.
+    async fn subtree_roots(
+        &mut self,
+        _protocol: i32,
+        _start: u32,
+    ) -> Result<Vec<CompletedSubtree>> {
+        anyhow::bail!("subtree roots are not available on this server")
+    }
 }
+
+/// A completed subtree as the server describes it: its root and the block that completed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedSubtree {
+    pub root: Hash32,
+    pub height: u32,
+    pub hash: Hash32,
+}
+
+impl CompletedSubtree {
+    /// The completing block's hash in `CompactBlock::hash` order: lightwalletd sends it reversed.
+    pub fn block_hash(&self) -> Hash32 {
+        let mut hash = self.hash;
+        hash.reverse();
+        hash
+    }
+}
+
+/// Subtrees asked for per pool: more than a wallet's scan spans, and a bound on what a server can make us hold.
+pub(crate) const MAX_SUBTREE_ROOTS: u32 = 4096;
 
 #[cfg(test)]
 mod tests {

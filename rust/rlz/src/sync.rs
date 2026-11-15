@@ -21,7 +21,7 @@ use crate::db::{
 };
 use crate::io::SyncHeight;
 use crate::net::{is_nym_url, STREAM_STATS};
-use crate::warp::sync::ScanWait;
+use crate::warp::sync::{fetch_subtree_roots, ScanWait};
 use crate::{Client, Sink};
 use fetch::{block_stream, fetch_config, BlockDownload, ClientFactory, FetchPlan};
 use std::future::Future;
@@ -1031,6 +1031,7 @@ pub async fn shielded_sync(
 
     let accounts = accounts.to_vec();
     let (s, o, i) = get_tree_state(network, client, start - 1).await?;
+    let subtree_roots = fetch_subtree_roots(client, [&s, &o, &i], end.saturating_sub(start)).await;
 
     debug!("get compact block range");
     let scan_wait = ScanWait::new();
@@ -1073,6 +1074,7 @@ pub async fn shielded_sync(
             &s,
             &o,
             &i,
+            subtree_roots,
             tx_messages,
             rx_cancel,
             fetch,

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use tracing::debug;
 use zcash_primitives::transaction::Transaction;
 
@@ -11,7 +11,8 @@ use crate::{
     api::{coin::Network, network::LWDInfo},
     lwd::*,
     net::{
-        bounded, forward_stream_with_idle, BroadcastOutcome, LwdServer, STREAM_IDLE, UNARY_DEADLINE,
+        bounded, forward_stream_with_idle, BroadcastOutcome, CompletedSubtree, LwdServer,
+        MAX_SUBTREE_ROOTS, STREAM_IDLE, UNARY_DEADLINE,
     },
     Client, GRPCClient,
 };
@@ -245,6 +246,21 @@ impl LwdServer for GRPCClient {
         Ok(hex::decode(&state.hash)?)
     }
 
+    async fn subtree_roots(&mut self, protocol: i32, start: u32) -> Result<Vec<CompletedSubtree>> {
+        let fetch = async {
+            let stream = self
+                .get_subtree_roots(Request::new(GetSubtreeRootsArg {
+                    start_index: start,
+                    shielded_protocol: protocol,
+                    max_entries: MAX_SUBTREE_ROOTS,
+                }))
+                .await?
+                .into_inner();
+            read_subtree_roots(stream).await
+        };
+        bounded("get_subtree_roots", UNARY_DEADLINE, fetch).await
+    }
+
     async fn lightd_info(&mut self) -> Result<LightdInfo> {
         let info = bounded(
             "get_lightd_info",
@@ -255,6 +271,30 @@ impl LwdServer for GRPCClient {
         .into_inner();
         Ok(info)
     }
+}
+
+/// Each root is checked as it arrives and at most `MAX_SUBTREE_ROOTS` are read, whatever the server sends.
+async fn read_subtree_roots(
+    stream: impl Stream<Item = Result<SubtreeRoot, tonic::Status>>,
+) -> Result<Vec<CompletedSubtree>> {
+    let mut stream = std::pin::pin!(stream.take(MAX_SUBTREE_ROOTS as usize));
+    let mut roots = vec![];
+    while let Some(root) = stream.next().await {
+        roots.push(completed_subtree(&root?)?);
+    }
+    Ok(roots)
+}
+
+fn completed_subtree(root: &SubtreeRoot) -> Result<CompletedSubtree> {
+    let bytes = |field: &[u8], what: &str| {
+        <[u8; 32]>::try_from(field)
+            .map_err(|_| anyhow::anyhow!("a subtree {what} of {} bytes", field.len()))
+    };
+    Ok(CompletedSubtree {
+        root: bytes(&root.root_hash, "root")?,
+        height: u32::try_from(root.completing_block_height)?,
+        hash: bytes(&root.completing_block_hash, "block hash")?,
+    })
 }
 
 pub async fn query_lwd_list(coin: u8) -> Result<Vec<LWDInfo>> {
@@ -310,4 +350,95 @@ pub async fn query_lwd_list(coin: u8) -> Result<Vec<LWDInfo>> {
     }
 
     Ok(lwd_list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::transport::{ClientTlsConfig, Endpoint};
+
+    fn root(i: u8) -> SubtreeRoot {
+        SubtreeRoot {
+            root_hash: vec![i; 32],
+            completing_block_hash: vec![i + 1; 32],
+            completing_block_height: 1_000 + u64::from(i),
+        }
+    }
+
+    async fn read(roots: Vec<SubtreeRoot>) -> Result<Vec<CompletedSubtree>> {
+        read_subtree_roots(futures::stream::iter(roots.into_iter().map(Ok))).await
+    }
+
+    #[tokio::test]
+    async fn read_subtree_roots_well_formed_keeps_order_and_fields() {
+        let roots = read(vec![root(1), root(2)]).await.unwrap();
+        let first = CompletedSubtree {
+            root: [1; 32],
+            height: 1_001,
+            hash: [2; 32],
+        };
+        assert_eq!(
+            roots,
+            [
+                first,
+                CompletedSubtree {
+                    root: [2; 32],
+                    height: 1_002,
+                    hash: [3; 32]
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_subtree_roots_malformed_root_fails_the_call() {
+        let short_root = SubtreeRoot {
+            root_hash: vec![0; 31],
+            ..root(1)
+        };
+        let long_hash = SubtreeRoot {
+            completing_block_hash: vec![0; 33],
+            ..root(1)
+        };
+        let high = SubtreeRoot {
+            completing_block_height: u64::from(u32::MAX) + 1,
+            ..root(1)
+        };
+        for bad in [short_root, long_hash, high] {
+            assert!(read(vec![root(0), bad, root(2)]).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_subtree_roots_server_ignores_the_limit_stops_at_it() {
+        let many = vec![root(1); MAX_SUBTREE_ROOTS as usize + 5];
+        assert_eq!(read(many).await.unwrap().len(), MAX_SUBTREE_ROOTS as usize);
+    }
+
+    #[tokio::test]
+    async fn read_subtree_roots_stream_error_fails_the_call() {
+        let stream = futures::stream::iter([Ok(root(1)), Err(tonic::Status::unimplemented("no"))]);
+        assert!(read_subtree_roots(stream).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "live: needs mainnet lightwalletd servers"]
+    async fn subtree_roots_live_servers_name_the_block_that_completed_each_subtree() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for url in ["https://zec.rocks:443", "https://ap.zec.rocks:443"] {
+            let channel = Endpoint::from_static(url)
+                .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut client = GRPCClient::new(channel);
+            for protocol in 0..3 {
+                let roots = client.subtree_roots(protocol, 0).await.unwrap();
+                let last = roots.last().expect("roots");
+                let block = client.block(&Network::Main, last.height).await.unwrap();
+                assert_eq!(block.hash, last.block_hash(), "{url} pool {protocol}");
+            }
+        }
+    }
 }
