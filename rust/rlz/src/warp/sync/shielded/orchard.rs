@@ -14,7 +14,7 @@ use crate::{
 };
 use zcash_trees::{network::Network, types};
 
-use crate::warp::{hasher::OrchardHasher, try_orchard_decrypt};
+use crate::warp::{decrypt_orchard_batch, hasher::OrchardHasher, OutputRef};
 
 use super::ShieldedProtocol;
 
@@ -64,18 +64,12 @@ impl ShieldedProtocol for OrchardProtocol {
         o.cmx.clone().try_into().unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn try_decrypt(
+    fn try_decrypt_batch(
         network: &Network,
-        account: u32,
-        scope: u8,
-        ivk: &Self::IVK,
-        height: u32,
-        ivtx: u32,
-        vout: u32,
-        output: &Self::Output,
-    ) -> Result<Option<(Self::Note, types::Note)>> {
-        try_orchard_decrypt(network, account, scope, ivk, height, ivtx, vout, output)
+        keys: &[(u32, u8, &Self::IVK)],
+        outputs: &[OutputRef<Self::Output>],
+    ) -> Vec<(usize, Self::Note, types::Note)> {
+        decrypt_orchard_batch(network, keys, outputs)
     }
 
     fn compute_issuance_cmx(

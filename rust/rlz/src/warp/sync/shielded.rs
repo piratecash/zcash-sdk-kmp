@@ -12,7 +12,7 @@ use tracing::{debug, enabled};
 use zcash_trees::network::Network;
 
 use crate::lwd::{CompactBlock, CompactIssueNote, CompactTx};
-use crate::warp::{Edge, Hasher, Witness, MERKLE_DEPTH};
+use crate::warp::{Edge, Hasher, OutputRef, Witness, MERKLE_DEPTH};
 use crate::Hash32;
 use ::orchard::issuance::auth::{IssueValidatingKey, ZSASchnorr};
 use ::orchard::note::{AssetBase, AssetId};
@@ -45,17 +45,12 @@ pub trait ShieldedProtocol {
     fn extract_nf(i: &Self::Spend) -> Hash32;
     fn extract_cmx(o: &Self::Output) -> Hash32;
 
-    #[allow(clippy::too_many_arguments)]
-    fn try_decrypt(
+    /// Every (key index, note) match of `outputs` against `keys`, output-major, key-minor.
+    fn try_decrypt_batch(
         network: &Network,
-        account: u32,
-        scope: u8,
-        ivk: &Self::IVK,
-        height: u32,
-        ivtx: u32,
-        vout: u32,
-        output: &Self::Output,
-    ) -> Result<Option<(Self::Note, Note)>>;
+        keys: &[(u32, u8, &Self::IVK)],
+        outputs: &[OutputRef<Self::Output>],
+    ) -> Vec<(usize, Self::Note, Note)>;
 
     fn derive_nf(nk: &Self::NK, position: u32, note: &mut Self::Note) -> Result<Hash32>;
 
@@ -88,6 +83,41 @@ pub trait ShieldedProtocol {
     ) -> Result<Option<Hash32>> {
         Ok(None) // default: issuance not supported
     }
+}
+
+/// Outputs per batch: enough to amortise the batched inversions, small enough to keep every core busy.
+const DECRYPT_BATCH: usize = 64;
+
+/// Every note of `blocks` that belongs to one of `keys`, with that key's nullifier key, in output order.
+fn decrypt_outputs<'k, P: ShieldedProtocol>(
+    network: &Network,
+    keys: &'k [(u32, u8, P::IVK, P::NK)],
+    blocks: &[CompactBlock],
+) -> Vec<(P::Note, Note, &'k P::NK)> {
+    // A pool without keys still syncs its tree: skip preparing epks nobody decrypts with.
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let outputs: Vec<OutputRef<P::Output>> = blocks
+        .iter()
+        .flat_map(|b| {
+            b.vtx.iter().enumerate().flat_map(move |(ivtx, vtx)| {
+                P::extract_outputs(vtx)
+                    .iter()
+                    .enumerate()
+                    .map(move |(vout, o)| (b.height as u32, ivtx as u32, vout as u32, o))
+            })
+        })
+        .collect();
+    let ivks: Vec<_> = keys.iter().map(|(a, s, ivk, _)| (*a, *s, ivk)).collect();
+    outputs
+        .par_chunks(DECRYPT_BATCH)
+        .flat_map_iter(|chunk| {
+            P::try_decrypt_batch(network, &ivks, chunk)
+                .into_iter()
+                .map(|(k, n, dbn)| (n, dbn, &keys[k].3))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -199,40 +229,7 @@ impl<P: ShieldedProtocol> Synchronizer<P> {
         }
 
         let network = self.network;
-        let outputs = blocks.into_par_iter().flat_map_iter(|b| {
-            b.vtx.iter().enumerate().flat_map(move |(ivtx, vtx)| {
-                P::extract_outputs(vtx)
-                    .iter()
-                    .enumerate()
-                    .map(move |(vout, o)| (b.height as u32, ivtx, vout, o))
-            })
-        });
-
-        let mut notes: Vec<(
-            <P as ShieldedProtocol>::Note,
-            Note,
-            &<P as ShieldedProtocol>::NK,
-        )> = outputs
-            .flat_map_iter(|(height, ivtx, vout, o)| {
-                self.keys.iter().flat_map(move |(account, scope, ivk, nk)| {
-                    P::try_decrypt(
-                        &network,
-                        *account,
-                        *scope,
-                        ivk,
-                        height,
-                        ivtx as u32,
-                        vout as u32,
-                        o,
-                    )
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("decrypt error: {e}");
-                        None
-                    })
-                    .map(|(n, dbn)| (n, dbn, nk))
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut notes = decrypt_outputs::<P>(&network, &self.keys, blocks);
 
         // Process issuance notes from vtx.issuances — plaintext, no trial
         // decryption needed.  Per tx we track the cmxs (for tree building)
@@ -474,10 +471,12 @@ impl<P: ShieldedProtocol> Synchronizer<P> {
             key.extend_from_slice(&utxo.nullifier);
             self.utxos.insert(key, utxo);
         }
-        let auth_path = self.tree_state.to_auth_path(&self.hasher);
+        // Only the DEBUG anchor check reads the auth path, and it costs a tree walk per chunk.
+        let auth_path = enabled!(target: "warp", tracing::Level::DEBUG)
+            .then(|| self.tree_state.to_auth_path(&self.hasher));
         let mut root: Option<[u8; 32]> = None;
         for utxo in self.utxos.values_mut() {
-            if enabled!(target: "warp", tracing::Level::DEBUG) {
+            if let Some(auth_path) = &auth_path {
                 let w = &mut utxo.witness;
                 let anchor = w.root(&auth_path.0, &self.hasher);
                 w.anchor = anchor;
@@ -543,5 +542,165 @@ impl<P: ShieldedProtocol> Synchronizer<P> {
             .context("sending checkpoint")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::orchard::OrchardProtocol;
+    use super::sapling::SaplingProtocol;
+    use super::*;
+    use crate::warp::decrypter::tests::{
+        fields, orchard_action, orchard_fvk, orchard_ivk, orchard_scalar, sapling_dfvk,
+        sapling_output, sapling_scalar, Bytes, NoteFields, OrchardKind, ORCHARD_HEIGHT,
+    };
+
+    type Scalar<P> = fn(
+        &Network,
+        &[(u32, u8, &<P as ShieldedProtocol>::IVK)],
+        &[OutputRef<<P as ShieldedProtocol>::Output>],
+    ) -> Vec<(usize, <P as ShieldedProtocol>::Note, Note)>;
+
+    /// The caller before batching: every output, one call, no chunks.
+    fn decrypt_unchunked<P: ShieldedProtocol>(
+        keys: &[(u32, u8, P::IVK, P::NK)],
+        blocks: &[CompactBlock],
+        scalar: Scalar<P>,
+    ) -> Vec<(NoteFields, usize)> {
+        let mut outputs = vec![];
+        for b in blocks {
+            for (ivtx, tx) in b.vtx.iter().enumerate() {
+                for (vout, o) in P::extract_outputs(tx).iter().enumerate() {
+                    outputs.push((b.height as u32, ivtx as u32, vout as u32, o));
+                }
+            }
+        }
+        let ivks: Vec<_> = keys.iter().map(|(a, s, ivk, _)| (*a, *s, ivk)).collect();
+        scalar(&Network::Main, &ivks, &outputs)
+            .iter()
+            .map(|(k, _, dbn)| (fields(dbn), *k))
+            .collect()
+    }
+
+    fn decrypted<P: ShieldedProtocol>(
+        keys: &[(u32, u8, P::IVK, P::NK)],
+        blocks: &[CompactBlock],
+    ) -> Vec<(NoteFields, usize)> {
+        decrypt_outputs::<P>(&Network::Main, keys, blocks)
+            .iter()
+            .map(|(_, dbn, nk)| {
+                let k = keys
+                    .iter()
+                    .position(|key| std::ptr::eq(&key.3, *nk))
+                    .unwrap();
+                (fields(dbn), k)
+            })
+            .collect()
+    }
+
+    /// Blocks of single-output txs, `outputs[i]` replaced by `ours[i]` where given.
+    fn blocks<O: Clone>(
+        height: u32,
+        filler: &O,
+        ours: &[(usize, O)],
+        total: usize,
+        tx: fn(O) -> CompactTx,
+    ) -> Vec<CompactBlock> {
+        let per_block = 50;
+        (0..total.div_ceil(per_block))
+            .map(|b| CompactBlock {
+                height: (height + b as u32) as u64,
+                vtx: (b * per_block..((b + 1) * per_block).min(total))
+                    .map(|i| {
+                        let o = ours
+                            .iter()
+                            .find(|(at, _)| *at == i)
+                            .map_or(filler, |(_, o)| o);
+                        tx(o.clone())
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Matches on both sides of each chunk boundary, at the ends, and on every key.
+    const AT: [usize; 7] = [0, B - 1, B, B + 1, 2 * B - 1, 2 * B, TOTAL - 1];
+    const B: usize = DECRYPT_BATCH;
+    const TOTAL: usize = 300;
+    const _: () = assert!(TOTAL > 2 * B + 1);
+
+    #[test]
+    fn decrypt_outputs_orchard_across_chunks_matches_unchunked_scalar_path() {
+        let mut bytes = Bytes::new(5);
+        let (a, b) = (orchard_fvk(1), orchard_fvk(2));
+        let keys = vec![
+            (1, 0, orchard_ivk(&a, 0), a.clone()),
+            (1, 1, orchard_ivk(&a, 1), a.clone()),
+            (2, 0, orchard_ivk(&b, 0), b.clone()),
+            (3, 0, orchard_ivk(&a, 0), a.clone()),
+        ];
+        let kinds = [OrchardKind::V2, OrchardKind::Ironwood, OrchardKind::Zsa];
+        let ours: Vec<_> = AT
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| {
+                let (fvk, scope) = [(&a, 0), (&a, 1), (&b, 0)][i % 3];
+                (
+                    at,
+                    orchard_action(fvk, scope, 100 + i as u64, kinds[i % 3], &mut bytes),
+                )
+            })
+            .collect();
+        let filler = orchard_action(&orchard_fvk(9), 0, 1, OrchardKind::V2, &mut bytes);
+        let blocks = blocks(ORCHARD_HEIGHT, &filler, &ours, TOTAL, |a| CompactTx {
+            actions: vec![a],
+            ..Default::default()
+        });
+
+        let notes = decrypted::<OrchardProtocol>(&keys, &blocks);
+
+        let keys_hit: Vec<usize> = notes.iter().map(|(_, k)| *k).collect();
+        assert_eq!(keys_hit, [0, 3, 1, 2, 0, 3, 1, 2, 0, 3]);
+        assert_eq!(
+            notes,
+            decrypt_unchunked::<OrchardProtocol>(&keys, &blocks, orchard_scalar)
+        );
+    }
+
+    #[test]
+    fn decrypt_outputs_sapling_across_chunks_matches_unchunked_scalar_path() {
+        let mut bytes = Bytes::new(6);
+        let (a, b) = (sapling_dfvk(1), sapling_dfvk(2));
+        let key = |account, scope, dfvk| {
+            let (ivk, nk) = crate::keys::sapling_ivk_nk_for_scope(scope, dfvk);
+            (account, scope, ivk, nk)
+        };
+        let keys = vec![key(1, 0u8, &a), key(1, 1, &a), key(2, 0, &b), key(3, 0, &a)];
+        let ours: Vec<_> = AT
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| {
+                let (dfvk, scope) = [(&a, 0), (&a, 1), (&b, 0)][i % 3];
+                (
+                    at,
+                    sapling_output(dfvk, scope, 100 + i as u64, true, &mut bytes),
+                )
+            })
+            .collect();
+        let filler = sapling_output(&sapling_dfvk(9), 0, 1, true, &mut bytes);
+        let blocks = blocks(ORCHARD_HEIGHT, &filler, &ours, TOTAL, |o| CompactTx {
+            outputs: vec![o],
+            ..Default::default()
+        });
+
+        let notes = decrypted::<SaplingProtocol>(&keys, &blocks);
+
+        let keys_hit: Vec<usize> = notes.iter().map(|(_, k)| *k).collect();
+        assert_eq!(keys_hit, [0, 3, 1, 2, 0, 3, 1, 2, 0, 3]);
+        assert_eq!(
+            notes,
+            decrypt_unchunked::<SaplingProtocol>(&keys, &blocks, sapling_scalar)
+        );
     }
 }
