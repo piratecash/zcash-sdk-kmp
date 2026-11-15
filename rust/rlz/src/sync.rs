@@ -214,10 +214,76 @@ fn more_clients(coin: &Coin) -> Option<ClientFactory> {
     })
 }
 
+/// A reorg is rewound and committed before its error surfaces, so another pass resumes below the
+/// fork. Only a reorg that keeps recurring reaches the caller.
+const REORG_RETRIES: u32 = 2;
+
 /// One sync cycle: recovery, then every height range the accounts need, transparent pass before
-/// shielded pass. Separate from `synchronize_impl` so the cycle can run against any `LwdServer`.
+/// shielded pass, run again after a reorg. Separate from `synchronize_impl` so the cycle can run
+/// against any `LwdServer`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_height_ranges(
+    network: &Network,
+    pool: &SqlitePool,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    accounts: &[u32],
+    current_height: u32,
+    actions_per_sync: u32,
+    transparent_limit: u32,
+    noskip_details: bool,
+    tx_progress: &Sender<SyncProgress>,
+    tx_cancel: &broadcast::Sender<()>,
+    fetch: Option<&FetchPlan>,
+) -> Result<()> {
+    let mut rx_cancel = tx_cancel.subscribe();
+    let mut retries = 0;
+    loop {
+        match sync_height_ranges_once(
+            network,
+            pool,
+            &mut *connection,
+            &mut *client,
+            accounts,
+            current_height,
+            actions_per_sync,
+            transparent_limit,
+            noskip_details,
+            tx_progress,
+            tx_cancel,
+            fetch,
+        )
+        .await
+        {
+            Err(error) if retry_after_reorg(&error, &mut retries, &mut rx_cancel) => {
+                debug!("Syncing again after {error:#}");
+            }
+            result => return result,
+        }
+    }
+}
+
+fn retry_after_reorg(
+    error: &anyhow::Error,
+    retries: &mut u32,
+    rx_cancel: &mut broadcast::Receiver<()>,
+) -> bool {
+    let reorg = error
+        .chain()
+        .any(|cause| matches!(cause.downcast_ref(), Some(SyncError::Reorg(_))));
+    let cancelled = !matches!(
+        rx_cancel.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    if !reorg || cancelled || *retries >= REORG_RETRIES {
+        return false;
+    }
+    *retries += 1;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_height_ranges_once(
     network: &Network,
     pool: &SqlitePool,
     connection: &mut SqliteConnection,
@@ -2409,6 +2475,7 @@ mod tests {
         memory_db, set_pool_sync_height, set_pool_sync_height_for_account, ACCOUNT,
     };
     use crate::net::{BroadcastOutcome, LwdServer};
+    use crate::sync::fetch::tests::Fake;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -10283,6 +10350,8 @@ mod tests {
         fail_anchor_read: Option<usize>,
         fail_stream_wider_than: Option<u32>,
         requests: Arc<Mutex<Vec<(String, u32, u32)>>>,
+        /// Serves the compact blocks and tree states instead of the empty defaults.
+        blocks: Option<Fake>,
     }
 
     impl AnchoredPayments {
@@ -10299,6 +10368,7 @@ mod tests {
                 fail_anchor_read: None,
                 fail_stream_wider_than: None,
                 requests: Arc::new(Mutex::new(vec![])),
+                blocks: None,
             }
         }
     }
@@ -10320,10 +10390,13 @@ mod tests {
         type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
         async fn block_range(
             &mut self,
-            _network: &Network,
-            _start: u32,
-            _end: u32,
+            network: &Network,
+            start: u32,
+            end: u32,
         ) -> Result<Self::CompactBlockStream> {
+            if let Some(blocks) = self.blocks.as_mut() {
+                return blocks.block_range(network, start, end).await;
+            }
             let (sender, receiver) = channel(1);
             drop(sender);
             Ok(ReceiverStream::new(receiver))
@@ -10386,8 +10459,11 @@ mod tests {
         }
 
         /// Empty trees: what a keyless account's shielded pass reads and then has no keys to use.
-        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-            Ok((vec![], vec![], vec![]))
+        async fn tree_state(&mut self, height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            match self.blocks.as_mut() {
+                Some(blocks) => blocks.tree_state(height).await,
+                None => Ok((vec![], vec![], vec![])),
+            }
         }
 
         async fn chain_anchor(&mut self, _height: u32) -> Result<Vec<u8>> {
@@ -11416,6 +11492,95 @@ mod tests {
             None,
         )
         .await
+    }
+
+    /// A keyed account born at 2_000_000 and a server whose block 2_000_100 forks off the chain
+    /// on its first `forking_streams` streams.
+    async fn reorging_cycle(forking_streams: u32) -> (Result<()>, Vec<(u32, u32)>, Vec<u32>) {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let blocks = Fake {
+            forks_at: Some(2_000_100),
+            forking_streams: Arc::new(AtomicU32::new(forking_streams)),
+            ..Fake::new(0, 100)
+        };
+        let asked = blocks.asked.clone();
+        let mut client: Client = Box::new(AnchoredPayments {
+            blocks: Some(blocks),
+            ..AnchoredPayments::paying(vec![])
+        });
+
+        let result = sync_cycle(&coin, &mut connection, &mut client, &[account], 2_000_200).await;
+
+        let asked = asked.lock().expect("lock").clone();
+        (result, asked, sync_heights(&mut connection).await)
+    }
+
+    #[tokio::test]
+    async fn sync_height_ranges_syncs_again_after_a_reorg() {
+        let (result, asked, heights) = reorging_cycle(1).await;
+
+        result.expect("the second pass syncs past the fork");
+        assert_eq!(asked, vec![(2_000_001, 2_000_200); 2]);
+        assert!(heights.iter().all(|h| *h == 2_000_200), "{heights:?}");
+    }
+
+    #[tokio::test]
+    async fn sync_height_ranges_returns_a_reorg_that_keeps_recurring() {
+        let (result, asked, _) = reorging_cycle(u32::MAX).await;
+
+        let error = result.expect_err("the reorg keeps recurring");
+        assert!(
+            error
+                .chain()
+                .any(|cause| matches!(cause.downcast_ref(), Some(SyncError::Reorg(_)))),
+            "{error:#}"
+        );
+        assert_eq!(asked.len(), 1 + REORG_RETRIES as usize);
+    }
+
+    #[test]
+    fn retry_after_reorg_sees_a_reorg_under_context() {
+        let (_tx, mut rx) = broadcast::channel(1);
+        let error = Err::<(), _>(SyncError::Reorg(5))
+            .context("shielded pass")
+            .unwrap_err();
+        let mut retries = 0;
+
+        assert!(retry_after_reorg(&error, &mut retries, &mut rx));
+        assert_eq!(retries, 1);
+    }
+
+    #[test]
+    fn retry_after_reorg_skips_other_errors() {
+        let (_tx, mut rx) = broadcast::channel(1);
+        let mut retries = 0;
+        for error in [
+            anyhow::Error::from(SyncError::Cancelled),
+            anyhow::Error::from(SyncError::Other(anyhow::anyhow!("stream died"))),
+            anyhow::anyhow!("stream died"),
+        ] {
+            assert!(!retry_after_reorg(&error, &mut retries, &mut rx), "{error}");
+        }
+        assert_eq!(retries, 0);
+    }
+
+    #[test]
+    fn retry_after_reorg_stops_once_cancel_is_requested() {
+        let (tx, mut rx) = broadcast::channel(1);
+        tx.send(()).expect("cancel");
+        let mut retries = 0;
+
+        assert!(!retry_after_reorg(
+            &anyhow::Error::from(SyncError::Reorg(5)),
+            &mut retries,
+            &mut rx
+        ));
+        assert_eq!(retries, 0);
     }
 
     /// Two keyless accounts at different heights, so the driver builds two ranges and the

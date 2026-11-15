@@ -1183,6 +1183,10 @@ pub(crate) mod tests {
         pub(crate) skips_block: Option<u32>,
         /// Opens every stream and never sends on it.
         pub(crate) silent: bool,
+        /// This block does not link to the one before it while `forking_streams` is above zero.
+        pub(crate) forks_at: Option<u32>,
+        /// How many more streams serve the fork at `forks_at`.
+        pub(crate) forking_streams: Arc<AtomicU32>,
         /// Wait before the first block of every request.
         pub(crate) latency: Duration,
         pub(crate) asked: Arc<Mutex<Vec<(u32, u32)>>>,
@@ -1203,6 +1207,8 @@ pub(crate) mod tests {
                 fails_after_blocks: None,
                 skips_block: None,
                 silent: false,
+                forks_at: None,
+                forking_streams: Arc::new(AtomicU32::new(0)),
                 latency: Duration::ZERO,
                 asked: Arc::new(Mutex::new(vec![])),
                 open: Arc::new(AtomicU64::new(0)),
@@ -1241,9 +1247,15 @@ pub(crate) mod tests {
                 if self.skips_block == Some(sent) {
                     continue;
                 }
+                let forks = self.forks_at == Some(height)
+                    && self
+                        .forking_streams
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
                 let block = CompactBlock {
                     height: u64::from(height),
                     header: vec![0u8; (self.size)(height)],
+                    prev_hash: if forks { vec![1] } else { vec![] },
                     ..Default::default()
                 };
                 if tx.send(Ok(block)).await.is_err() {
