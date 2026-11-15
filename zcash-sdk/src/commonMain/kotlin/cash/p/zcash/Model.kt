@@ -113,6 +113,17 @@ public data class AccountInfo(
 /** The last block a running sync reported. */
 public data class SyncProgress(val height: Int, val time: Long)
 
+/**
+ * Limits of a sync's compact-block download over a direct lightwalletd connection: at most
+ * [maxStreams] block streams open at once, and about [bufferMegabytes] MiB of blocks held ahead of
+ * the scan (a target, not a hard cap: blocks that fill a gap at the head are still read). Values
+ * below 1 are treated as 1. Tor, Zebra and Nym servers always use one stream.
+ */
+public data class BlockDownload(
+    val maxStreams: Int = 16,
+    val bufferMegabytes: Int = 128,
+)
+
 /** One payment output. [pools] picks which pool receives it; `null` derives that from the address. */
 public data class Recipient(
     val address: String,

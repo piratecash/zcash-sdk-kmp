@@ -20,7 +20,13 @@ use crate::db::{
     transparent_trim_counter, write_transparent_coverage,
 };
 use crate::io::SyncHeight;
+use crate::net::{is_nym_url, STREAM_STATS};
+use crate::warp::sync::ScanWait;
 use crate::{Client, Sink};
+use fetch::{block_stream, fetch_config, BlockDownload, ClientFactory, FetchPlan};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::{collections::HashSet, mem, time::Duration};
 
 use crate::{
@@ -42,6 +48,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use zcash_keys::encoding::AddressCodec;
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+
+pub mod fetch;
 
 pub const DEFAULT_ACTIONS_PER_SYNC: u32 = 10000u32;
 pub const DEFAULT_TRANSPARENT_LIMIT: u32 = 100u32;
@@ -90,6 +98,33 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
     noskip_details: bool,
     c: &Coin,
 ) -> Result<u32> {
+    synchronize_with(
+        progress,
+        accounts,
+        current_height,
+        actions_per_sync,
+        transparent_limit,
+        checkpoint_age,
+        noskip_details,
+        c,
+        BlockDownload::default(),
+    )
+    .await
+}
+
+/// [`synchronize_impl`] with the caller's limits on the compact-block download.
+#[allow(clippy::too_many_arguments)]
+pub async fn synchronize_with<S: Sink<SyncProgress> + Send + 'static>(
+    progress: S,
+    accounts: Vec<u32>,
+    current_height: u32,
+    actions_per_sync: u32,
+    transparent_limit: u32,
+    checkpoint_age: u32,
+    noskip_details: bool,
+    c: &Coin,
+    download: BlockDownload,
+) -> Result<u32> {
     if accounts.is_empty() {
         return Ok(current_height);
     }
@@ -122,6 +157,10 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
         });
         let pool = c.get_pool()?;
         let mut client = c.client().await?;
+        let fetch = more_clients(c).map(|factory| FetchPlan {
+            factory,
+            config: fetch_config(&download),
+        });
         sync_height_ranges(
             &network,
             &pool,
@@ -134,6 +173,7 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
             noskip_details,
             &tx_progress,
             &tx_cancel,
+            fetch.as_ref(),
         )
         .await?;
 
@@ -160,6 +200,20 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
     Ok(current_height)
 }
 
+/// More connections for the block download: only a direct lightwalletd gets them. Each one is a
+/// new connection to this pass's server.
+fn more_clients(coin: &Coin) -> Option<ClientFactory> {
+    let eligible = coin.server_type == 0 && coin.transport == 0 && !is_nym_url(&coin.url);
+    eligible.then(|| {
+        let coin = coin.clone();
+        Arc::new(move || {
+            let coin = coin.clone();
+            Box::pin(async move { coin.client().await })
+                as Pin<Box<dyn Future<Output = Result<Client>> + Send>>
+        }) as ClientFactory
+    })
+}
+
 /// One sync cycle: recovery, then every height range the accounts need, transparent pass before
 /// shielded pass. Separate from `synchronize_impl` so the cycle can run against any `LwdServer`.
 #[allow(clippy::too_many_arguments)]
@@ -175,6 +229,7 @@ pub(crate) async fn sync_height_ranges(
     noskip_details: bool,
     tx_progress: &Sender<SyncProgress>,
     tx_cancel: &broadcast::Sender<()>,
+    fetch: Option<&FetchPlan>,
 ) -> Result<()> {
     recover_from_partial_sync(&mut *connection, accounts).await?;
 
@@ -277,6 +332,7 @@ pub(crate) async fn sync_height_ranges(
             actions_per_sync,
             tx_progress.clone(),
             tx_cancel.subscribe(),
+            fetch.cloned(),
         )
         .await?;
 
@@ -964,6 +1020,7 @@ pub async fn shielded_sync(
     actions_per_sync: u32,
     tx_progress: Sender<SyncProgress>,
     rx_cancel: broadcast::Receiver<()>,
+    fetch: Option<FetchPlan>,
 ) -> Result<()> {
     let activation_height: u32 = network
         .activation_height(NetworkUpgrade::Sapling)
@@ -976,7 +1033,17 @@ pub async fn shielded_sync(
     let (s, o, i) = get_tree_state(network, client, start - 1).await?;
 
     debug!("get compact block range");
-    let blocks = get_compact_block_range(network, client, start, end).await?;
+    let scan_wait = ScanWait::new();
+    let blocks = block_stream(
+        network,
+        client,
+        start,
+        end,
+        fetch.as_ref(),
+        &STREAM_STATS,
+        Some(scan_wait.clone()),
+    )
+    .await?;
     debug!("got streaming blocks");
     let (tx_messages, rx_messages) = channel::<WarpSyncMessage>(100);
 
@@ -1008,6 +1075,8 @@ pub async fn shielded_sync(
             &i,
             tx_messages,
             rx_cancel,
+            fetch,
+            scan_wait,
         )
         .await
         {
@@ -11342,6 +11411,7 @@ mod tests {
             true,
             &tx_progress,
             &tx_cancel,
+            None,
         )
         .await
     }
@@ -11491,5 +11561,42 @@ mod tests {
             assert_eq!(sync_heights(&mut connection).await, vec![tip]);
         }
         assert_eq!(owed(&mut connection, 10).await, None);
+    }
+
+    fn coin_on(url: &str, server_type: u8, transport: u8) -> Coin {
+        Coin {
+            coin: 0,
+            account: 0,
+            db_filepath: String::new(),
+            url: url.to_string(),
+            server_type,
+            transport,
+            proxy: String::new(),
+        }
+    }
+
+    #[test]
+    fn more_clients_tor_returns_none() {
+        assert!(more_clients(&coin_on("https://zec.rocks:443", 0, 1)).is_none());
+    }
+
+    #[test]
+    fn more_clients_proxy_returns_none() {
+        assert!(more_clients(&coin_on("https://zec.rocks:443", 0, 3)).is_none());
+    }
+
+    #[test]
+    fn more_clients_zebra_returns_none() {
+        assert!(more_clients(&coin_on("http://127.0.0.1:8232", 1, 0)).is_none());
+    }
+
+    #[test]
+    fn more_clients_nym_returns_none() {
+        assert!(more_clients(&coin_on("nym://service.recipient", 0, 0)).is_none());
+    }
+
+    #[test]
+    fn more_clients_direct_lightwalletd_returns_a_factory() {
+        assert!(more_clients(&coin_on("https://zec.rocks:443", 0, 0)).is_some());
     }
 }

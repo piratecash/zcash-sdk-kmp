@@ -36,6 +36,7 @@ internal interface SyncBackend {
         actionsPerSync: Int,
         transparentLimit: Int,
         checkpointAge: Int,
+        blockDownload: BlockDownload,
     )
 
     suspend fun progress(): SyncProgress?
@@ -52,6 +53,7 @@ internal fun syncFlow(
     actionsPerSync: Int,
     transparentLimit: Int,
     checkpointAge: Int,
+    blockDownload: BlockDownload,
     mutex: Mutex,
     backend: SyncBackend,
 ): Flow<SyncState> = flow {
@@ -68,7 +70,15 @@ internal fun syncFlow(
     mutex.withLock {
         backend.onStart()
         val result = try {
-            runNativeSync(accountIds, target, actionsPerSync, transparentLimit, checkpointAge, backend)
+            runNativeSync(
+                accountIds,
+                target,
+                actionsPerSync,
+                transparentLimit,
+                checkpointAge,
+                blockDownload,
+                backend,
+            )
         } finally {
             backend.onFinish()
         }
@@ -88,10 +98,18 @@ private suspend fun FlowCollector<SyncState>.runNativeSync(
     actionsPerSync: Int,
     transparentLimit: Int,
     checkpointAge: Int,
+    blockDownload: BlockDownload,
     backend: SyncBackend,
 ): NativeSyncResult = supervisorScope {
     val native = async {
-        backend.synchronize(accountIds, target, actionsPerSync, transparentLimit, checkpointAge)
+        backend.synchronize(
+            accountIds,
+            target,
+            actionsPerSync,
+            transparentLimit,
+            checkpointAge,
+            blockDownload,
+        )
     }
     var madeProgress = false
     while (native.isActive) {
@@ -248,6 +266,7 @@ public class ZcashWallet private constructor(
             actionsPerSync: Int,
             transparentLimit: Int,
             checkpointAge: Int,
+            blockDownload: BlockDownload,
         ) {
             withNative {
                 ZcashJni.synchronize(
@@ -258,6 +277,8 @@ public class ZcashWallet private constructor(
                     transparentLimit,
                     checkpointAge,
                     false,
+                    blockDownload.maxStreams,
+                    blockDownload.bufferMegabytes,
                 )
             }
         }
@@ -675,11 +696,13 @@ public class ZcashWallet private constructor(
         actionsPerSync: Int = DEFAULT_ACTIONS_PER_SYNC,
         transparentLimit: Int = DEFAULT_TRANSPARENT_LIMIT,
         checkpointAge: Int = DEFAULT_CHECKPOINT_AGE,
+        blockDownload: BlockDownload = BlockDownload(),
     ): Flow<SyncState> = syncFlow(
         accountIds = accountIds,
         actionsPerSync = actionsPerSync,
         transparentLimit = transparentLimit,
         checkpointAge = checkpointAge,
+        blockDownload = blockDownload,
         mutex = ZcashSdk.syncMutex,
         backend = syncBackend,
     )

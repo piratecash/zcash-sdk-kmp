@@ -102,6 +102,8 @@ internal object ZcashJni {
         transparentLimit: Int,
         checkpointAge: Int,
         noskipDetails: Boolean,
+        maxStreams: Int,
+        bufferMegabytes: Int,
     )
 
     external fun cancelSync()

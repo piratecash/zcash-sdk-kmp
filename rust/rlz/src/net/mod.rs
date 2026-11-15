@@ -55,6 +55,16 @@ impl StreamStats {
 
 pub(crate) static STREAM_STATS: StreamStats = StreamStats::new();
 
+/// Context of a stream error whose failures are already counted in [`StreamStats`].
+#[derive(Debug)]
+pub(crate) struct BreakCounted;
+
+impl std::fmt::Display for BreakCounted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("every block stream failed")
+    }
+}
+
 /// Process-wide: `stream_breaks` counts every failure of a scan's compact-block stream, a failed
 /// reopen included; `stream_resumed` counts reopens that then delivered a block.
 #[derive(Debug, PartialEq)]

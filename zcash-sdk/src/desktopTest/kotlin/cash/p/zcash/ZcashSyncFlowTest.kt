@@ -29,6 +29,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(syncFailure = failure),
         ).toList()
@@ -46,6 +47,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(localHeight = LOCAL_HEIGHT),
         ).toList()
@@ -63,6 +65,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(localHeight = null),
         ).toList()
@@ -80,6 +83,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(heightFailure = readFailure),
         ).toList()
@@ -165,6 +169,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(localHeight = TARGET_HEIGHT),
         ).toList()
@@ -186,6 +191,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(
                 syncFailure = ZcashException("Sync canceled"),
@@ -204,6 +210,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(
                 localHeight = TARGET_HEIGHT,
@@ -229,6 +236,7 @@ class ZcashSyncFlowTest {
             actionsPerSync = 1,
             transparentLimit = 1,
             checkpointAge = 1,
+            blockDownload = BlockDownload(),
             mutex = Mutex(),
             backend = FakeSyncBackend(
                 localHeight = TARGET_HEIGHT + 100,
@@ -254,6 +262,26 @@ class ZcashSyncFlowTest {
         ZcashWallet.forSyncTest(backend).sync(accountIds = listOf(ACCOUNT_ID)).toList()
 
         assertEquals(10_000, backend.receivedActionsPerSync)
+    }
+
+    @Test
+    fun sync_blockDownloadGiven_reachesTheBackend() = runTest {
+        val backend = FakeSyncBackend()
+
+        ZcashWallet.forSyncTest(backend)
+            .sync(accountIds = listOf(ACCOUNT_ID), blockDownload = BlockDownload(2, 8))
+            .toList()
+
+        assertEquals(BlockDownload(2, 8), backend.receivedBlockDownload)
+    }
+
+    @Test
+    fun sync_blockDownloadOmitted_passesThePublicDefaultToBackend() = runTest {
+        val backend = FakeSyncBackend()
+
+        ZcashWallet.forSyncTest(backend).sync(accountIds = listOf(ACCOUNT_ID)).toList()
+
+        assertEquals(BlockDownload(16, 128), backend.receivedBlockDownload)
     }
 
     @Test
@@ -313,6 +341,7 @@ class ZcashSyncFlowTest {
         actionsPerSync = 1,
         transparentLimit = 1,
         checkpointAge = 1,
+        blockDownload = BlockDownload(),
         mutex = Mutex(),
         backend = backend,
     )
@@ -346,6 +375,9 @@ private class FakeSyncBackend(
     var receivedActionsPerSync: Int? = null
         private set
 
+    var receivedBlockDownload: BlockDownload? = null
+        private set
+
     override suspend fun latestHeight(): Int {
         targetFailure?.let { throw it }
         return TARGET_HEIGHT
@@ -357,8 +389,10 @@ private class FakeSyncBackend(
         actionsPerSync: Int,
         transparentLimit: Int,
         checkpointAge: Int,
+        blockDownload: BlockDownload,
     ) {
         receivedActionsPerSync = actionsPerSync
+        receivedBlockDownload = blockDownload
         delay(syncDelayMs)
         syncFailure?.let { throw it }
     }

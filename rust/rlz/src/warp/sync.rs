@@ -1,3 +1,7 @@
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context as _, Result};
@@ -16,7 +20,8 @@ use orchard::note::AssetId;
 
 use crate::{
     lwd::CompactBlock,
-    net::{StreamStats, STREAM_STATS},
+    net::{BreakCounted, StreamStats, STREAM_STATS},
+    sync::fetch::{block_stream, FetchPlan},
     warp::hasher::{OrchardHasher, SaplingHasher},
     Client,
 };
@@ -36,6 +41,53 @@ const STREAM_RESUME_DELAYS: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
 ];
+
+/// How long the scan has waited for blocks so far. The scan writes it, the
+/// block download reads it: seen from the download side the scan looks
+/// hungry even while it is busy, because blocks are batched in between.
+#[derive(Debug)]
+pub struct ScanWait {
+    base: Instant,
+    waited_ns: AtomicU64,
+    /// Nanoseconds since `base` at which the current wait began, plus one;
+    /// zero while the scan is not waiting.
+    since_ns: AtomicU64,
+}
+
+impl ScanWait {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            waited_ns: 0.into(),
+            since_ns: 0.into(),
+        })
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.base.elapsed().as_nanos() as u64
+    }
+
+    pub(crate) async fn timed<T>(&self, wait: impl Future<Output = T>) -> T {
+        self.since_ns.store(self.now_ns() + 1, Ordering::Relaxed);
+        let value = wait.await;
+        let since = self.since_ns.swap(0, Ordering::Relaxed);
+        if since != 0 {
+            let waited = self.now_ns().saturating_sub(since - 1);
+            self.waited_ns.fetch_add(waited, Ordering::Relaxed);
+        }
+        value
+    }
+
+    /// Total time waited, the wait in progress included.
+    pub fn total(&self) -> Duration {
+        let mut ns = self.waited_ns.load(Ordering::Relaxed);
+        let since = self.since_ns.load(Ordering::Relaxed);
+        if since != 0 {
+            ns += self.now_ns().saturating_sub(since - 1);
+        }
+        Duration::from_nanos(ns)
+    }
+}
 
 pub type SaplingSync = Synchronizer<shielded::sapling::SaplingProtocol>;
 pub type OrchardSync = Synchronizer<shielded::orchard::OrchardProtocol>;
@@ -79,6 +131,8 @@ pub async fn warp_sync(
     ironwood_state: &CommitmentTreeFrontier,
     tx_decrypted: Sender<WarpSyncMessage>,
     rx_cancel: broadcast::Receiver<()>,
+    fetch: Option<FetchPlan>,
+    scan_wait: Arc<ScanWait>,
 ) -> Result<(), SyncError> {
     let sap_hasher = SaplingHasher::default();
 
@@ -149,6 +203,8 @@ pub async fn warp_sync(
         end_height,
         failures: 0,
         stats: &STREAM_STATS,
+        fetch,
+        scan_wait: scan_wait.clone(),
     };
     let block_reader = read_block_stream(
         source,
@@ -163,7 +219,7 @@ pub async fn warp_sync(
     );
 
     let block_processor = async {
-        while let Some(bm) = rx_blocks.recv().await {
+        while let Some(bm) = scan_wait.timed(rx_blocks.recv()).await {
             match bm {
                 BlockMessage::Chunk(bs) => {
                     debug!("Processing {} blocks", bs.len());
@@ -242,6 +298,9 @@ struct ResumableBlocks {
     end_height: u32,
     failures: usize,
     stats: &'static StreamStats,
+    /// Reopens stay parallel when the first stream was.
+    fetch: Option<FetchPlan>,
+    scan_wait: Arc<ScanWait>,
 }
 
 impl ResumableBlocks {
@@ -252,8 +311,10 @@ impl ResumableBlocks {
         from: u32,
         rx_cancel: &mut broadcast::Receiver<()>,
     ) -> Result<(), SyncError> {
-        loop {
+        if error.downcast_ref::<BreakCounted>().is_none() {
             self.stats.record_break();
+        }
+        loop {
             self.failures += 1;
             let Some(delay) = STREAM_RESUME_DELAYS.get(self.failures - 1) else {
                 return Err(SyncError::Other(anyhow::anyhow!(
@@ -264,9 +325,16 @@ impl ResumableBlocks {
             debug!("compact block stream broke ({error:#}), reopening at {from} in {delay:?}");
             let reopen = async {
                 tokio::time::sleep(*delay).await;
-                self.client
-                    .block_range(&self.network, from, self.end_height)
-                    .await
+                block_stream(
+                    &self.network,
+                    &mut self.client,
+                    from,
+                    self.end_height,
+                    self.fetch.as_ref(),
+                    self.stats,
+                    Some(self.scan_wait.clone()),
+                )
+                .await
             };
             let reopened = tokio::select! {
                 biased;
@@ -278,7 +346,10 @@ impl ResumableBlocks {
                     self.blocks = blocks;
                     return Ok(());
                 }
-                Err(reopen_error) => error = reopen_error,
+                Err(reopen_error) => {
+                    self.stats.record_break();
+                    error = reopen_error;
+                }
             }
         }
     }
@@ -422,7 +493,9 @@ mod tests {
     use crate::account::tests::{restore, TEST_PHRASE};
     use crate::api::sync::file_backed_coin;
     use crate::net::{BroadcastOutcome, LwdServer, NetworkStats};
-    use crate::sync::shielded_sync;
+    use crate::sync::fetch::tests::{cfg, eventually, factory, new_breaks, Fake};
+    use crate::sync::fetch::FetchConfig;
+    use crate::sync::{get_tree_state, shielded_sync};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use tonic::async_trait;
@@ -570,6 +643,8 @@ mod tests {
             end_height,
             failures: 0,
             stats,
+            fetch: None,
+            scan_wait: ScanWait::new(),
         }
     }
 
@@ -593,11 +668,25 @@ mod tests {
             .block_range(&Network::Main, start, end)
             .await
             .expect("first stream");
+        let (result, messages) =
+            read_from(resumable(blocks, &server, end, stats), start, previous_hash).await;
+        Read {
+            result,
+            messages,
+            starts: server.starts(),
+        }
+    }
+
+    async fn read_from(
+        source: ResumableBlocks,
+        start: u32,
+        previous_hash: Option<Vec<u8>>,
+    ) -> (Result<(), SyncError>, Vec<BlockMessage>) {
         let (messages, mut output) = tokio::sync::mpsc::channel(10);
         let (_cancel, cancellation) = broadcast::channel(1);
 
         let reader = read_block_stream(
-            resumable(blocks, &server, end, stats),
+            source,
             start,
             previous_hash,
             vec![7],
@@ -614,11 +703,63 @@ mod tests {
             }
             collected
         };
-        let (result, messages) = tokio::join!(reader, collector);
-        Read {
+        tokio::join!(reader, collector)
+    }
+
+    struct FailedFetchRead {
+        result: Result<(), SyncError>,
+        messages: Vec<BlockMessage>,
+        opened: u64,
+        caller_asked: Vec<(u32, u32)>,
+    }
+
+    /// Reads 10..=300 over a one-stream download whose only worker breaks after five blocks.
+    async fn read_after_a_failed_fetch(breaks: &'static StreamStats) -> FailedFetchRead {
+        let caller = Fake::new(0, 100);
+        let caller_asked = caller.asked.clone();
+        let failing = Fake {
+            fails_after_blocks: Some(5),
+            ..Fake::new(0, 100)
+        };
+        let (more, opened) = factory(Some(failing), Fake::new(0, 100));
+        let plan = FetchPlan {
+            factory: more,
+            config: FetchConfig {
+                initial_streams: 1,
+                max_streams: 1,
+                ..cfg(64 << 20)
+            },
+        };
+        let mut client: Client = Box::new(caller);
+        let blocks = block_stream(
+            &Network::Main,
+            &mut client,
+            10,
+            300,
+            Some(&plan),
+            breaks,
+            None,
+        )
+        .await
+        .expect("first stream");
+        let source = ResumableBlocks {
+            blocks,
+            client,
+            network: Network::Main,
+            end_height: 300,
+            failures: 0,
+            stats: breaks,
+            fetch: Some(plan),
+            scan_wait: ScanWait::new(),
+        };
+
+        let (result, messages) = read_from(source, 10, None).await;
+        let caller_asked = caller_asked.lock().expect("lock").clone();
+        FailedFetchRead {
             result,
             messages,
-            starts: server.starts(),
+            opened: opened.load(Ordering::Relaxed),
+            caller_asked,
         }
     }
 
@@ -934,6 +1075,7 @@ mod tests {
             u32::MAX,
             progress,
             cancellation,
+            None,
         )
         .await
         .expect_err("retries run out")
@@ -1069,5 +1211,166 @@ mod tests {
 
         assert!(matches!(result, Err(SyncError::Cancelled)));
         assert_eq!(server.starts(), vec![10]);
+    }
+
+    // Real time here and below: the download paces itself on timers.
+    #[tokio::test]
+    async fn read_block_stream_last_fetch_stream_fails_counts_the_break_once() {
+        let breaks = new_breaks();
+
+        let read = read_after_a_failed_fetch(breaks).await;
+
+        read.result.expect("resumed scan");
+        assert_eq!(breaks.snapshot(), stats(1, 1));
+    }
+
+    #[tokio::test]
+    async fn read_block_stream_fetch_fails_completely_reopens_in_parallel_at_the_next_height() {
+        let read = read_after_a_failed_fetch(new_breaks()).await;
+
+        read.result.expect("resumed scan");
+        assert_eq!(
+            chunked_heights(&read.messages),
+            (10..=300).collect::<Vec<u64>>()
+        );
+        // The reopen asks the caller's connection for a probe, not the rest of the range.
+        assert_eq!(read.caller_asked, vec![(10, 73), (79, 142)]);
+        assert!(read.opened >= 2, "the reopen opened no stream of its own");
+    }
+
+    #[tokio::test]
+    async fn warp_sync_scanner_waits_reports_its_wait_to_the_gauge() {
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let mut client: Client = Box::new(ScriptedRanges::new(vec![]));
+        let (sapling, orchard, ironwood) = get_tree_state(&Network::Main, &mut client, 2_000_000)
+            .await
+            .expect("tree state");
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = sender.send(Ok(chained(2_000_001))).await;
+        });
+        let (decrypted, _decrypted) = tokio::sync::mpsc::channel(100);
+        let (_cancel, cancellation) = broadcast::channel(1);
+        let gauge = ScanWait::new();
+
+        warp_sync(
+            &Network::Main,
+            &mut connection,
+            2_000_001,
+            2_000_001,
+            &[(account, false)],
+            ReceiverStream::new(receiver),
+            client,
+            HashSet::new(),
+            u32::MAX,
+            &sapling,
+            &orchard,
+            &ironwood,
+            decrypted,
+            cancellation,
+            None,
+            gauge.clone(),
+        )
+        .await
+        .expect("scan");
+
+        assert!(
+            gauge.total() >= Duration::from_millis(250),
+            "{:?}",
+            gauge.total()
+        );
+    }
+
+    #[tokio::test]
+    async fn shielded_sync_ineligible_transport_requests_the_whole_range_once_on_the_callers_client(
+    ) {
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let caller = Fake::new(0, 100);
+        let asked = caller.asked.clone();
+        let mut client: Client = Box::new(caller);
+        let (progress, _progress) = tokio::sync::mpsc::channel(100);
+        let (_cancel, cancellation) = broadcast::channel(1);
+
+        shielded_sync(
+            &Network::Main,
+            &coin.get_pool().expect("pool"),
+            &mut client,
+            &[(account, false)],
+            2_000_001,
+            2_000_200,
+            u32::MAX,
+            progress,
+            cancellation,
+            None,
+        )
+        .await
+        .expect("synced");
+
+        assert_eq!(*asked.lock().expect("lock"), vec![(2_000_001, 2_000_200)]);
+    }
+
+    #[tokio::test]
+    async fn shielded_sync_cancelled_stops_the_parallel_download() {
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let server = Fake {
+            silent: true,
+            ..Fake::new(0, 100)
+        };
+        let open = server.open.clone();
+        let (more, _) = factory(None, server.clone());
+        let plan = FetchPlan {
+            factory: more,
+            config: cfg(64 << 20),
+        };
+        let mut client: Client = Box::new(server);
+        let (progress, _progress) = tokio::sync::mpsc::channel(100);
+        let (cancel, cancellation) = broadcast::channel(1);
+        let pool = coin.get_pool().expect("pool");
+        let accounts = [(account, false)];
+        let sync = shielded_sync(
+            &Network::Main,
+            &pool,
+            &mut client,
+            &accounts,
+            2_000_001,
+            2_003_000,
+            u32::MAX,
+            progress,
+            cancellation,
+            Some(plan),
+        );
+        let cancelling = async {
+            let started =
+                eventually(|| open.load(Ordering::SeqCst) >= 2, Duration::from_secs(2)).await;
+            let _ = cancel.send(());
+            started
+        };
+
+        let (_, started) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(sync, cancelling)
+        })
+        .await
+        .expect("the sync returned after the cancel");
+
+        assert!(started, "the parallel download never started");
+        // Well inside the 5 s `piece_stall` a lingering stream would wait out.
+        assert!(
+            eventually(|| open.load(Ordering::SeqCst) == 0, Duration::from_secs(1)).await,
+            "{} streams still open",
+            open.load(Ordering::SeqCst)
+        );
     }
 }

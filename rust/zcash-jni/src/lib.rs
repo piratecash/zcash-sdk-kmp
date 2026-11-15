@@ -49,7 +49,8 @@ use rlz::net::network_stats;
 use rlz::pay::pool::ALL_POOLS;
 use rlz::pay::reserve::OwnInputs;
 use rlz::pay::Recipient;
-use rlz::sync::synchronize_impl;
+use rlz::sync::fetch::BlockDownload;
+use rlz::sync::synchronize_with;
 use serde::Serialize;
 use std::any::Any;
 use std::path::PathBuf;
@@ -726,6 +727,14 @@ fn concurrency_arg(value: jint) -> u32 {
     u32::try_from(value).unwrap_or(0)
 }
 
+/// A negative `jint` must not wrap to a huge `u32`; rlz clamps what is left.
+fn block_download(max_streams: jint, buffer_megabytes: jint) -> BlockDownload {
+    BlockDownload {
+        max_streams: concurrency_arg(max_streams),
+        buffer_bytes: u64::from(concurrency_arg(buffer_megabytes)) << 20,
+    }
+}
+
 /// Re-derives transparent addresses this account handed out before it was restored, storing the
 /// ones the server knows a transaction for. Returns how many were added.
 #[no_mangle]
@@ -1028,6 +1037,8 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_synchronize<'local>(
     transparent_limit: jint,
     checkpoint_age: jint,
     noskip_details: jboolean,
+    max_streams: jint,
+    buffer_megabytes: jint,
 ) {
     unowned_env
         .with_env(|env| -> Result<(), BridgeError> {
@@ -1036,7 +1047,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_synchronize<'local>(
             let sink = progress::sink();
             sink.reset();
 
-            runtime().block_on(synchronize_impl(
+            runtime().block_on(synchronize_with(
                 sink.clone(),
                 accounts,
                 current_height as u32,
@@ -1045,6 +1056,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_synchronize<'local>(
                 checkpoint_age as u32,
                 noskip_details,
                 &coin,
+                block_download(max_streams, buffer_megabytes),
             ))?;
 
             sink.outcome().map_err(BridgeError)
@@ -1604,6 +1616,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_migrationStep<'local>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rlz::sync::fetch::fetch_config;
 
     fn account(key: &str, birth_height: jint) -> NewAccount {
         build_new_account(
@@ -1637,6 +1650,27 @@ mod tests {
     fn concurrency_arg_positive_passes_through() {
         assert_eq!(8, concurrency_arg(8));
         assert_eq!(0, concurrency_arg(0));
+    }
+
+    #[test]
+    fn block_download_jni_values_map_to_streams_and_bytes() {
+        assert_eq!(
+            BlockDownload {
+                max_streams: 2,
+                buffer_bytes: 8 << 20,
+            },
+            block_download(2, 8)
+        );
+    }
+
+    #[test]
+    fn block_download_zero_and_negative_values_are_clamped() {
+        for (streams, megabytes) in [(0, 0), (-1, -1), (jint::MIN, jint::MIN)] {
+            let config = fetch_config(&block_download(streams, megabytes));
+
+            assert_eq!(1, config.max_streams, "{streams}");
+            assert_eq!(1 << 20, config.mem_cap, "{megabytes}");
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.absolutePathString
@@ -16,6 +17,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -24,6 +26,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 
 /** Published BIP-39 test vector (all-zero entropy) — never holds funds. */
@@ -46,9 +49,10 @@ private val JSONRPC_ID = Regex(""""id"\s*:\s*("[^"]*"|[0-9]+)""")
 
 /**
  * A Zebra stand-in on loopback that answers the JSON-RPC calls a discovery walk makes and records
- * how many address probes were ever on the wire at once.
+ * how many address probes were ever on the wire at once, and which methods it was asked.
  */
 private class LoopbackZebra : AutoCloseable {
+    private val asked = ConcurrentLinkedQueue<String>()
     private val inFlight = AtomicInteger()
     private val peakSeen = AtomicInteger()
     private val executor = Executors.newCachedThreadPool()
@@ -63,6 +67,8 @@ private class LoopbackZebra : AutoCloseable {
 
     val peak: Int get() = peakSeen.get()
 
+    val methods: List<String> get() = asked.toList()
+
     override fun close() {
         server.stop(0)
         executor.shutdownNow()
@@ -72,6 +78,7 @@ private class LoopbackZebra : AutoCloseable {
         val body = requestBody.use { it.readBytes() }.decodeToString()
         val method = JSONRPC_METHOD.find(body)?.groupValues?.get(1).orEmpty()
         val id = JSONRPC_ID.find(body)?.groupValues?.get(1) ?: "\"1\""
+        asked += method
         val payload = when (method) {
             "getblockcount" -> """{"result":$LOOPBACK_TIP,"error":null,"id":$id}"""
             "getaddresstxids" -> {
@@ -1364,6 +1371,25 @@ class ZcashWalletIntegrationTest {
             zebra.close()
         }
     }
+
+    /** `z_gettreestate` is left unanswered, so the pass fails right after crossing into native. */
+    @Test
+    fun sync_explicitBlockDownload_reachesTheNativeSynchronize() =
+        LoopbackZebra().use { zebra ->
+            withWallet(ServerType.ZEBRA, zebra.url) { wallet ->
+                val account = wallet.restoreAccount(
+                    name = "vector",
+                    key = TEST_PHRASE,
+                    birthHeight = BIRTH_HEIGHT,
+                )
+
+                val states =
+                    wallet.sync(listOf(account), blockDownload = BlockDownload(2, 8)).toList()
+
+                assertIs<SyncState.Failed>(states.last())
+                assertTrue("z_gettreestate" in zebra.methods, zebra.methods.toString())
+            }
+        }
 
     @Test
     fun setServer_fromAnUnreachableServerToLoopbackZebra_latestHeightSucceeds() =
