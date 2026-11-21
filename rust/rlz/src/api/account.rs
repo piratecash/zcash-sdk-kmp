@@ -380,18 +380,54 @@ pub async fn generate_next_receive_address(c: &Coin) -> Result<Option<String>> {
     crate::account::generate_next_receive_address(&c.network(), &mut connection, c.account).await
 }
 
-/// The lowest receive-scope address that is neither used nor in `excluded`, with the coverage
-/// statement describing the same instant; `None` when the account has no transparent key.
+/// The lowest receive-scope address above `min_index_exclusive` that is neither used nor in
+/// `excluded`, with the coverage statement describing the same instant; `None` when the account
+/// has no transparent key.
 ///
 /// `excluded` is a caller contract: every address handed out and not yet seen used belongs in it.
 pub async fn next_unused_receive_address(
     excluded: Vec<String>,
+    min_index_exclusive: Option<u32>,
     c: &Coin,
 ) -> Result<Option<NextUnusedAddress>> {
     let (_guard, mut connection) = locked_connection(c).await?;
 
-    crate::account::next_unused_receive_address(&c.network(), &mut connection, c.account, &excluded)
-        .await
+    crate::account::next_unused_receive_address(
+        &c.network(),
+        &mut connection,
+        c.account,
+        &excluded,
+        min_index_exclusive,
+    )
+    .await
+}
+
+/// Stores every receive-scope address above the highest stored index through `through`, in one
+/// transaction. Returns how many rows it created.
+pub async fn reserve_receive_addresses_through(through: u32, c: &Coin) -> Result<u32> {
+    let (_guard, mut connection) = locked_connection(c).await?;
+
+    crate::account::reserve_receive_addresses_through(
+        &c.network(),
+        &mut connection,
+        c.account,
+        through,
+    )
+    .await
+}
+
+/// The highest receive-scope index stored for the account, used or not.
+pub async fn highest_stored_receive_index(c: &Coin) -> Result<Option<u32>> {
+    let mut connection = c.get_connection().await?;
+
+    crate::db::highest_stored_dindex(&mut connection, c.account, 0).await
+}
+
+/// The highest receive-scope index of the account with history in this database.
+pub async fn highest_used_receive_index(c: &Coin) -> Result<Option<u32>> {
+    let mut connection = c.get_connection().await?;
+
+    crate::db::highest_used_receive_dindex(&mut connection, c.account).await
 }
 
 /// How far the account's transparent address space has been swept, allocating nothing.
@@ -1627,7 +1663,7 @@ mod tests {
 
         let mut call = tokio::spawn({
             let coin = coin.clone();
-            async move { next_unused_receive_address(vec![], &coin).await }
+            async move { next_unused_receive_address(vec![], None, &coin).await }
         });
 
         for _ in 0..10 {

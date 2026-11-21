@@ -1,7 +1,8 @@
 use anyhow::Result;
+use sqlx::{pool::PoolConnection, Sqlite};
 use std::sync::LazyLock;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "flutter")]
@@ -94,9 +95,7 @@ pub async fn discover_transparent_addresses(
     concurrency: u32,
     c: &Coin,
 ) -> Result<u32> {
-    let _walk = DISCOVERING.lock().await;
-    let mut connection = c.get_connection().await?;
-    let mut client = connect_client(c).await?;
+    let (_walk, mut connection, mut client) = discovery_session(c).await?;
     crate::sync::discover_transparent_addresses(
         &c.network(),
         &mut connection,
@@ -109,6 +108,40 @@ pub async fn discover_transparent_addresses(
         CancellationToken::new(),
     )
     .await
+}
+
+/// Every index in `[from, to)` of both scopes, stored and backfilled as discovery does, with no gap
+/// stop. Returns how many stored addresses in that range have history.
+pub async fn discover_transparent_address_range(
+    end_height: u32,
+    from: u32,
+    to: u32,
+    concurrency: u32,
+    c: &Coin,
+) -> Result<u32> {
+    let (_walk, mut connection, mut client) = discovery_session(c).await?;
+    crate::sync::discover_transparent_address_range(
+        &c.network(),
+        &mut connection,
+        &mut client,
+        c.account,
+        end_height,
+        from,
+        to,
+        concurrency,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// `DISCOVERING` before the connection, so a queued walk never holds a pooled connection.
+async fn discovery_session(
+    c: &Coin,
+) -> Result<(MutexGuard<'static, ()>, PoolConnection<Sqlite>, Client)> {
+    let walk = DISCOVERING.lock().await;
+    let connection = c.get_connection().await?;
+    let client = connect_client(c).await?;
+    Ok((walk, connection, client))
 }
 
 #[cfg(test)]

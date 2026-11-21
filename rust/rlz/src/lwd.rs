@@ -316,6 +316,30 @@ pub struct TreeState {
     #[prost(string, tag = "7")]
     pub ironwood_tree: ::prost::alloc::string::String,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetSubtreeRootsArg {
+    /// Index identifying where to start returning subtree roots
+    #[prost(uint32, tag = "1")]
+    pub start_index: u32,
+    /// Shielded protocol to return subtree roots for: 0 Sapling, 1 Orchard, 2 Ironwood
+    #[prost(int32, tag = "2")]
+    pub shielded_protocol: i32,
+    /// Maximum number of entries to return, or 0 for all entries.
+    #[prost(uint32, tag = "3")]
+    pub max_entries: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SubtreeRoot {
+    /// The 32-byte Merkle root of the subtree.
+    #[prost(bytes = "vec", tag = "2")]
+    pub root_hash: ::prost::alloc::vec::Vec<u8>,
+    /// The hash of the block that completed this subtree.
+    #[prost(bytes = "vec", tag = "3")]
+    pub completing_block_hash: ::prost::alloc::vec::Vec<u8>,
+    /// The height of the block that completed this subtree in the main chain.
+    #[prost(uint64, tag = "4")]
+    pub completing_block_height: u64,
+}
 /// Results are sorted by height, which makes it easy to issue another
 /// request that picks up from where the previous left off.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -668,6 +692,29 @@ pub(crate) mod compact_tx_streamer_client {
                 "GetTreeState",
             ));
             self.inner.unary(req, path, codec).await
+        }
+        /// Returns a stream of information about roots of subtrees of the note commitment tree
+        /// for the specified shielded pool (Sapling, Orchard, or Ironwood).
+        pub async fn get_subtree_roots(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSubtreeRootsArg>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::SubtreeRoot>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSubtreeRoots",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetSubtreeRoots",
+            ));
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn get_address_utxos(
             &mut self,

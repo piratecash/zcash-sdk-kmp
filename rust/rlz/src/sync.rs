@@ -14,13 +14,19 @@ use crate::api::sync::{CANCEL_SYNC, SYNCING};
 use crate::budget::merge_pending_txs;
 
 use crate::db::{
-    advance_backfilled_height, highest_stored_dindex, raise_catch_up_debt, store_block_header,
-    taddress_scope_dindex, transparent_address_is_used, transparent_address_row,
-    transparent_addresses_to_scan, transparent_backfilled_height, transparent_incarnation,
-    transparent_trim_counter, write_transparent_coverage,
+    advance_backfilled_height, count_used_transparent_addresses, highest_stored_dindex,
+    raise_catch_up_debt, store_block_header, taddress_scope_dindex, transparent_address_is_used,
+    transparent_address_row, transparent_addresses_to_scan, transparent_backfilled_height,
+    transparent_incarnation, transparent_trim_counter, write_transparent_coverage,
 };
 use crate::io::SyncHeight;
+use crate::net::{is_nym_url, STREAM_STATS};
+use crate::warp::sync::{fetch_subtree_roots, ScanWait};
 use crate::{Client, Sink};
+use fetch::{block_stream, fetch_config, BlockDownload, ClientFactory, FetchPlan};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::{collections::HashSet, mem, time::Duration};
 
 use crate::{
@@ -42,6 +48,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use zcash_keys::encoding::AddressCodec;
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+
+pub mod fetch;
 
 pub const DEFAULT_ACTIONS_PER_SYNC: u32 = 10000u32;
 pub const DEFAULT_TRANSPARENT_LIMIT: u32 = 100u32;
@@ -90,6 +98,33 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
     noskip_details: bool,
     c: &Coin,
 ) -> Result<u32> {
+    synchronize_with(
+        progress,
+        accounts,
+        current_height,
+        actions_per_sync,
+        transparent_limit,
+        checkpoint_age,
+        noskip_details,
+        c,
+        BlockDownload::default(),
+    )
+    .await
+}
+
+/// [`synchronize_impl`] with the caller's limits on the compact-block download.
+#[allow(clippy::too_many_arguments)]
+pub async fn synchronize_with<S: Sink<SyncProgress> + Send + 'static>(
+    progress: S,
+    accounts: Vec<u32>,
+    current_height: u32,
+    actions_per_sync: u32,
+    transparent_limit: u32,
+    checkpoint_age: u32,
+    noskip_details: bool,
+    c: &Coin,
+    download: BlockDownload,
+) -> Result<u32> {
     if accounts.is_empty() {
         return Ok(current_height);
     }
@@ -122,6 +157,10 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
         });
         let pool = c.get_pool()?;
         let mut client = c.client().await?;
+        let fetch = more_clients(c).map(|factory| FetchPlan {
+            factory,
+            config: fetch_config(&download),
+        });
         sync_height_ranges(
             &network,
             &pool,
@@ -134,6 +173,7 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
             noskip_details,
             &tx_progress,
             &tx_cancel,
+            fetch.as_ref(),
         )
         .await?;
 
@@ -160,8 +200,27 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
     Ok(current_height)
 }
 
+/// More connections for the block download: only a direct lightwalletd gets them. Each one is a
+/// new connection to this pass's server.
+fn more_clients(coin: &Coin) -> Option<ClientFactory> {
+    let eligible = coin.server_type == 0 && coin.transport == 0 && !is_nym_url(&coin.url);
+    eligible.then(|| {
+        let coin = coin.clone();
+        Arc::new(move || {
+            let coin = coin.clone();
+            Box::pin(async move { coin.client().await })
+                as Pin<Box<dyn Future<Output = Result<Client>> + Send>>
+        }) as ClientFactory
+    })
+}
+
+/// A reorg is rewound and committed before its error surfaces, so another pass resumes below the
+/// fork. Only a reorg that keeps recurring reaches the caller.
+const REORG_RETRIES: u32 = 2;
+
 /// One sync cycle: recovery, then every height range the accounts need, transparent pass before
-/// shielded pass. Separate from `synchronize_impl` so the cycle can run against any `LwdServer`.
+/// shielded pass, run again after a reorg. Separate from `synchronize_impl` so the cycle can run
+/// against any `LwdServer`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_height_ranges(
     network: &Network,
@@ -175,6 +234,68 @@ pub(crate) async fn sync_height_ranges(
     noskip_details: bool,
     tx_progress: &Sender<SyncProgress>,
     tx_cancel: &broadcast::Sender<()>,
+    fetch: Option<&FetchPlan>,
+) -> Result<()> {
+    let mut rx_cancel = tx_cancel.subscribe();
+    let mut retries = 0;
+    loop {
+        match sync_height_ranges_once(
+            network,
+            pool,
+            &mut *connection,
+            &mut *client,
+            accounts,
+            current_height,
+            actions_per_sync,
+            transparent_limit,
+            noskip_details,
+            tx_progress,
+            tx_cancel,
+            fetch,
+        )
+        .await
+        {
+            Err(error) if retry_after_reorg(&error, &mut retries, &mut rx_cancel) => {
+                debug!("Syncing again after {error:#}");
+            }
+            result => return result,
+        }
+    }
+}
+
+fn retry_after_reorg(
+    error: &anyhow::Error,
+    retries: &mut u32,
+    rx_cancel: &mut broadcast::Receiver<()>,
+) -> bool {
+    let reorg = error
+        .chain()
+        .any(|cause| matches!(cause.downcast_ref(), Some(SyncError::Reorg(_))));
+    let cancelled = !matches!(
+        rx_cancel.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    if !reorg || cancelled || *retries >= REORG_RETRIES {
+        return false;
+    }
+    *retries += 1;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_height_ranges_once(
+    network: &Network,
+    pool: &SqlitePool,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    accounts: &[u32],
+    current_height: u32,
+    actions_per_sync: u32,
+    transparent_limit: u32,
+    noskip_details: bool,
+    tx_progress: &Sender<SyncProgress>,
+    tx_cancel: &broadcast::Sender<()>,
+    fetch: Option<&FetchPlan>,
 ) -> Result<()> {
     recover_from_partial_sync(&mut *connection, accounts).await?;
 
@@ -277,6 +398,7 @@ pub(crate) async fn sync_height_ranges(
             actions_per_sync,
             tx_progress.clone(),
             tx_cancel.subscribe(),
+            fetch.cloned(),
         )
         .await?;
 
@@ -964,6 +1086,7 @@ pub async fn shielded_sync(
     actions_per_sync: u32,
     tx_progress: Sender<SyncProgress>,
     rx_cancel: broadcast::Receiver<()>,
+    fetch: Option<FetchPlan>,
 ) -> Result<()> {
     let activation_height: u32 = network
         .activation_height(NetworkUpgrade::Sapling)
@@ -974,9 +1097,20 @@ pub async fn shielded_sync(
 
     let accounts = accounts.to_vec();
     let (s, o, i) = get_tree_state(network, client, start - 1).await?;
+    let subtree_roots = fetch_subtree_roots(client, [&s, &o, &i], end.saturating_sub(start)).await;
 
     debug!("get compact block range");
-    let blocks = get_compact_block_range(network, client, start, end).await?;
+    let scan_wait = ScanWait::new();
+    let blocks = block_stream(
+        network,
+        client,
+        start,
+        end,
+        fetch.as_ref(),
+        &STREAM_STATS,
+        Some(scan_wait.clone()),
+    )
+    .await?;
     debug!("got streaming blocks");
     let (tx_messages, rx_messages) = channel::<WarpSyncMessage>(100);
 
@@ -1006,8 +1140,11 @@ pub async fn shielded_sync(
             &s,
             &o,
             &i,
+            subtree_roots,
             tx_messages,
             rx_cancel,
+            fetch,
+            scan_wait,
         )
         .await
         {
@@ -1944,6 +2081,102 @@ pub async fn discover_transparent_addresses(
     progress_fn: impl Fn(String),
     cancellation_token: CancellationToken,
 ) -> Result<u32> {
+    walk_transparent_addresses(
+        network,
+        connection,
+        client,
+        account,
+        end_height,
+        WalkExtent::GapLimit(gap_limit),
+        concurrency,
+        progress_fn,
+        cancellation_token,
+    )
+    .await
+}
+
+/// [`discover_transparent_addresses`] over every index in `[from, to)` of both scopes, with no gap
+/// stop and no coverage record. Returns how many stored addresses in that range have history,
+/// read back after the walk, so a retry of a half-failed range reports everything it holds.
+#[allow(clippy::too_many_arguments)]
+pub async fn discover_transparent_address_range(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    end_height: u32,
+    from: u32,
+    to: u32,
+    concurrency: u32,
+    cancellation_token: CancellationToken,
+) -> Result<u32> {
+    walk_transparent_addresses(
+        network,
+        connection,
+        client,
+        account,
+        end_height,
+        WalkExtent::Range { from, to },
+        concurrency,
+        |_| {},
+        cancellation_token,
+    )
+    .await?;
+    count_used_transparent_addresses(connection, account, from, to).await
+}
+
+/// Which indexes of each scope a discovery walk visits.
+#[derive(Clone, Copy)]
+enum WalkExtent {
+    /// From 0 until more than `gap_limit` never-stored indexes in a row, and through every stored
+    /// one. Only this walk certifies coverage: it is the one that starts at the bottom.
+    GapLimit(u32),
+    /// Every index in `[from, to)`.
+    Range { from: u32, to: u32 },
+}
+
+impl WalkExtent {
+    fn first(self) -> u32 {
+        match self {
+            WalkExtent::GapLimit(_) => 0,
+            WalkExtent::Range { from, .. } => from,
+        }
+    }
+
+    fn reaches(self, dindex: u32, gap: u32, stored_through: Option<u32>) -> bool {
+        match self {
+            // A wider earlier walk can have stored an address past where this gap would stop;
+            // leaving it unvisited would let the run certify coverage for history it never checked.
+            WalkExtent::GapLimit(gap_limit) => {
+                gap <= gap_limit || stored_through.is_some_and(|last| dindex <= last)
+            }
+            WalkExtent::Range { to, .. } => dindex < to,
+        }
+    }
+
+    /// How many indexes from `dindex` on the sequential walk is certain to reach.
+    fn certain(self, dindex: u32, gap: u32, stored_through: Option<u32>) -> u32 {
+        match self {
+            WalkExtent::GapLimit(gap_limit) => gap_limit.saturating_add(1).saturating_sub(gap).max(
+                stored_through.map_or(0, |last| last.saturating_add(1).saturating_sub(dindex)),
+            ),
+            WalkExtent::Range { to, .. } => to.saturating_sub(dindex),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn walk_transparent_addresses(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    end_height: u32,
+    extent: WalkExtent,
+    concurrency: u32,
+    progress_fn: impl Fn(String),
+    cancellation_token: CancellationToken,
+) -> Result<u32> {
     // The identity every later check compares against and the key material the walk derives from
     // must come from one guarded read: a delete plus a restore between them would leave the walk
     // deriving addresses from the old account's key while every check passes against the new one.
@@ -1985,21 +2218,19 @@ pub async fn discover_transparent_addresses(
     let mut width = concurrency.clamp(1, MAX_DISCOVERY_CONCURRENCY);
 
     for scope in 0..2 {
-        // A wider earlier walk can have stored an address past where this gap would stop; leaving
-        // it unvisited would let the run certify coverage for history it never checked.
         let stored_through = stored_through[scope as usize];
-        let mut dindex = 0;
+        let mut dindex = extent.first();
         let mut gap = 0;
-        while gap <= gap_limit || stored_through.is_some_and(|last| dindex <= last) {
+        while extent.reaches(dindex, gap, stored_through) {
             if cancellation_token.is_cancelled() {
                 anyhow::bail!("transparent discovery cancelled");
             }
 
             // Plan over the indexes the sequential walk is certain to reach from here, so a batch
             // never requests an address that walk would not have asked for.
-            let certain = gap_limit.saturating_add(1).saturating_sub(gap).max(
-                stored_through.map_or(0, |last| last.saturating_add(1).saturating_sub(dindex)),
-            );
+            let certain = extent.certain(dindex, gap, stored_through);
+            // An empty plan would never advance `dindex`: the walk would spin instead of ending.
+            debug_assert!(certain > 0, "a reached index must be planned");
             let mut batch: Vec<BatchEntry> = vec![];
             let mut requests = 0;
             while (batch.len() as u32) < certain && requests < width {
@@ -2202,7 +2433,9 @@ pub async fn discover_transparent_addresses(
     if transparent_trim_counter(connection, account).await? != trim_at_start {
         anyhow::bail!("coverage invalidated by a trim during the walk");
     }
-    write_transparent_coverage(&mut *connection, account, gap_limit).await?;
+    if let WalkExtent::GapLimit(gap_limit) = extent {
+        write_transparent_coverage(&mut *connection, account, gap_limit).await?;
+    }
 
     Ok(n_added)
 }
@@ -2338,6 +2571,7 @@ mod tests {
         memory_db, set_pool_sync_height, set_pool_sync_height_for_account, ACCOUNT,
     };
     use crate::net::{BroadcastOutcome, LwdServer};
+    use crate::sync::fetch::tests::Fake;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -7708,6 +7942,144 @@ mod tests {
         );
     }
 
+    async fn discover_range_against(
+        connection: &mut SqliteConnection,
+        account: u32,
+        from: u32,
+        to: u32,
+        server: ScriptedServer,
+    ) -> Result<u32> {
+        let mut client: Client = Box::new(server);
+        discover_transparent_address_range(
+            &Network::Main,
+            connection,
+            &mut client,
+            account,
+            2_000_100,
+            from,
+            to,
+            MAX_DISCOVERY_CONCURRENCY,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn stored_rows(connection: &mut SqliteConnection, account: u32) -> Vec<(u32, u32)> {
+        sqlx::query_as(
+            "SELECT scope, dindex FROM transparent_address_accounts
+            WHERE account = ? ORDER BY scope, dindex",
+        )
+        .bind(account)
+        .fetch_all(connection)
+        .await
+        .expect("rows")
+    }
+
+    async fn funded_at_receive(
+        connection: &mut SqliteConnection,
+        account: u32,
+        dindex: u32,
+        server: &ScriptedServer,
+    ) {
+        let taddr = taddress_at(connection, account, 0, dindex).await;
+        server.always(
+            &taddr,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_finds_an_address_past_what_the_gap_limit_reaches() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let server = ScriptedServer::default();
+        funded_at_receive(&mut connection, account, 1000, &server).await;
+
+        discover_against(&mut connection, account, 500, 32, server.clone())
+            .await
+            .expect("gap-limited discovery");
+        assert_eq!(stored_rows(&mut connection, account).await, vec![(0, 0)]);
+
+        let found = discover_range_against(&mut connection, account, 500, 1100, server)
+            .await
+            .expect("range discovery");
+
+        assert_eq!(found, 1);
+        assert_eq!(
+            stored_rows(&mut connection, account).await,
+            vec![(0, 0), (0, 1000)],
+            "nothing is stored for the empty indexes"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_probes_exactly_the_range_in_both_scopes() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let server = ScriptedServer::default();
+        let mut expected = vec![];
+        for scope in 0..2 {
+            for dindex in 5..8 {
+                expected.push(taddress_at(&mut connection, account, scope, dindex).await);
+            }
+        }
+
+        discover_range_against(&mut connection, account, 5, 8, server.clone())
+            .await
+            .expect("range discovery");
+
+        let mut probed = server.addresses();
+        probed.sort();
+        expected.sort();
+        assert_eq!(probed, expected);
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_certifies_no_coverage() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+
+        discover_range_against(&mut connection, account, 0, 30, ScriptedServer::default())
+            .await
+            .expect("range discovery");
+
+        let coverage = crate::db::read_transparent_coverage(&mut connection, account)
+            .await
+            .expect("coverage");
+        assert!(!coverage.certified);
+        assert_eq!(coverage.gap, 0);
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_retried_after_a_failure_reports_the_full_count() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let failing = ScriptedServer::default();
+        funded_at_receive(&mut connection, account, 1000, &failing).await;
+        let broken = taddress_at(&mut connection, account, 0, 1050).await;
+        failing.always(&broken, Reply::Fail);
+
+        discover_range_against(&mut connection, account, 990, 1100, failing)
+            .await
+            .expect_err("a probe that keeps failing fails the range");
+        assert_eq!(
+            stored_rows(&mut connection, account).await,
+            vec![(0, 0), (0, 1000)],
+            "the walk stored the find before it failed"
+        );
+
+        let healthy = ScriptedServer::default();
+        funded_at_receive(&mut connection, account, 1000, &healthy).await;
+        let found = discover_range_against(&mut connection, account, 990, 1100, healthy)
+            .await
+            .expect("retry");
+
+        assert_eq!(found, 1);
+    }
+
     /// The account's default address has no backfill marker and its only payment sits below any
     /// window `transparent_sync` would ever request — `transparent_sync` only ever scans
     /// `[start_height, end_height]` forward from the caller, never back to `birth_height`. One
@@ -8566,6 +8938,7 @@ mod tests {
             &mut connection,
             account,
             &[],
+            None,
         )
         .await
         .expect("selector")
@@ -10212,6 +10585,8 @@ mod tests {
         fail_anchor_read: Option<usize>,
         fail_stream_wider_than: Option<u32>,
         requests: Arc<Mutex<Vec<(String, u32, u32)>>>,
+        /// Serves the compact blocks and tree states instead of the empty defaults.
+        blocks: Option<Fake>,
     }
 
     impl AnchoredPayments {
@@ -10228,6 +10603,7 @@ mod tests {
                 fail_anchor_read: None,
                 fail_stream_wider_than: None,
                 requests: Arc::new(Mutex::new(vec![])),
+                blocks: None,
             }
         }
     }
@@ -10249,10 +10625,13 @@ mod tests {
         type CompactBlockStream = ReceiverStream<Result<CompactBlock>>;
         async fn block_range(
             &mut self,
-            _network: &Network,
-            _start: u32,
-            _end: u32,
+            network: &Network,
+            start: u32,
+            end: u32,
         ) -> Result<Self::CompactBlockStream> {
+            if let Some(blocks) = self.blocks.as_mut() {
+                return blocks.block_range(network, start, end).await;
+            }
             let (sender, receiver) = channel(1);
             drop(sender);
             Ok(ReceiverStream::new(receiver))
@@ -10315,8 +10694,11 @@ mod tests {
         }
 
         /// Empty trees: what a keyless account's shielded pass reads and then has no keys to use.
-        async fn tree_state(&mut self, _height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-            Ok((vec![], vec![], vec![]))
+        async fn tree_state(&mut self, height: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            match self.blocks.as_mut() {
+                Some(blocks) => blocks.tree_state(height).await,
+                None => Ok((vec![], vec![], vec![])),
+            }
         }
 
         async fn chain_anchor(&mut self, _height: u32) -> Result<Vec<u8>> {
@@ -11342,8 +11724,98 @@ mod tests {
             true,
             &tx_progress,
             &tx_cancel,
+            None,
         )
         .await
+    }
+
+    /// A keyed account born at 2_000_000 and a server whose block 2_000_100 forks off the chain
+    /// on its first `forking_streams` streams.
+    async fn reorging_cycle(forking_streams: u32) -> (Result<()>, Vec<(u32, u32)>, Vec<u32>) {
+        let _serial = LOCK_TEST_SERIAL.lock().await;
+        let coin = file_backed_coin().await;
+        let mut connection = coin.get_connection().await.expect("connection");
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let blocks = Fake {
+            forks_at: Some(2_000_100),
+            forking_streams: Arc::new(AtomicU32::new(forking_streams)),
+            ..Fake::new(0, 100)
+        };
+        let asked = blocks.asked.clone();
+        let mut client: Client = Box::new(AnchoredPayments {
+            blocks: Some(blocks),
+            ..AnchoredPayments::paying(vec![])
+        });
+
+        let result = sync_cycle(&coin, &mut connection, &mut client, &[account], 2_000_200).await;
+
+        let asked = asked.lock().expect("lock").clone();
+        (result, asked, sync_heights(&mut connection).await)
+    }
+
+    #[tokio::test]
+    async fn sync_height_ranges_syncs_again_after_a_reorg() {
+        let (result, asked, heights) = reorging_cycle(1).await;
+
+        result.expect("the second pass syncs past the fork");
+        assert_eq!(asked, vec![(2_000_001, 2_000_200); 2]);
+        assert!(heights.iter().all(|h| *h == 2_000_200), "{heights:?}");
+    }
+
+    #[tokio::test]
+    async fn sync_height_ranges_returns_a_reorg_that_keeps_recurring() {
+        let (result, asked, _) = reorging_cycle(u32::MAX).await;
+
+        let error = result.expect_err("the reorg keeps recurring");
+        assert!(
+            error
+                .chain()
+                .any(|cause| matches!(cause.downcast_ref(), Some(SyncError::Reorg(_)))),
+            "{error:#}"
+        );
+        assert_eq!(asked.len(), 1 + REORG_RETRIES as usize);
+    }
+
+    #[test]
+    fn retry_after_reorg_sees_a_reorg_under_context() {
+        let (_tx, mut rx) = broadcast::channel(1);
+        let error = Err::<(), _>(SyncError::Reorg(5))
+            .context("shielded pass")
+            .unwrap_err();
+        let mut retries = 0;
+
+        assert!(retry_after_reorg(&error, &mut retries, &mut rx));
+        assert_eq!(retries, 1);
+    }
+
+    #[test]
+    fn retry_after_reorg_skips_other_errors() {
+        let (_tx, mut rx) = broadcast::channel(1);
+        let mut retries = 0;
+        for error in [
+            anyhow::Error::from(SyncError::Cancelled),
+            anyhow::Error::from(SyncError::Other(anyhow::anyhow!("stream died"))),
+            anyhow::anyhow!("stream died"),
+        ] {
+            assert!(!retry_after_reorg(&error, &mut retries, &mut rx), "{error}");
+        }
+        assert_eq!(retries, 0);
+    }
+
+    #[test]
+    fn retry_after_reorg_stops_once_cancel_is_requested() {
+        let (tx, mut rx) = broadcast::channel(1);
+        tx.send(()).expect("cancel");
+        let mut retries = 0;
+
+        assert!(!retry_after_reorg(
+            &anyhow::Error::from(SyncError::Reorg(5)),
+            &mut retries,
+            &mut rx
+        ));
+        assert_eq!(retries, 0);
     }
 
     /// Two keyless accounts at different heights, so the driver builds two ranges and the
@@ -11491,5 +11963,42 @@ mod tests {
             assert_eq!(sync_heights(&mut connection).await, vec![tip]);
         }
         assert_eq!(owed(&mut connection, 10).await, None);
+    }
+
+    fn coin_on(url: &str, server_type: u8, transport: u8) -> Coin {
+        Coin {
+            coin: 0,
+            account: 0,
+            db_filepath: String::new(),
+            url: url.to_string(),
+            server_type,
+            transport,
+            proxy: String::new(),
+        }
+    }
+
+    #[test]
+    fn more_clients_tor_returns_none() {
+        assert!(more_clients(&coin_on("https://zec.rocks:443", 0, 1)).is_none());
+    }
+
+    #[test]
+    fn more_clients_proxy_returns_none() {
+        assert!(more_clients(&coin_on("https://zec.rocks:443", 0, 3)).is_none());
+    }
+
+    #[test]
+    fn more_clients_zebra_returns_none() {
+        assert!(more_clients(&coin_on("http://127.0.0.1:8232", 1, 0)).is_none());
+    }
+
+    #[test]
+    fn more_clients_nym_returns_none() {
+        assert!(more_clients(&coin_on("nym://service.recipient", 0, 0)).is_none());
+    }
+
+    #[test]
+    fn more_clients_direct_lightwalletd_returns_a_factory() {
+        assert!(more_clients(&coin_on("https://zec.rocks:443", 0, 0)).is_some());
     }
 }

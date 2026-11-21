@@ -1,7 +1,6 @@
 use anyhow::Result;
 use bip39::Mnemonic;
 use sapling_crypto::zip32::ExtendedSpendingKey;
-use tracing::debug;
 use zcash_protocol::consensus::{MainNetwork, NetworkConstants};
 
 use hmac::{Hmac, Mac};
@@ -24,7 +23,6 @@ pub struct ExtendedPrivateKey {
 /// - while (I[31] & 0x20) { I = HMAC-SHA512(sk, I) }
 /// - private_scalar = clamp(I[0..32])
 pub fn ledger_derivation_from_seed(seed: &[u8]) -> Result<ExtendedPrivateKey> {
-    debug!("MS {}", hex::encode(seed));
     // 1) chain code = HMAC-SHA256(sk, 0x01 || seed)
     let sk = b"ed25519 seed";
     let mut cc_mac =
@@ -34,7 +32,6 @@ pub fn ledger_derivation_from_seed(seed: &[u8]) -> Result<ExtendedPrivateKey> {
     let cc_bytes = cc_mac.finalize().into_bytes(); // 32 bytes
     let mut chain_code = [0u8; 32];
     chain_code.copy_from_slice(&cc_bytes);
-    debug!("cc {}", hex::encode(chain_code));
 
     // 2) I = HMAC-SHA512(sk, seed)
     let mut i_mac =
@@ -43,12 +40,10 @@ pub fn ledger_derivation_from_seed(seed: &[u8]) -> Result<ExtendedPrivateKey> {
     let i_bytes = i_mac.finalize().into_bytes(); // 64 bytes
     let mut raw_i = [0u8; 64];
     raw_i.copy_from_slice(&i_bytes);
-    debug!("I {}", hex::encode(raw_i));
 
     // 3) while (I[31] & 0x20) { I = HMAC-SHA512(sk, I) }
     // Note: i_bytes[31] corresponds to raw_i[31].
     while (raw_i[31] & 0x20) != 0 {
-        debug!("RETRY");
         let mut mac =
             HmacSha512::new_from_slice(sk).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
         mac.update(&raw_i);
@@ -61,9 +56,6 @@ pub fn ledger_derivation_from_seed(seed: &[u8]) -> Result<ExtendedPrivateKey> {
     key.copy_from_slice(&raw_i);
     key[0] &= 0xF8;
     key[31] = (key[31] & 0x7F) | 0x40;
-
-    debug!("key {}", hex::encode(key));
-    debug!("cc {}", hex::encode(chain_code));
 
     Ok(ExtendedPrivateKey { key, chain_code })
 }
@@ -99,18 +91,13 @@ pub fn derive_hardened_ed25519(
         let zl = &z[..28];
         let zr = &z[32..];
 
-        debug!("ZL {}", hex::encode(zl));
-        debug!("ZR {}", hex::encode(zr));
-
         // kL_new = 8*ZL + kL_parent (no modulo reduction)
         let mut kl = [0u8; 32];
         add_scalar_inplace_mul8(&mut kl, zl, &key[..32]);
-        debug!("kl {}", hex::encode(kl));
 
         // kR_new = ZR + kR_parent
         let mut kr = [0u8; 32];
         add_scalar_inplace(&mut kr, zr, &key[32..]);
-        debug!("kr {}", hex::encode(kr));
 
         // update chain code: HMAC(chain_code, 0x01 || key || index)
         tmp[0] = 0x01;
@@ -119,7 +106,6 @@ pub fn derive_hardened_ed25519(
         mac.update(&tmp[..69]);
         let new_chain = mac.finalize().into_bytes();
         chain_code.copy_from_slice(&new_chain[32..]); // upper 32 bytes
-        debug!("cc {}", hex::encode(chain_code));
 
         // update key
         key[..32].copy_from_slice(&kl);

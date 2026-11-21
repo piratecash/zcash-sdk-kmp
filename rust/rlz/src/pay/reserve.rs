@@ -1,7 +1,8 @@
 use anyhow::{ensure, Context as _, Result};
 use sqlx::{Connection as _, Row, Sqlite, SqliteConnection, Transaction as SqliteTransaction};
 use zcash_primitives::transaction::{
-    Authorized, OrchardBundle, Transaction, TransactionData, TxVersion,
+    builder::NU7_DEFAULT_TX_EXPIRY_DELTA, Authorized, OrchardBundle, Transaction, TransactionData,
+    TxVersion,
 };
 use zcash_protocol::consensus::BranchId;
 
@@ -111,9 +112,10 @@ pub async fn reserve_transaction(
     account: u32,
     raw: &[u8],
     own_inputs: OwnInputs,
+    chain_tip: impl AsyncFnOnce() -> Result<u32>,
 ) -> Result<()> {
     let parsed = parse_transaction(raw)?;
-    reserve_parsed_transaction(connection, account, &parsed, own_inputs).await
+    reserve_parsed_transaction(connection, account, &parsed, own_inputs, chain_tip).await
 }
 
 pub async fn reserve_and_send(
@@ -126,7 +128,10 @@ pub async fn reserve_and_send(
     own_inputs: OwnInputs,
 ) -> Result<BroadcastOutcome> {
     let parsed = parse_transaction(raw)?;
-    reserve_parsed_transaction(connection, account, &parsed, own_inputs).await?;
+    reserve_parsed_transaction(connection, account, &parsed, own_inputs, async || {
+        client.latest_height().await
+    })
+    .await?;
     // An `Err` here is not a verdict: the bytes may have reached the node, so the inputs stay held.
     let mut outcome = crate::pay::send(client, height, raw).await?;
     if outcome.error_code != 0 && cannot_be_mined(network, client, &parsed, &outcome.message).await
@@ -197,11 +202,28 @@ async fn cannot_be_mined(
     u32::from(end).saturating_add(REORG_MARGIN) <= tip.saturating_add(1)
 }
 
+/// The longest lifetime our builder gives a transaction; bytes from elsewhere cannot claim more.
+const MAX_RESERVATION_BLOCKS: u32 = NU7_DEFAULT_TX_EXPIRY_DELTA;
+
+/// A balanced server or a switch between planning and broadcast may report a slightly lower tip.
+const TIP_SKEW_MARGIN: u32 = DEFAULT_CONFIRMATIONS;
+
+/// The transaction's own expiry, never past what a transaction built at `reference` could reach.
+fn hold_until(expiry_height: u32, reference: u32) -> u32 {
+    let ceiling = reference.saturating_add(1 + MAX_RESERVATION_BLOCKS + TIP_SKEW_MARGIN);
+    if expiry_height == 0 {
+        ceiling
+    } else {
+        expiry_height.min(ceiling)
+    }
+}
+
 async fn reserve_parsed_transaction(
     connection: &mut SqliteConnection,
     account: u32,
     parsed: &ParsedTransaction,
     own_inputs: OwnInputs,
+    chain_tip: impl AsyncFnOnce() -> Result<u32>,
 ) -> Result<()> {
     let scanned_height = get_sync_height(&mut *connection, account).await?;
     if let Some(height) = scanned_height {
@@ -212,30 +234,61 @@ async fn reserve_parsed_transaction(
         );
     }
 
-    let mut transaction = connection.begin().await?;
-    let owned_inputs = validate_owned_inputs(&mut transaction, account, parsed).await?;
-    if owned_inputs.is_empty() {
-        ensure!(
-            own_inputs == OwnInputs::Optional,
-            "Transaction does not spend an input owned by account {account}"
-        );
-        ensure!(
-            !reserved_by_another_transaction(&mut transaction, account, parsed).await?,
-            "Transaction input is reserved by another pending transaction"
-        );
+    // The tip is read between the two transactions: a network round-trip must not hold one open.
+    let mut probe = connection.begin().await?;
+    let has_owned_inputs = owned_inputs_or_settle(&mut probe, account, parsed, own_inputs)
+        .await?
+        .is_some();
+    probe.rollback().await?;
+    if !has_owned_inputs {
         return Ok(());
     }
-    claim_inputs(&mut transaction, account, parsed, owned_inputs).await?;
+    let tip = chain_tip().await?;
+    let hold = hold_until(
+        parsed.expiry_height,
+        scanned_height.unwrap_or_default().max(tip),
+    );
+
+    let mut transaction = connection.begin().await?;
+    let Some(owned_inputs) =
+        owned_inputs_or_settle(&mut transaction, account, parsed, own_inputs).await?
+    else {
+        return Ok(());
+    };
+    claim_inputs(&mut transaction, account, parsed, owned_inputs, hold).await?;
     record_pending_tx(&mut transaction, account, parsed, scanned_height).await?;
     transaction.commit().await?;
     tracing::debug!(
         account,
         txid = %hex::encode(&parsed.txid),
         expiry_height = parsed.expiry_height,
+        hold_until = hold,
         inputs = parsed.inputs.len(),
         "Reserved transaction inputs"
     );
     Ok(())
+}
+
+/// The account's inputs `parsed` spends, or `None` once a transaction spending none is settled.
+async fn owned_inputs_or_settle(
+    transaction: &mut SqliteTransaction<'_, Sqlite>,
+    account: u32,
+    parsed: &ParsedTransaction,
+    own_inputs: OwnInputs,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    let owned_inputs = validate_owned_inputs(transaction, account, parsed).await?;
+    if !owned_inputs.is_empty() {
+        return Ok(Some(owned_inputs));
+    }
+    ensure!(
+        own_inputs == OwnInputs::Optional,
+        "Transaction does not spend an input owned by account {account}"
+    );
+    ensure!(
+        !reserved_by_another_transaction(transaction, account, parsed).await?,
+        "Transaction input is reserved by another pending transaction"
+    );
+    Ok(None)
 }
 
 async fn validate_owned_inputs(
@@ -308,6 +361,7 @@ async fn claim_inputs(
     account: u32,
     parsed: &ParsedTransaction,
     owned_inputs: Vec<Vec<u8>>,
+    hold_until: u32,
 ) -> Result<()> {
     for input in owned_inputs {
         let result = sqlx::query(
@@ -326,7 +380,7 @@ async fn claim_inputs(
         .bind(account)
         .bind(input)
         .bind(&parsed.txid)
-        .bind(parsed.expiry_height)
+        .bind(hold_until)
         .execute(&mut **transaction)
         .await?;
         ensure!(
@@ -391,6 +445,12 @@ pub(crate) mod tests {
     };
 
     const NOTE: [u8; 4] = [1, 2, 3, 4];
+    /// The chain tip most tests reserve against: the height they sync the account to.
+    const TIP: u32 = 100;
+
+    fn at_tip(height: u32) -> impl AsyncFnOnce() -> Result<u32> {
+        async move || Ok(height)
+    }
 
     async fn set_sync_height(connection: &mut SqliteConnection, account: u32, height: u32) {
         for pool in 0..NUM_POOLS as u8 {
@@ -521,9 +581,15 @@ pub(crate) mod tests {
         let (raw, input) = transparent_transaction();
         let parsed = parse_transaction(&raw).expect("parse");
         insert_note(&mut connection, ACCOUNT, &input, 50, 80).await;
-        reserve_transaction(&mut connection, ACCOUNT, &raw, OwnInputs::Required)
-            .await
-            .expect("reserve");
+        reserve_transaction(
+            &mut connection,
+            ACCOUNT,
+            &raw,
+            OwnInputs::Required,
+            at_tip(TIP),
+        )
+        .await
+        .expect("reserve");
         let mut display_txid = parsed.txid.clone();
         display_txid.reverse();
         store_pending_tx(
@@ -688,6 +754,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect("reserve");
@@ -738,6 +805,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect("first reserve");
@@ -746,6 +814,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect("idempotent reserve");
@@ -754,6 +823,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(2, 120),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect_err("foreign owner must fail");
@@ -780,6 +850,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 101),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect("reserve");
@@ -811,6 +882,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect("reserve");
@@ -829,21 +901,191 @@ pub(crate) mod tests {
         assert_eq!(balance.0[1].available, 0);
     }
 
-    #[tokio::test]
-    async fn reserve_transaction_zero_expiry_never_unlocks_by_height() {
+    /// `TIP` + 1 + the longest default expiry delta + the tip-skew margin.
+    const CEILING: u32 = TIP + 131;
+
+    async fn reserved_until(connection: &mut SqliteConnection) -> u32 {
+        sqlx::query_scalar(
+            "SELECT expiry_height FROM pending_spend_inputs WHERE account = ?1 AND nullifier = ?2",
+        )
+        .bind(ACCOUNT)
+        .bind(&NOTE[..])
+        .fetch_one(connection)
+        .await
+        .expect("reservation")
+    }
+
+    async fn pending_tx_expiry(connection: &mut SqliteConnection, txid: u8) -> u32 {
+        sqlx::query_scalar("SELECT expiry_height FROM pending_txs WHERE account = ?1 AND txid = ?2")
+            .bind(ACCOUNT)
+            .bind(vec![txid; 32])
+            .fetch_one(connection)
+            .await
+            .expect("pending transaction")
+    }
+
+    /// The account synced to `TIP` with one confirmed note, `NOTE`.
+    async fn wallet_with_note() -> SqliteConnection {
         let mut connection = memory_db().await;
-        set_sync_height(&mut connection, ACCOUNT, 100).await;
+        set_sync_height(&mut connection, ACCOUNT, TIP).await;
         insert_note(&mut connection, ACCOUNT, &NOTE, 50, 80).await;
-        reserve_parsed_transaction(&mut connection, ACCOUNT, &parsed(1, 0), OwnInputs::Required)
-            .await
-            .expect("reserve");
-        set_sync_height(&mut connection, ACCOUNT, u32::MAX).await;
+        connection
+    }
 
-        let balance = calculate_balance_breakdown(&mut connection, ACCOUNT, 0)
-            .await
-            .expect("balance");
+    async fn reserve_note_at(
+        connection: &mut SqliteConnection,
+        expiry_height: u32,
+        own_inputs: OwnInputs,
+        tip: u32,
+    ) -> u32 {
+        reserve_parsed_transaction(
+            connection,
+            ACCOUNT,
+            &parsed(1, expiry_height),
+            own_inputs,
+            at_tip(tip),
+        )
+        .await
+        .expect("reserve");
+        reserved_until(connection).await
+    }
 
-        assert_eq!(balance.0[1].locked, 50);
+    #[tokio::test]
+    async fn reserve_transaction_zero_expiry_unlocks_after_the_ceiling() {
+        let mut connection = wallet_with_note().await;
+        reserve_note_at(&mut connection, 0, OwnInputs::Required, TIP).await;
+
+        set_sync_height(&mut connection, ACCOUNT, CEILING - 1).await;
+        let before = calculate_balance_breakdown(&mut connection, ACCOUNT, 0)
+            .await
+            .expect("before the ceiling");
+        set_sync_height(&mut connection, ACCOUNT, CEILING).await;
+        let at = calculate_balance_breakdown(&mut connection, ACCOUNT, 0)
+            .await
+            .expect("at the ceiling");
+
+        assert_eq!(before.0[1].locked, 50);
+        assert_eq!(at.0[1].available, 50);
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_far_expiry_is_capped_at_the_ceiling() {
+        let mut connection = wallet_with_note().await;
+
+        let held = reserve_note_at(&mut connection, 499_999_999, OwnInputs::Required, TIP).await;
+
+        assert_eq!(held, CEILING);
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_optional_foreign_long_expiry_is_capped_at_the_ceiling() {
+        let mut connection = wallet_with_note().await;
+
+        let held = reserve_note_at(&mut connection, TIP + 500, OwnInputs::Optional, TIP).await;
+
+        assert_eq!(held, CEILING);
+        assert_eq!(pending_tx_expiry(&mut connection, 1).await, TIP + 500);
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_planner_expiry_is_kept() {
+        for expiry in [TIP + 1 + 40, TIP + 1 + 120] {
+            let mut connection = wallet_with_note().await;
+
+            let held = reserve_note_at(&mut connection, expiry, OwnInputs::Required, TIP).await;
+
+            assert_eq!(held, expiry);
+        }
+    }
+
+    /// Planned against tip 200 while the account still syncs at `TIP`; reserved against a server
+    /// that reports 10 blocks less.
+    #[tokio::test]
+    async fn reserve_transaction_tip_up_to_margin_below_planning_keeps_planner_expiry() {
+        let mut connection = wallet_with_note().await;
+        let planning_tip = 200;
+
+        let held = reserve_note_at(
+            &mut connection,
+            planning_tip + 1 + 120,
+            OwnInputs::Required,
+            planning_tip - 10,
+        )
+        .await;
+
+        assert_eq!(held, planning_tip + 1 + 120);
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_tip_below_scanned_uses_the_scanned_height() {
+        let mut connection = wallet_with_note().await;
+
+        let held = reserve_note_at(&mut connection, 0, OwnInputs::Required, TIP - 50).await;
+
+        assert_eq!(held, CEILING);
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_tip_unreadable_with_owned_inputs_fails_and_writes_nothing() {
+        let mut connection = wallet_with_note().await;
+
+        reserve_parsed_transaction(
+            &mut connection,
+            ACCOUNT,
+            &parsed(1, 0),
+            OwnInputs::Optional,
+            async || -> Result<u32> { anyhow::bail!("tip unavailable") },
+        )
+        .await
+        .expect_err("a reservation it cannot bound must fail");
+
+        assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_without_owned_inputs_never_asks_for_the_tip() {
+        let mut connection = memory_db().await;
+        set_sync_height(&mut connection, ACCOUNT, TIP).await;
+        let (raw, _) = transparent_transaction();
+        let tip_reads = std::cell::Cell::new(0);
+        let counted_tip = || {
+            async || {
+                tip_reads.set(tip_reads.get() + 1);
+                Ok(TIP)
+            }
+        };
+
+        reserve_transaction(
+            &mut connection,
+            ACCOUNT,
+            &raw,
+            OwnInputs::Optional,
+            counted_tip(),
+        )
+        .await
+        .expect("nothing to reserve");
+        reserve_transaction(
+            &mut connection,
+            ACCOUNT,
+            &raw,
+            OwnInputs::Required,
+            counted_tip(),
+        )
+        .await
+        .expect_err("an own send must still spend an owned input");
+
+        assert_eq!(tip_reads.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_transaction_pending_tx_keeps_the_real_expiry() {
+        for expiry in [0, 499_999_999] {
+            let mut connection = wallet_with_note().await;
+
+            reserve_note_at(&mut connection, expiry, OwnInputs::Required, TIP).await;
+
+            assert_eq!(pending_tx_expiry(&mut connection, 1).await, expiry);
+        }
     }
 
     #[tokio::test]
@@ -857,6 +1099,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect_err("wrong account must fail");
@@ -870,9 +1113,15 @@ pub(crate) mod tests {
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         let (raw, _) = transparent_transaction();
 
-        reserve_transaction(&mut connection, ACCOUNT, &raw, OwnInputs::Optional)
-            .await
-            .expect("a transaction of unknown origin reserves nothing and succeeds");
+        reserve_transaction(
+            &mut connection,
+            ACCOUNT,
+            &raw,
+            OwnInputs::Optional,
+            at_tip(TIP),
+        )
+        .await
+        .expect("a transaction of unknown origin reserves nothing and succeeds");
 
         assert_eq!(pending_row_counts(&mut connection, ACCOUNT).await, (0, 0));
     }
@@ -883,9 +1132,15 @@ pub(crate) mod tests {
         set_sync_height(&mut connection, ACCOUNT, 100).await;
         let (raw, _) = transparent_transaction();
 
-        let error = reserve_transaction(&mut connection, ACCOUNT, &raw, OwnInputs::Required)
-            .await
-            .expect_err("an own send must still spend an owned input");
+        let error = reserve_transaction(
+            &mut connection,
+            ACCOUNT,
+            &raw,
+            OwnInputs::Required,
+            at_tip(TIP),
+        )
+        .await
+        .expect_err("an own send must still spend an owned input");
 
         assert!(error.to_string().contains("does not spend an input owned"));
     }
@@ -901,6 +1156,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect_err("another account's input must still fail");
@@ -924,6 +1180,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect_err("a locked input must still fail");
@@ -958,6 +1215,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect_err("an input spent by another transaction must still fail");
@@ -975,6 +1233,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect("first reserve");
@@ -984,6 +1243,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(2, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect_err("an input held by another pending transaction must still fail");
@@ -1003,6 +1263,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect("first reserve");
@@ -1013,6 +1274,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(2, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect_err("a reservation must outlive the note row a rewind removed");
@@ -1030,6 +1292,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect("first reserve");
@@ -1040,6 +1303,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect("rebroadcasting the very same transaction must stay idempotent");
@@ -1057,6 +1321,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 90),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect("first reserve");
@@ -1068,6 +1333,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(2, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect("an expired reservation must not block a transaction of unknown origin");
@@ -1085,6 +1351,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 100),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect_err("an expired transaction must still fail");
@@ -1096,12 +1363,12 @@ pub(crate) mod tests {
     async fn send_at_tips(
         connection: &mut SqliteConnection,
         (raw, input): (Vec<u8>, Vec<u8>),
-        tips: &[u32],
+        tips: &[Option<u32>],
         reply: BroadcastReply,
     ) -> Result<BroadcastOutcome> {
         set_sync_height(connection, ACCOUNT, 100).await;
         insert_note(connection, ACCOUNT, &input, 50_000, 80).await;
-        let mut client = ScriptedServer::new(tips, reply).client();
+        let mut client = ScriptedServer::scripted(tips, reply).client();
         reserve_and_send(
             &Network::Main,
             connection,
@@ -1125,7 +1392,7 @@ pub(crate) mod tests {
         send_at_tips(
             connection,
             transparent_transaction(),
-            &[BRANCH_OVER_TIP],
+            &[Some(BRANCH_OVER_TIP)],
             reply,
         )
         .await
@@ -1133,7 +1400,7 @@ pub(crate) mod tests {
 
     async fn assert_branch_id_rejection_keeps_the_reservation(
         transaction: (Vec<u8>, Vec<u8>),
-        tips: &[u32],
+        tips: &[Option<u32>],
     ) {
         let mut connection = memory_db().await;
 
@@ -1158,12 +1425,12 @@ pub(crate) mod tests {
     async fn reserve_and_send_branch_still_current_keeps_the_reservation() {
         assert_branch_id_rejection_keeps_the_reservation(
             transparent_transaction(),
-            &[NU7_ACTIVATION - 2],
+            &[Some(NU7_ACTIVATION - 2)],
         )
         .await;
         assert_branch_id_rejection_keeps_the_reservation(
             transparent_v6_transaction(BranchId::Nu7),
-            &[NU7_ACTIVATION + 10],
+            &[Some(NU7_ACTIVATION + 10)],
         )
         .await;
     }
@@ -1173,7 +1440,7 @@ pub(crate) mod tests {
     async fn reserve_and_send_branch_ahead_of_the_node_keeps_the_reservation() {
         assert_branch_id_rejection_keeps_the_reservation(
             transparent_v6_transaction(BranchId::Nu7),
-            &[NU7_ACTIVATION - 2],
+            &[Some(NU7_ACTIVATION - 2)],
         )
         .await;
     }
@@ -1182,14 +1449,18 @@ pub(crate) mod tests {
     async fn reserve_and_send_branch_ended_within_the_reorg_margin_keeps_the_reservation() {
         assert_branch_id_rejection_keeps_the_reservation(
             transparent_transaction(),
-            &[BRANCH_OVER_TIP - 1],
+            &[Some(BRANCH_OVER_TIP - 1)],
         )
         .await;
     }
 
     #[tokio::test]
     async fn reserve_and_send_tip_unreadable_keeps_the_reservation() {
-        assert_branch_id_rejection_keeps_the_reservation(transparent_transaction(), &[]).await;
+        assert_branch_id_rejection_keeps_the_reservation(
+            transparent_transaction(),
+            &[Some(BRANCH_OVER_TIP), None],
+        )
+        .await;
     }
 
     #[test]
@@ -1328,6 +1599,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Required,
+            at_tip(TIP),
         )
         .await
         .expect("another transaction's reservation");
@@ -1365,6 +1637,7 @@ pub(crate) mod tests {
             ACCOUNT,
             &parsed(1, 120),
             OwnInputs::Optional,
+            at_tip(TIP),
         )
         .await
         .expect("an owned input reserves as usual");

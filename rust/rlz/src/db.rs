@@ -470,6 +470,17 @@ pub async fn create_schema(connection: &mut SqliteConnection) -> Result<()> {
         .await;
 
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sent_addresses (
+        account INTEGER NOT NULL,
+        txid BLOB NOT NULL,
+        address TEXT NOT NULL,
+        receiver TEXT NOT NULL,
+        UNIQUE (account, txid, receiver))",
+    )
+    .execute(&mut *connection)
+    .await?;
+
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS pending_spend_inputs (
         account INTEGER NOT NULL,
         nullifier BLOB NOT NULL,
@@ -1656,6 +1667,10 @@ pub async fn delete_account(connection: &mut SqliteConnection, account: u32) -> 
         .bind(account)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM sent_addresses WHERE account = ?")
+        .bind(account)
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query("DELETE FROM dkg_params WHERE account = ?")
         .bind(account)
@@ -1916,7 +1931,9 @@ pub async fn fetch_txs(connection: &mut SqliteConnection, account: u32) -> Resul
                 WHERE n.account = t.account AND n.tx = t.id_tx AND n.id_asset IS NULL) as received_count,
             (SELECT COUNT(*) FROM notes n
                 WHERE n.account = t.account AND n.tx = t.id_tx AND n.id_asset IS NULL AND n.scope = 1) as change_count,
-            (SELECT o.address FROM outputs o
+            (SELECT COALESCE(sa.address, o.address) FROM outputs o
+                LEFT JOIN sent_addresses sa ON sa.account = o.account AND sa.txid = t.txid
+                    AND sa.receiver = o.address
                 WHERE o.account = t.account AND o.tx = t.id_tx AND NOT EXISTS (
                     SELECT 1 FROM notes n
                     WHERE n.account = o.account AND n.tx = o.tx AND n.pool = o.pool AND n.value = o.value)
@@ -2340,22 +2357,65 @@ pub async fn transparent_address_is_used(
     account: u32,
     address: &str,
 ) -> Result<bool> {
-    let used: bool = sqlx::query_scalar(
-        "WITH n AS (
-        SELECT account, taddress FROM notes WHERE pool = 0 UNION ALL
-        SELECT n.account, n.taddress FROM spends s JOIN notes n ON s.id_note = n.id_note AND s.account = n.account WHERE s.pool = 0)
+    let used: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "{TRANSPARENT_ACTIVITY}
         SELECT EXISTS(
         SELECT 1 FROM transparent_address_accounts ta
-        WHERE ta.account = ?1 AND ta.address = ?2
-        AND (ta.seen_used OR EXISTS(
-            SELECT 1 FROM n WHERE n.account = ta.account AND n.taddress = ta.id_taddress)))",
-    )
+        WHERE ta.account = ?1 AND ta.address = ?2 AND {TRANSPARENT_ROW_IS_USED})"
+    )))
     .bind(account)
     .bind(address)
     .fetch_one(&mut *connection)
     .await?;
 
     Ok(used)
+}
+
+/// The notes-union-spends CTE `n` that [`TRANSPARENT_ROW_IS_USED`] reads.
+const TRANSPARENT_ACTIVITY: &str = "WITH n AS (
+        SELECT account, taddress FROM notes WHERE pool = 0 UNION ALL
+        SELECT n.account, n.taddress FROM spends s JOIN notes n ON s.id_note = n.id_note AND s.account = n.account WHERE s.pool = 0)";
+
+/// [`transparent_address_is_used`]'s definition of "used", for a row aliased `ta`.
+const TRANSPARENT_ROW_IS_USED: &str = "(ta.seen_used OR EXISTS(
+            SELECT 1 FROM n WHERE n.account = ta.account AND n.taddress = ta.id_taddress))";
+
+/// The highest receive-scope index of `account` that [`transparent_address_is_used`] calls used.
+pub async fn highest_used_receive_dindex(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<Option<u32>> {
+    let highest: Option<u32> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "{TRANSPARENT_ACTIVITY}
+        SELECT MAX(ta.dindex) FROM transparent_address_accounts ta
+        WHERE ta.account = ?1 AND ta.scope = 0 AND {TRANSPARENT_ROW_IS_USED}"
+    )))
+    .bind(account)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(highest)
+}
+
+/// How many stored addresses of `account`, in either scope, with a dindex in `[from, to)` are used.
+pub async fn count_used_transparent_addresses(
+    connection: &mut SqliteConnection,
+    account: u32,
+    from: u32,
+    to: u32,
+) -> Result<u32> {
+    let count: u32 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "{TRANSPARENT_ACTIVITY}
+        SELECT COUNT(*) FROM transparent_address_accounts ta
+        WHERE ta.account = ?1 AND ta.dindex >= ?2 AND ta.dindex < ?3 AND {TRANSPARENT_ROW_IS_USED}"
+    )))
+    .bind(account)
+    .bind(from)
+    .bind(to)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(count)
 }
 
 pub async fn fetch_transparent_address_tx_count(
@@ -2569,6 +2629,34 @@ pub async fn store_pending_tx(
     .bind(category)
     .execute(connection)
     .await?;
+    Ok(())
+}
+
+/// Remembers the addresses a transaction was sent to, keyed by the receivers its outputs are
+/// stored under: the chain only reveals the receiver an output paid, not the address entered.
+pub async fn store_sent_addresses(
+    connection: &mut SqliteConnection,
+    account: u32,
+    network: &Network,
+    txid: &[u8],
+    addresses: &[String],
+) -> Result<()> {
+    let mut tx = connection.begin().await?;
+    for address in addresses {
+        for (receiver, _) in crate::memo::expand_address_to_receivers_with_pool(address, network)? {
+            sqlx::query(
+                "INSERT INTO sent_addresses(account, txid, address, receiver)
+                VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+            )
+            .bind(account)
+            .bind(txid)
+            .bind(address)
+            .bind(receiver)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3517,6 +3605,118 @@ pub(crate) mod tests {
         assert_eq!(1_000, tx.fee);
     }
 
+    const ENTERED_UA: &str = "u1zf3u05gc5sptyarp4hv3wlxgpshr8zm73vxgd2pyzlytr82c7yldegnc546euxj49n69nxzd9djhyzyxjx6zzv8zur5p733f9v2mlnf2lzpucs88r5x6ljvh7aya8gpvs5krsrs7agkfp5zq8l3q0l8emn09rusl489494ez2pthuqdgthxzxdsrw8dheeq35y9yysl9l9ptce4pw30";
+
+    fn orchard_receiver(address: &str) -> String {
+        crate::memo::expand_address_to_receivers_with_pool(address, &Network::Main)
+            .expect("receivers")
+            .into_iter()
+            .find(|(_, pool)| *pool == 2)
+            .expect("orchard receiver")
+            .0
+    }
+
+    async fn remember_sent(connection: &mut SqliteConnection, address: &str) {
+        store_sent_addresses(
+            connection,
+            ACCOUNT,
+            &Network::Main,
+            &TX.to_le_bytes(),
+            &[address.to_string()],
+        )
+        .await
+        .expect("sent addresses");
+    }
+
+    async fn sent_address_rows(connection: &mut SqliteConnection) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sent_addresses")
+            .fetch_one(connection)
+            .await
+            .expect("count")
+    }
+
+    async fn recipient_of_entered_ua_paid_into(pool: u8) -> Option<String> {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -3_000, 1_000).await;
+        insert_output(
+            &mut connection,
+            TX,
+            pool,
+            0,
+            2_000,
+            &orchard_receiver(ENTERED_UA),
+        )
+        .await;
+        remember_sent(&mut connection, ENTERED_UA).await;
+
+        single_tx(&mut connection).await.recipient
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_recipient_orchard_output_shows_the_entered_address() {
+        assert_eq!(
+            Some(ENTERED_UA.to_string()),
+            recipient_of_entered_ua_paid_into(2).await
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_recipient_ironwood_output_shows_the_entered_address() {
+        assert_eq!(
+            Some(ENTERED_UA.to_string()),
+            recipient_of_entered_ua_paid_into(3).await
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_recipient_tex_paid_to_a_transparent_output_shows_the_entered_tex() {
+        let hash = [7u8; 20];
+        let tex = zcash_keys::address::Address::Tex(hash).encode(&Network::Main);
+        let transparent = zcash_transparent::address::TransparentAddress::PublicKeyHash(hash)
+            .encode(&Network::Main);
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -3_000, 1_000).await;
+        insert_output(&mut connection, TX, 0, 0, 2_000, &transparent).await;
+        remember_sent(&mut connection, &tex).await;
+
+        assert_eq!(Some(tex), single_tx(&mut connection).await.recipient);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_recipient_entered_address_of_another_receiver_keeps_the_output_address() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -3_000, 1_000).await;
+        insert_output(&mut connection, TX, 2, 0, 2_000, "another-recipient").await;
+        remember_sent(&mut connection, ENTERED_UA).await;
+
+        assert_eq!(
+            Some("another-recipient".to_string()),
+            single_tx(&mut connection).await.recipient
+        );
+    }
+
+    #[tokio::test]
+    async fn store_sent_addresses_repeated_keeps_one_row_per_receiver() {
+        let mut connection = memory_db().await;
+
+        remember_sent(&mut connection, ENTERED_UA).await;
+        remember_sent(&mut connection, ENTERED_UA).await;
+
+        assert_eq!(3, sent_address_rows(&mut connection).await);
+    }
+
+    #[tokio::test]
+    async fn delete_account_removes_the_sent_addresses() {
+        let mut connection = memory_db().await;
+        remember_sent(&mut connection, ENTERED_UA).await;
+
+        delete_account(&mut connection, ACCOUNT)
+            .await
+            .expect("delete");
+
+        assert_eq!(0, sent_address_rows(&mut connection).await);
+    }
+
     #[tokio::test]
     async fn fetch_txs_transaction_without_details_has_no_recipient_and_no_fee() {
         let mut connection = memory_db().await;
@@ -4113,6 +4313,73 @@ pub(crate) mod tests {
             !transparent_address_is_used(&mut connection, ACCOUNT, "t1never")
                 .await
                 .expect("used")
+        );
+    }
+
+    #[tokio::test]
+    async fn highest_used_receive_dindex_skips_an_unused_row_that_highest_stored_dindex_counts() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1paid").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 1, "t1seen").await;
+        insert_scoped_taddress(&mut connection, 3, 0, 2, "t1unused").await;
+        insert_scoped_taddress(&mut connection, 4, 1, 7, "t1change").await;
+        insert_transparent_note(&mut connection, 1, 100, 1).await;
+        insert_transparent_note(&mut connection, 2, 100, 4).await;
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET seen_used = TRUE WHERE id_taddress = 2",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("flag");
+
+        assert_eq!(
+            highest_stored_dindex(&mut connection, ACCOUNT, 0)
+                .await
+                .expect("stored"),
+            Some(2)
+        );
+        assert_eq!(
+            highest_used_receive_dindex(&mut connection, ACCOUNT)
+                .await
+                .expect("used"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn highest_used_receive_dindex_without_history_is_none() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1unused").await;
+
+        assert_eq!(
+            highest_used_receive_dindex(&mut connection, ACCOUNT)
+                .await
+                .expect("used"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn count_used_transparent_addresses_counts_both_scopes_inside_the_range_only() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 4, "t1below").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 5, "t1first").await;
+        insert_scoped_taddress(&mut connection, 3, 1, 9, "t1change").await;
+        insert_scoped_taddress(&mut connection, 4, 0, 8, "t1unused").await;
+        insert_scoped_taddress(&mut connection, 5, 0, 10, "t1end").await;
+        for (id_note, id_taddress) in [(1, 1), (2, 2), (3, 3), (4, 5)] {
+            insert_transparent_note(&mut connection, id_note, 100, id_taddress).await;
+        }
+        spend_note(&mut connection, 2, 0, 110).await;
+
+        assert_eq!(
+            count_used_transparent_addresses(&mut connection, ACCOUNT, 5, 10)
+                .await
+                .expect("count"),
+            2
         );
     }
 

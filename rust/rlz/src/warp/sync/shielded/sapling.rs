@@ -9,7 +9,7 @@ use crate::{
 };
 use zcash_trees::{network::Network, types};
 
-use crate::warp::{hasher::SaplingHasher, try_sapling_decrypt};
+use crate::warp::{decrypt_sapling_batch, hasher::SaplingHasher, OutputRef};
 
 use super::ShieldedProtocol;
 
@@ -58,17 +58,12 @@ impl ShieldedProtocol for SaplingProtocol {
         Ok(keys)
     }
 
-    fn try_decrypt(
+    fn try_decrypt_batch(
         network: &Network,
-        account: u32,
-        scope: u8,
-        ivk: &Self::IVK,
-        height: u32,
-        ivtx: u32,
-        vout: u32,
-        output: &Self::Output,
-    ) -> Result<Option<(sapling_crypto::Note, types::Note)>> {
-        try_sapling_decrypt(network, account, scope, ivk, height, ivtx, vout, output)
+        keys: &[(u32, u8, &Self::IVK)],
+        outputs: &[OutputRef<Self::Output>],
+    ) -> Vec<(usize, Self::Note, types::Note)> {
+        decrypt_sapling_batch(network, keys, outputs)
     }
 
     fn derive_nf(nk: &Self::NK, position: u32, note: &mut Self::Note) -> Result<Hash32> {

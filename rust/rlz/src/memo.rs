@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use orchard::{
     keys::Scope,
     note::ExtractedNoteCommitment,
@@ -10,6 +10,8 @@ use orchard::{
 use sapling_crypto::{keys::PreparedIncomingViewingKey, note_encryption::SaplingDomain};
 use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
 use tracing::debug;
+use zcash_address::unified::{self, Container, Encoding};
+use zcash_address::ZcashAddress;
 use zcash_keys::{address::UnifiedAddress, encoding::AddressCodec};
 use zcash_note_encryption::note_bytes::NoteBytesData;
 use zcash_note_encryption::{try_note_decryption, try_output_recovery_with_ovk};
@@ -17,10 +19,12 @@ use zcash_primitives::transaction::{
     components::sapling::zip212_enforcement, Authorized, OrchardBundle, TransactionData,
 };
 use zcash_protocol::{
+    consensus::Parameters,
     memo::Memo,
     value::{BalanceError, Zatoshis},
+    PoolType, ShieldedPool,
 };
-use zcash_transparent::bundle::OutPoint;
+use zcash_transparent::{address::TransparentAddress, bundle::OutPoint};
 
 use crate::{
     account::{get_orchard_vk, get_sapling_vk},
@@ -634,6 +638,78 @@ async fn process_memo(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Expand an address to a list of (receiver, pool) pairs.
+/// Pool: 0 = transparent, 1 = sapling, 2 = orchard.
+///
+/// If the address is a unified address, it is decomposed into individual
+/// receivers (one per pool), each assigned the appropriate pool id.
+/// If it's a single-pool address, it is returned as-is with its pool.
+pub fn expand_address_to_receivers_with_pool(
+    addr: &str,
+    network: &Network,
+) -> Result<Vec<(String, u8)>> {
+    // Try to parse as a unified address first
+    if let Ok((net, _revision, ua)) = unified::Address::decode(addr) {
+        if net != network.network_type() {
+            anyhow::bail!("Invalid network for address");
+        }
+        let mut results = Vec::new();
+        for item in ua.items() {
+            match item {
+                unified::Receiver::P2pkh(pkh) => {
+                    let taddr = TransparentAddress::PublicKeyHash(pkh);
+                    results.push((taddr.encode(&network), 0u8));
+                }
+                unified::Receiver::P2sh(sh) => {
+                    let taddr = TransparentAddress::ScriptHash(sh);
+                    results.push((taddr.encode(&network), 0u8));
+                }
+                unified::Receiver::Sapling(s) => {
+                    let saddr = sapling_crypto::PaymentAddress::from_bytes(&s).unwrap();
+                    results.push((saddr.encode(&network), 1u8));
+                }
+                unified::Receiver::Orchard(o) => {
+                    let oaddr = orchard::Address::from_raw_address_bytes(&o)
+                        .into_option()
+                        .unwrap();
+                    let oaddr_ua =
+                        UnifiedAddress::from_receivers(Some(oaddr), None, None, None, None)
+                            .unwrap();
+                    results.push((oaddr_ua.encode(&network), 2u8));
+                }
+                _ => {}
+            }
+        }
+        if results.is_empty() {
+            anyhow::bail!("Address has no recognizable receivers");
+        }
+        return Ok(results);
+    }
+
+    // Fallback: single-pool address (transparent, sapling)
+    let zaddr =
+        ZcashAddress::try_from_encoded(addr).map_err(|e| anyhow!("Invalid address: {e}"))?;
+    // A TEX address is paid, and its output stored, as the plain P2PKH address it wraps.
+    if let Ok(zcash_keys::address::Address::Tex(data)) =
+        zaddr.clone().convert_if_network(network.network_type())
+    {
+        return Ok(vec![(
+            TransparentAddress::PublicKeyHash(data).encode(network),
+            0u8,
+        )]);
+    }
+    let pool = if zaddr.can_receive_as(PoolType::Transparent) {
+        0u8
+    } else if zaddr.can_receive_as(PoolType::Shielded(ShieldedPool::Sapling)) {
+        1u8
+    } else if zaddr.can_receive_as(PoolType::Shielded(ShieldedPool::Orchard)) {
+        2u8
+    } else {
+        anyhow::bail!("Unrecognized address pool");
+    };
+    Ok(vec![(addr.to_string(), pool)])
+}
+
 async fn store_output(
     connection: &mut SqliteConnection,
     account: u32,

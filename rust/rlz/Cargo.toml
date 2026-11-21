@@ -30,8 +30,8 @@ rand = "0.10"
 rand_core = "0.10"
 rand_core_legacy = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 
-hickory-proto = "0.24"
-hickory-resolver = {version = "0.24", features = ["dnssec-ring"]}
+hickory-proto = "0.26"
+hickory-resolver = {version = "0.26", features = ["dnssec-ring"]}
 thiserror = "2.0"
 
 hmac = "0.12"

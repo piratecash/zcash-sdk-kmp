@@ -36,6 +36,7 @@ internal interface SyncBackend {
         actionsPerSync: Int,
         transparentLimit: Int,
         checkpointAge: Int,
+        blockDownload: BlockDownload,
     )
 
     suspend fun progress(): SyncProgress?
@@ -52,6 +53,7 @@ internal fun syncFlow(
     actionsPerSync: Int,
     transparentLimit: Int,
     checkpointAge: Int,
+    blockDownload: BlockDownload,
     mutex: Mutex,
     backend: SyncBackend,
 ): Flow<SyncState> = flow {
@@ -68,7 +70,15 @@ internal fun syncFlow(
     mutex.withLock {
         backend.onStart()
         val result = try {
-            runNativeSync(accountIds, target, actionsPerSync, transparentLimit, checkpointAge, backend)
+            runNativeSync(
+                accountIds,
+                target,
+                actionsPerSync,
+                transparentLimit,
+                checkpointAge,
+                blockDownload,
+                backend,
+            )
         } finally {
             backend.onFinish()
         }
@@ -88,10 +98,18 @@ private suspend fun FlowCollector<SyncState>.runNativeSync(
     actionsPerSync: Int,
     transparentLimit: Int,
     checkpointAge: Int,
+    blockDownload: BlockDownload,
     backend: SyncBackend,
 ): NativeSyncResult = supervisorScope {
     val native = async {
-        backend.synchronize(accountIds, target, actionsPerSync, transparentLimit, checkpointAge)
+        backend.synchronize(
+            accountIds,
+            target,
+            actionsPerSync,
+            transparentLimit,
+            checkpointAge,
+            blockDownload,
+        )
     }
     var madeProgress = false
     while (native.isActive) {
@@ -200,6 +218,8 @@ public data class TransparentCoverage(
     val trim: Long,
 )
 
+private fun Int.indexOrNull(): Int? = takeIf { it >= 0 }
+
 private fun parseNextUnusedAddress(marshalled: String): NextUnusedAddress {
     val (address, certified, gap) = marshalled.split('\n')
     return NextUnusedAddress(address = address, certified = certified.toBoolean(), gap = gap.toInt())
@@ -248,6 +268,7 @@ public class ZcashWallet private constructor(
             actionsPerSync: Int,
             transparentLimit: Int,
             checkpointAge: Int,
+            blockDownload: BlockDownload,
         ) {
             withNative {
                 ZcashJni.synchronize(
@@ -258,6 +279,8 @@ public class ZcashWallet private constructor(
                     transparentLimit,
                     checkpointAge,
                     false,
+                    blockDownload.maxStreams,
+                    blockDownload.bufferMegabytes,
                 )
             }
         }
@@ -347,8 +370,8 @@ public class ZcashWallet private constructor(
         withNative { ZcashJni.nextTransparentAddress(handle, id) }
 
     /**
-     * The lowest receive-scope address of [id] the SDK has no history for and that is not in
-     * [excluded], or `null` when the account has no transparent key.
+     * The lowest receive-scope address of [id] above [minIndexExclusive] the SDK has no history for
+     * and that is not in [excluded], or `null` when the account has no transparent key.
      *
      * [excluded] is a caller contract: an address handed out and not yet paid to has no history,
      * so only the caller's list keeps it out of the answer. The address [addresses] reports stays
@@ -357,11 +380,38 @@ public class ZcashWallet private constructor(
     public suspend fun nextUnusedTransparentAddress(
         id: Int,
         excluded: List<String>,
-    ): NextUnusedAddress? =
-        withNative {
-            ZcashJni.nextUnusedTransparentAddress(handle, id, excluded.joinToString("\n"))
-                ?.let(::parseNextUnusedAddress)
+        minIndexExclusive: Int? = null,
+    ): NextUnusedAddress? {
+        // The highest non-hardened index is Int.MAX_VALUE, so a floor there leaves nothing above it.
+        require(minIndexExclusive == null || minIndexExclusive in 0 until Int.MAX_VALUE) {
+            "Index floor must be in 0 until ${Int.MAX_VALUE}: $minIndexExclusive"
         }
+        return withNative {
+            ZcashJni.nextUnusedTransparentAddress(
+                handle,
+                id,
+                excluded.joinToString("\n"),
+                minIndexExclusive ?: -1,
+            )?.let(::parseNextUnusedAddress)
+        }
+    }
+
+    /** The highest receive-scope index stored for [id], used or not, or `null` when none is. */
+    public suspend fun highestStoredTransparentAddressIndex(id: Int): Int? =
+        withNative { ZcashJni.highestStoredTransparentAddressIndex(handle, id).indexOrNull() }
+
+    /** The highest receive-scope index of [id] with history in the local database, or `null` if none has. */
+    public suspend fun highestUsedTransparentAddressIndex(id: Int): Int? =
+        withNative { ZcashJni.highestUsedTransparentAddressIndex(handle, id).indexOrNull() }
+
+    /**
+     * Stores every receive-scope address of [id] above the highest stored index through [index], in
+     * one transaction, so sync polls them. Returns how many were created; 0 when they exist already.
+     */
+    public suspend fun reserveTransparentAddressesThrough(id: Int, index: Int): Int {
+        require(index >= 0) { "Index must not be negative: $index" }
+        return withNative { ZcashJni.reserveTransparentAddressesThrough(handle, id, index) }
+    }
 
     /** How far [id]'s transparent address space has been swept. Allocates nothing. */
     public suspend fun transparentCoverage(id: Int): TransparentCoverage =
@@ -383,7 +433,7 @@ public class ZcashWallet private constructor(
      */
     public suspend fun transparentAddressIndex(id: Int, address: String): Int? {
         require(address.isNotBlank()) { "Address must not be blank" }
-        return withNative { ZcashJni.transparentAddressIndex(handle, id, address).takeIf { it >= 0 } }
+        return withNative { ZcashJni.transparentAddressIndex(handle, id, address).indexOrNull() }
     }
 
     /**
@@ -403,6 +453,27 @@ public class ZcashWallet private constructor(
         val endHeight = latestHeight()
         return withNative {
             ZcashJni.discoverTransparentAddresses(handle, id, endHeight, gapLimit, concurrency)
+        }
+    }
+
+    /**
+     * Probes every index in `[fromIndex, toIndex)` of both of [id]'s transparent scopes, with no gap
+     * limit, and stores those the server knows a transaction for, as [discoverTransparentAddresses]
+     * does. Returns how many stored addresses in that range have history — read back after the
+     * walk, so retrying a range that failed half-way reports its full count.
+     */
+    public suspend fun discoverTransparentAddressRange(
+        id: Int,
+        fromIndex: Int,
+        toIndex: Int,
+        concurrency: Int = DEFAULT_DISCOVERY_CONCURRENCY,
+    ): Int {
+        require(fromIndex in 0 until toIndex) {
+            "Range [$fromIndex, $toIndex) must be non-empty and non-negative"
+        }
+        val endHeight = latestHeight()
+        return withNative {
+            ZcashJni.discoverTransparentAddressRange(handle, id, endHeight, fromIndex, toIndex, concurrency)
         }
     }
 
@@ -584,7 +655,8 @@ public class ZcashWallet private constructor(
     }
 
     /**
-     * Reserves wallet-owned inputs before a caller starts network I/O. Idempotent for the same tx.
+     * Reserves wallet-owned inputs before a caller broadcasts, reading the chain tip only when the
+     * tx spends this account's inputs. Idempotent for the same tx.
      * Pass `requireOwnInputs = false` for a transaction of unknown origin: it then reserves nothing
      * instead of being refused for spending no input of this account.
      */
@@ -594,6 +666,19 @@ public class ZcashWallet private constructor(
         requireOwnInputs: Boolean = true,
     ): Unit = withNative {
         ZcashJni.reserveForBroadcast(handle, account, rawTransaction, requireOwnInputs)
+    }
+
+    /**
+     * Remembers the [addresses] [rawTransaction] pays, so history shows them instead of the single
+     * receiver the chain reveals. Only a send from this device can know them: a restored wallet cannot.
+     */
+    public suspend fun rememberSentAddresses(
+        account: Int,
+        rawTransaction: ByteArray,
+        addresses: List<String>,
+    ): Unit {
+        require(addresses.none(String::isBlank)) { "Sent addresses must not be blank" }
+        withNative { ZcashJni.rememberSentAddresses(handle, account, rawTransaction, encodeAddresses(addresses)) }
     }
 
     /** Hands [rawTransaction] to the node and reports its verdict without interpreting it. */
@@ -661,11 +746,13 @@ public class ZcashWallet private constructor(
         actionsPerSync: Int = DEFAULT_ACTIONS_PER_SYNC,
         transparentLimit: Int = DEFAULT_TRANSPARENT_LIMIT,
         checkpointAge: Int = DEFAULT_CHECKPOINT_AGE,
+        blockDownload: BlockDownload = BlockDownload(),
     ): Flow<SyncState> = syncFlow(
         accountIds = accountIds,
         actionsPerSync = actionsPerSync,
         transparentLimit = transparentLimit,
         checkpointAge = checkpointAge,
+        blockDownload = blockDownload,
         mutex = ZcashSdk.syncMutex,
         backend = syncBackend,
     )
