@@ -21,11 +21,12 @@ use jni::sys::{jboolean, jbyte, jint, jlong};
 use jni::{Env, EnvUnowned};
 use rlz::api::account::{
     address_kind, address_receivers, addresses_from_key, delete_account, derive_unified_address,
-    generate_next_receive_address, get_account_pools, get_account_ufvk, list_accounts,
-    list_tx_history, new_account, next_unused_receive_address, orchard_only_address,
-    receivers_from_ua, receivers_of, transparent_address_balance, transparent_address_of_tex,
-    transparent_coverage, transparent_receive_index, ua_from_ufvk, unified_address, AddressKind,
-    NewAccount,
+    generate_next_receive_address, get_account_pools, get_account_ufvk,
+    highest_stored_receive_index, highest_used_receive_index, list_accounts, list_tx_history,
+    new_account, next_unused_receive_address, orchard_only_address, receivers_from_ua,
+    receivers_of, reserve_receive_addresses_through, transparent_address_balance,
+    transparent_address_of_tex, transparent_coverage, transparent_receive_index, ua_from_ufvk,
+    unified_address, AddressKind, NewAccount,
 };
 use rlz::api::coin::{database_stats, init_datadir, Coin};
 use rlz::api::key::{
@@ -43,7 +44,7 @@ use rlz::api::pay::{
 };
 use rlz::api::sapling::set_legacy_params_dir;
 use rlz::api::sqlite_log::{describe, record};
-use rlz::api::sweep::discover_transparent_addresses;
+use rlz::api::sweep::{discover_transparent_address_range, discover_transparent_addresses};
 use rlz::api::sync::{balance_breakdown, cancel_sync, max_spendable_from_pools};
 use rlz::net::network_stats;
 use rlz::pay::pool::ALL_POOLS;
@@ -628,8 +629,9 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_nextTransparentAddress<'local>
         .resolve::<ThrowNativeError>()
 }
 
-/// The lowest receive-scope transparent address that is neither used nor excluded, as
-/// `"{address}\n{certified}\n{gap}"`; `null` when the account has no transparent key.
+/// The lowest receive-scope transparent address above `min_index_exclusive` (none when negative)
+/// that is neither used nor excluded, as `"{address}\n{certified}\n{gap}"`; `null` when the
+/// account has no transparent key.
 ///
 /// `excluded` crosses as one newline-joined string: which addresses have already been handed out
 /// and not yet seen used is knowledge only the caller has.
@@ -640,6 +642,7 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_nextUnusedTransparentAddress<'
     handle: jlong,
     account: jint,
     excluded: JString<'local>,
+    min_index_exclusive: jint,
 ) -> JString<'local> {
     unowned_env
         .with_env(|env| -> Result<JString<'local>, BridgeError> {
@@ -651,7 +654,9 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_nextUnusedTransparentAddress<'
                 .map(str::to_owned)
                 .collect();
 
-            match runtime().block_on(next_unused_receive_address(excluded, &coin))? {
+            let floor = u32::try_from(min_index_exclusive).ok();
+
+            match runtime().block_on(next_unused_receive_address(excluded, floor, &coin))? {
                 Some(answer) => Ok(env.new_string(&format!(
                     "{}\n{}\n{}",
                     answer.address, answer.certified, answer.gap
@@ -717,7 +722,65 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_transparentAddressIndex<'local
             let coin = wallet_account(handle, account)?;
             let address = address.try_to_string(env)?;
             let index = runtime().block_on(transparent_receive_index(&coin, &address))?;
-            Ok(index.and_then(|i| jint::try_from(i).ok()).unwrap_or(-1))
+            Ok(index_or_minus_one(index))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+fn index_or_minus_one(index: Option<u32>) -> jint {
+    index.and_then(|i| jint::try_from(i).ok()).unwrap_or(-1)
+}
+
+/// Highest receive-scope index stored for the account, used or not; -1 when none is.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_highestStoredTransparentAddressIndex<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+) -> jint {
+    unowned_env
+        .with_env(|_env| -> Result<jint, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let index = runtime().block_on(highest_stored_receive_index(&coin))?;
+            Ok(index_or_minus_one(index))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Highest receive-scope index of the account with history in the database; -1 when none has any.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_highestUsedTransparentAddressIndex<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+) -> jint {
+    unowned_env
+        .with_env(|_env| -> Result<jint, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let index = runtime().block_on(highest_used_receive_index(&coin))?;
+            Ok(index_or_minus_one(index))
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Stores every receive-scope address above the highest stored one through `index`. Returns how
+/// many it created.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_reserveTransparentAddressesThrough<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    index: jint,
+) -> jint {
+    unowned_env
+        .with_env(|_env| -> Result<jint, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let created =
+                runtime().block_on(reserve_receive_addresses_through(index as u32, &coin))?;
+            Ok(created as jint)
         })
         .resolve::<ThrowNativeError>()
 }
@@ -757,6 +820,34 @@ pub extern "system" fn Java_cash_p_zcash_ZcashJni_discoverTransparentAddresses<'
                 &coin,
             ))?;
             Ok(added as jint)
+        })
+        .resolve::<ThrowNativeError>()
+}
+
+/// Probes every index in `[from_index, to_index)` of both scopes, storing the addresses the server
+/// knows a transaction for. Returns how many stored addresses in that range have history.
+#[no_mangle]
+pub extern "system" fn Java_cash_p_zcash_ZcashJni_discoverTransparentAddressRange<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+    account: jint,
+    end_height: jint,
+    from_index: jint,
+    to_index: jint,
+    concurrency: jint,
+) -> jint {
+    unowned_env
+        .with_env(|_env| -> Result<jint, BridgeError> {
+            let coin = wallet_account(handle, account)?;
+            let found = runtime().block_on(discover_transparent_address_range(
+                end_height as u32,
+                from_index as u32,
+                to_index as u32,
+                concurrency_arg(concurrency),
+                &coin,
+            ))?;
+            Ok(found as jint)
         })
         .resolve::<ThrowNativeError>()
 }

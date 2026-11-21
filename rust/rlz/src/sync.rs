@@ -14,10 +14,10 @@ use crate::api::sync::{CANCEL_SYNC, SYNCING};
 use crate::budget::merge_pending_txs;
 
 use crate::db::{
-    advance_backfilled_height, highest_stored_dindex, raise_catch_up_debt, store_block_header,
-    taddress_scope_dindex, transparent_address_is_used, transparent_address_row,
-    transparent_addresses_to_scan, transparent_backfilled_height, transparent_incarnation,
-    transparent_trim_counter, write_transparent_coverage,
+    advance_backfilled_height, count_used_transparent_addresses, highest_stored_dindex,
+    raise_catch_up_debt, store_block_header, taddress_scope_dindex, transparent_address_is_used,
+    transparent_address_row, transparent_addresses_to_scan, transparent_backfilled_height,
+    transparent_incarnation, transparent_trim_counter, write_transparent_coverage,
 };
 use crate::io::SyncHeight;
 use crate::net::{is_nym_url, STREAM_STATS};
@@ -2081,6 +2081,102 @@ pub async fn discover_transparent_addresses(
     progress_fn: impl Fn(String),
     cancellation_token: CancellationToken,
 ) -> Result<u32> {
+    walk_transparent_addresses(
+        network,
+        connection,
+        client,
+        account,
+        end_height,
+        WalkExtent::GapLimit(gap_limit),
+        concurrency,
+        progress_fn,
+        cancellation_token,
+    )
+    .await
+}
+
+/// [`discover_transparent_addresses`] over every index in `[from, to)` of both scopes, with no gap
+/// stop and no coverage record. Returns how many stored addresses in that range have history,
+/// read back after the walk, so a retry of a half-failed range reports everything it holds.
+#[allow(clippy::too_many_arguments)]
+pub async fn discover_transparent_address_range(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    end_height: u32,
+    from: u32,
+    to: u32,
+    concurrency: u32,
+    cancellation_token: CancellationToken,
+) -> Result<u32> {
+    walk_transparent_addresses(
+        network,
+        connection,
+        client,
+        account,
+        end_height,
+        WalkExtent::Range { from, to },
+        concurrency,
+        |_| {},
+        cancellation_token,
+    )
+    .await?;
+    count_used_transparent_addresses(connection, account, from, to).await
+}
+
+/// Which indexes of each scope a discovery walk visits.
+#[derive(Clone, Copy)]
+enum WalkExtent {
+    /// From 0 until more than `gap_limit` never-stored indexes in a row, and through every stored
+    /// one. Only this walk certifies coverage: it is the one that starts at the bottom.
+    GapLimit(u32),
+    /// Every index in `[from, to)`.
+    Range { from: u32, to: u32 },
+}
+
+impl WalkExtent {
+    fn first(self) -> u32 {
+        match self {
+            WalkExtent::GapLimit(_) => 0,
+            WalkExtent::Range { from, .. } => from,
+        }
+    }
+
+    fn reaches(self, dindex: u32, gap: u32, stored_through: Option<u32>) -> bool {
+        match self {
+            // A wider earlier walk can have stored an address past where this gap would stop;
+            // leaving it unvisited would let the run certify coverage for history it never checked.
+            WalkExtent::GapLimit(gap_limit) => {
+                gap <= gap_limit || stored_through.is_some_and(|last| dindex <= last)
+            }
+            WalkExtent::Range { to, .. } => dindex < to,
+        }
+    }
+
+    /// How many indexes from `dindex` on the sequential walk is certain to reach.
+    fn certain(self, dindex: u32, gap: u32, stored_through: Option<u32>) -> u32 {
+        match self {
+            WalkExtent::GapLimit(gap_limit) => gap_limit.saturating_add(1).saturating_sub(gap).max(
+                stored_through.map_or(0, |last| last.saturating_add(1).saturating_sub(dindex)),
+            ),
+            WalkExtent::Range { to, .. } => to.saturating_sub(dindex),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn walk_transparent_addresses(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+    end_height: u32,
+    extent: WalkExtent,
+    concurrency: u32,
+    progress_fn: impl Fn(String),
+    cancellation_token: CancellationToken,
+) -> Result<u32> {
     // The identity every later check compares against and the key material the walk derives from
     // must come from one guarded read: a delete plus a restore between them would leave the walk
     // deriving addresses from the old account's key while every check passes against the new one.
@@ -2122,21 +2218,19 @@ pub async fn discover_transparent_addresses(
     let mut width = concurrency.clamp(1, MAX_DISCOVERY_CONCURRENCY);
 
     for scope in 0..2 {
-        // A wider earlier walk can have stored an address past where this gap would stop; leaving
-        // it unvisited would let the run certify coverage for history it never checked.
         let stored_through = stored_through[scope as usize];
-        let mut dindex = 0;
+        let mut dindex = extent.first();
         let mut gap = 0;
-        while gap <= gap_limit || stored_through.is_some_and(|last| dindex <= last) {
+        while extent.reaches(dindex, gap, stored_through) {
             if cancellation_token.is_cancelled() {
                 anyhow::bail!("transparent discovery cancelled");
             }
 
             // Plan over the indexes the sequential walk is certain to reach from here, so a batch
             // never requests an address that walk would not have asked for.
-            let certain = gap_limit.saturating_add(1).saturating_sub(gap).max(
-                stored_through.map_or(0, |last| last.saturating_add(1).saturating_sub(dindex)),
-            );
+            let certain = extent.certain(dindex, gap, stored_through);
+            // An empty plan would never advance `dindex`: the walk would spin instead of ending.
+            debug_assert!(certain > 0, "a reached index must be planned");
             let mut batch: Vec<BatchEntry> = vec![];
             let mut requests = 0;
             while (batch.len() as u32) < certain && requests < width {
@@ -2339,7 +2433,9 @@ pub async fn discover_transparent_addresses(
     if transparent_trim_counter(connection, account).await? != trim_at_start {
         anyhow::bail!("coverage invalidated by a trim during the walk");
     }
-    write_transparent_coverage(&mut *connection, account, gap_limit).await?;
+    if let WalkExtent::GapLimit(gap_limit) = extent {
+        write_transparent_coverage(&mut *connection, account, gap_limit).await?;
+    }
 
     Ok(n_added)
 }
@@ -7846,6 +7942,144 @@ mod tests {
         );
     }
 
+    async fn discover_range_against(
+        connection: &mut SqliteConnection,
+        account: u32,
+        from: u32,
+        to: u32,
+        server: ScriptedServer,
+    ) -> Result<u32> {
+        let mut client: Client = Box::new(server);
+        discover_transparent_address_range(
+            &Network::Main,
+            connection,
+            &mut client,
+            account,
+            2_000_100,
+            from,
+            to,
+            MAX_DISCOVERY_CONCURRENCY,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn stored_rows(connection: &mut SqliteConnection, account: u32) -> Vec<(u32, u32)> {
+        sqlx::query_as(
+            "SELECT scope, dindex FROM transparent_address_accounts
+            WHERE account = ? ORDER BY scope, dindex",
+        )
+        .bind(account)
+        .fetch_all(connection)
+        .await
+        .expect("rows")
+    }
+
+    async fn funded_at_receive(
+        connection: &mut SqliteConnection,
+        account: u32,
+        dindex: u32,
+        server: &ScriptedServer,
+    ) {
+        let taddr = taddress_at(connection, account, 0, dindex).await;
+        server.always(
+            &taddr,
+            Reply::Funded {
+                height: 2_000_050,
+                after: Duration::ZERO,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_finds_an_address_past_what_the_gap_limit_reaches() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let server = ScriptedServer::default();
+        funded_at_receive(&mut connection, account, 1000, &server).await;
+
+        discover_against(&mut connection, account, 500, 32, server.clone())
+            .await
+            .expect("gap-limited discovery");
+        assert_eq!(stored_rows(&mut connection, account).await, vec![(0, 0)]);
+
+        let found = discover_range_against(&mut connection, account, 500, 1100, server)
+            .await
+            .expect("range discovery");
+
+        assert_eq!(found, 1);
+        assert_eq!(
+            stored_rows(&mut connection, account).await,
+            vec![(0, 0), (0, 1000)],
+            "nothing is stored for the empty indexes"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_probes_exactly_the_range_in_both_scopes() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let server = ScriptedServer::default();
+        let mut expected = vec![];
+        for scope in 0..2 {
+            for dindex in 5..8 {
+                expected.push(taddress_at(&mut connection, account, scope, dindex).await);
+            }
+        }
+
+        discover_range_against(&mut connection, account, 5, 8, server.clone())
+            .await
+            .expect("range discovery");
+
+        let mut probed = server.addresses();
+        probed.sort();
+        expected.sort();
+        assert_eq!(probed, expected);
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_certifies_no_coverage() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+
+        discover_range_against(&mut connection, account, 0, 30, ScriptedServer::default())
+            .await
+            .expect("range discovery");
+
+        let coverage = crate::db::read_transparent_coverage(&mut connection, account)
+            .await
+            .expect("coverage");
+        assert!(!coverage.certified);
+        assert_eq!(coverage.gap, 0);
+    }
+
+    #[tokio::test]
+    async fn discover_transparent_address_range_retried_after_a_failure_reports_the_full_count() {
+        let mut connection = memory_db().await;
+        let account = restored_account(&mut connection).await;
+        let failing = ScriptedServer::default();
+        funded_at_receive(&mut connection, account, 1000, &failing).await;
+        let broken = taddress_at(&mut connection, account, 0, 1050).await;
+        failing.always(&broken, Reply::Fail);
+
+        discover_range_against(&mut connection, account, 990, 1100, failing)
+            .await
+            .expect_err("a probe that keeps failing fails the range");
+        assert_eq!(
+            stored_rows(&mut connection, account).await,
+            vec![(0, 0), (0, 1000)],
+            "the walk stored the find before it failed"
+        );
+
+        let healthy = ScriptedServer::default();
+        funded_at_receive(&mut connection, account, 1000, &healthy).await;
+        let found = discover_range_against(&mut connection, account, 990, 1100, healthy)
+            .await
+            .expect("retry");
+
+        assert_eq!(found, 1);
+    }
+
     /// The account's default address has no backfill marker and its only payment sits below any
     /// window `transparent_sync` would ever request — `transparent_sync` only ever scans
     /// `[start_height, end_height]` forward from the caller, never back to `birth_height`. One
@@ -8704,6 +8938,7 @@ mod tests {
             &mut connection,
             account,
             &[],
+            None,
         )
         .await
         .expect("selector")

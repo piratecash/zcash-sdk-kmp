@@ -218,6 +218,8 @@ public data class TransparentCoverage(
     val trim: Long,
 )
 
+private fun Int.indexOrNull(): Int? = takeIf { it >= 0 }
+
 private fun parseNextUnusedAddress(marshalled: String): NextUnusedAddress {
     val (address, certified, gap) = marshalled.split('\n')
     return NextUnusedAddress(address = address, certified = certified.toBoolean(), gap = gap.toInt())
@@ -368,8 +370,8 @@ public class ZcashWallet private constructor(
         withNative { ZcashJni.nextTransparentAddress(handle, id) }
 
     /**
-     * The lowest receive-scope address of [id] the SDK has no history for and that is not in
-     * [excluded], or `null` when the account has no transparent key.
+     * The lowest receive-scope address of [id] above [minIndexExclusive] the SDK has no history for
+     * and that is not in [excluded], or `null` when the account has no transparent key.
      *
      * [excluded] is a caller contract: an address handed out and not yet paid to has no history,
      * so only the caller's list keeps it out of the answer. The address [addresses] reports stays
@@ -378,11 +380,38 @@ public class ZcashWallet private constructor(
     public suspend fun nextUnusedTransparentAddress(
         id: Int,
         excluded: List<String>,
-    ): NextUnusedAddress? =
-        withNative {
-            ZcashJni.nextUnusedTransparentAddress(handle, id, excluded.joinToString("\n"))
-                ?.let(::parseNextUnusedAddress)
+        minIndexExclusive: Int? = null,
+    ): NextUnusedAddress? {
+        // The highest non-hardened index is Int.MAX_VALUE, so a floor there leaves nothing above it.
+        require(minIndexExclusive == null || minIndexExclusive in 0 until Int.MAX_VALUE) {
+            "Index floor must be in 0 until ${Int.MAX_VALUE}: $minIndexExclusive"
         }
+        return withNative {
+            ZcashJni.nextUnusedTransparentAddress(
+                handle,
+                id,
+                excluded.joinToString("\n"),
+                minIndexExclusive ?: -1,
+            )?.let(::parseNextUnusedAddress)
+        }
+    }
+
+    /** The highest receive-scope index stored for [id], used or not, or `null` when none is. */
+    public suspend fun highestStoredTransparentAddressIndex(id: Int): Int? =
+        withNative { ZcashJni.highestStoredTransparentAddressIndex(handle, id).indexOrNull() }
+
+    /** The highest receive-scope index of [id] with history in the local database, or `null` if none has. */
+    public suspend fun highestUsedTransparentAddressIndex(id: Int): Int? =
+        withNative { ZcashJni.highestUsedTransparentAddressIndex(handle, id).indexOrNull() }
+
+    /**
+     * Stores every receive-scope address of [id] above the highest stored index through [index], in
+     * one transaction, so sync polls them. Returns how many were created; 0 when they exist already.
+     */
+    public suspend fun reserveTransparentAddressesThrough(id: Int, index: Int): Int {
+        require(index >= 0) { "Index must not be negative: $index" }
+        return withNative { ZcashJni.reserveTransparentAddressesThrough(handle, id, index) }
+    }
 
     /** How far [id]'s transparent address space has been swept. Allocates nothing. */
     public suspend fun transparentCoverage(id: Int): TransparentCoverage =
@@ -404,7 +433,7 @@ public class ZcashWallet private constructor(
      */
     public suspend fun transparentAddressIndex(id: Int, address: String): Int? {
         require(address.isNotBlank()) { "Address must not be blank" }
-        return withNative { ZcashJni.transparentAddressIndex(handle, id, address).takeIf { it >= 0 } }
+        return withNative { ZcashJni.transparentAddressIndex(handle, id, address).indexOrNull() }
     }
 
     /**
@@ -424,6 +453,27 @@ public class ZcashWallet private constructor(
         val endHeight = latestHeight()
         return withNative {
             ZcashJni.discoverTransparentAddresses(handle, id, endHeight, gapLimit, concurrency)
+        }
+    }
+
+    /**
+     * Probes every index in `[fromIndex, toIndex)` of both of [id]'s transparent scopes, with no gap
+     * limit, and stores those the server knows a transaction for, as [discoverTransparentAddresses]
+     * does. Returns how many stored addresses in that range have history — read back after the
+     * walk, so retrying a range that failed half-way reports its full count.
+     */
+    public suspend fun discoverTransparentAddressRange(
+        id: Int,
+        fromIndex: Int,
+        toIndex: Int,
+        concurrency: Int = DEFAULT_DISCOVERY_CONCURRENCY,
+    ): Int {
+        require(fromIndex in 0 until toIndex) {
+            "Range [$fromIndex, $toIndex) must be non-empty and non-negative"
+        }
+        val endHeight = latestHeight()
+        return withNative {
+            ZcashJni.discoverTransparentAddressRange(handle, id, endHeight, fromIndex, toIndex, concurrency)
         }
     }
 

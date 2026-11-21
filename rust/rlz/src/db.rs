@@ -2357,22 +2357,65 @@ pub async fn transparent_address_is_used(
     account: u32,
     address: &str,
 ) -> Result<bool> {
-    let used: bool = sqlx::query_scalar(
-        "WITH n AS (
-        SELECT account, taddress FROM notes WHERE pool = 0 UNION ALL
-        SELECT n.account, n.taddress FROM spends s JOIN notes n ON s.id_note = n.id_note AND s.account = n.account WHERE s.pool = 0)
+    let used: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "{TRANSPARENT_ACTIVITY}
         SELECT EXISTS(
         SELECT 1 FROM transparent_address_accounts ta
-        WHERE ta.account = ?1 AND ta.address = ?2
-        AND (ta.seen_used OR EXISTS(
-            SELECT 1 FROM n WHERE n.account = ta.account AND n.taddress = ta.id_taddress)))",
-    )
+        WHERE ta.account = ?1 AND ta.address = ?2 AND {TRANSPARENT_ROW_IS_USED})"
+    )))
     .bind(account)
     .bind(address)
     .fetch_one(&mut *connection)
     .await?;
 
     Ok(used)
+}
+
+/// The notes-union-spends CTE `n` that [`TRANSPARENT_ROW_IS_USED`] reads.
+const TRANSPARENT_ACTIVITY: &str = "WITH n AS (
+        SELECT account, taddress FROM notes WHERE pool = 0 UNION ALL
+        SELECT n.account, n.taddress FROM spends s JOIN notes n ON s.id_note = n.id_note AND s.account = n.account WHERE s.pool = 0)";
+
+/// [`transparent_address_is_used`]'s definition of "used", for a row aliased `ta`.
+const TRANSPARENT_ROW_IS_USED: &str = "(ta.seen_used OR EXISTS(
+            SELECT 1 FROM n WHERE n.account = ta.account AND n.taddress = ta.id_taddress))";
+
+/// The highest receive-scope index of `account` that [`transparent_address_is_used`] calls used.
+pub async fn highest_used_receive_dindex(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<Option<u32>> {
+    let highest: Option<u32> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "{TRANSPARENT_ACTIVITY}
+        SELECT MAX(ta.dindex) FROM transparent_address_accounts ta
+        WHERE ta.account = ?1 AND ta.scope = 0 AND {TRANSPARENT_ROW_IS_USED}"
+    )))
+    .bind(account)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(highest)
+}
+
+/// How many stored addresses of `account`, in either scope, with a dindex in `[from, to)` are used.
+pub async fn count_used_transparent_addresses(
+    connection: &mut SqliteConnection,
+    account: u32,
+    from: u32,
+    to: u32,
+) -> Result<u32> {
+    let count: u32 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "{TRANSPARENT_ACTIVITY}
+        SELECT COUNT(*) FROM transparent_address_accounts ta
+        WHERE ta.account = ?1 AND ta.dindex >= ?2 AND ta.dindex < ?3 AND {TRANSPARENT_ROW_IS_USED}"
+    )))
+    .bind(account)
+    .bind(from)
+    .bind(to)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(count)
 }
 
 pub async fn fetch_transparent_address_tx_count(
@@ -4270,6 +4313,73 @@ pub(crate) mod tests {
             !transparent_address_is_used(&mut connection, ACCOUNT, "t1never")
                 .await
                 .expect("used")
+        );
+    }
+
+    #[tokio::test]
+    async fn highest_used_receive_dindex_skips_an_unused_row_that_highest_stored_dindex_counts() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1paid").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 1, "t1seen").await;
+        insert_scoped_taddress(&mut connection, 3, 0, 2, "t1unused").await;
+        insert_scoped_taddress(&mut connection, 4, 1, 7, "t1change").await;
+        insert_transparent_note(&mut connection, 1, 100, 1).await;
+        insert_transparent_note(&mut connection, 2, 100, 4).await;
+        sqlx::query(
+            "UPDATE transparent_address_accounts SET seen_used = TRUE WHERE id_taddress = 2",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("flag");
+
+        assert_eq!(
+            highest_stored_dindex(&mut connection, ACCOUNT, 0)
+                .await
+                .expect("stored"),
+            Some(2)
+        );
+        assert_eq!(
+            highest_used_receive_dindex(&mut connection, ACCOUNT)
+                .await
+                .expect("used"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn highest_used_receive_dindex_without_history_is_none() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 0, "t1unused").await;
+
+        assert_eq!(
+            highest_used_receive_dindex(&mut connection, ACCOUNT)
+                .await
+                .expect("used"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn count_used_transparent_addresses_counts_both_scopes_inside_the_range_only() {
+        let mut connection = memory_db().await;
+        insert_account(&mut connection, 0).await;
+        insert_scoped_taddress(&mut connection, 1, 0, 4, "t1below").await;
+        insert_scoped_taddress(&mut connection, 2, 0, 5, "t1first").await;
+        insert_scoped_taddress(&mut connection, 3, 1, 9, "t1change").await;
+        insert_scoped_taddress(&mut connection, 4, 0, 8, "t1unused").await;
+        insert_scoped_taddress(&mut connection, 5, 0, 10, "t1end").await;
+        for (id_note, id_taddress) in [(1, 1), (2, 2), (3, 3), (4, 5)] {
+            insert_transparent_note(&mut connection, id_note, 100, id_taddress).await;
+        }
+        spend_note(&mut connection, 2, 0, 110).await;
+
+        assert_eq!(
+            count_used_transparent_addresses(&mut connection, ACCOUNT, 5, 10)
+                .await
+                .expect("count"),
+            2
         );
     }
 

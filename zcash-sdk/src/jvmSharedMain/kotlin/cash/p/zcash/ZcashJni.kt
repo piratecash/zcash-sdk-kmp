@@ -65,11 +65,25 @@ internal object ZcashJni {
     external fun nextTransparentAddress(handle: Long, account: Int): String?
 
     /**
-     * The lowest receive-scope address that is neither used nor in [excluded], as
-     * `"{address}\n{certified}\n{gap}"`; `null` when the account has no transparent key.
-     * [excluded] crosses newline-joined.
+     * The lowest receive-scope address above [minIndexExclusive] (none when negative) that is neither
+     * used nor in [excluded], as `"{address}\n{certified}\n{gap}"`; `null` when the account has no
+     * transparent key. [excluded] crosses newline-joined.
      */
-    external fun nextUnusedTransparentAddress(handle: Long, account: Int, excluded: String): String?
+    external fun nextUnusedTransparentAddress(
+        handle: Long,
+        account: Int,
+        excluded: String,
+        minIndexExclusive: Int,
+    ): String?
+
+    /** Highest receive-scope index stored for the account; -1 when none is. */
+    external fun highestStoredTransparentAddressIndex(handle: Long, account: Int): Int
+
+    /** Highest receive-scope index of the account with history in the database; -1 when none has any. */
+    external fun highestUsedTransparentAddressIndex(handle: Long, account: Int): Int
+
+    /** Stores every receive-scope address above the highest stored one through [index]; returns how many. */
+    external fun reserveTransparentAddressesThrough(handle: Long, account: Int, index: Int): Int
 
     /** How far the account's transparent space has been swept, as `"{certified}\n{gap}\n{trim}"`. */
     external fun transparentCoverage(handle: Long, account: Int): String
@@ -86,6 +100,16 @@ internal object ZcashJni {
         account: Int,
         endHeight: Int,
         gapLimit: Int,
+        concurrency: Int,
+    ): Int
+
+    /** Probes every index in `[fromIndex, toIndex)` of both scopes. Returns how many stored there have history. */
+    external fun discoverTransparentAddressRange(
+        handle: Long,
+        account: Int,
+        endHeight: Int,
+        fromIndex: Int,
+        toIndex: Int,
         concurrency: Int,
     ): Int
 

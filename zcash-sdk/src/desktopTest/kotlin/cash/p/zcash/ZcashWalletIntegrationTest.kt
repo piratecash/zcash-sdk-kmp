@@ -368,6 +368,61 @@ class ZcashWalletIntegrationTest {
     }
 
     @Test
+    fun nextUnusedTransparentAddress_withAFloor_returnsTheIndexPastIt() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        val answer = assertNotNull(wallet.nextUnusedTransparentAddress(id, emptyList(), minIndexExclusive = 5))
+
+        assertEquals(6, wallet.transparentAddressIndex(id, answer.address))
+    }
+
+    @Test
+    fun nextUnusedTransparentAddress_negativeFloor_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> {
+            wallet.nextUnusedTransparentAddress(id, emptyList(), minIndexExclusive = -1)
+        }
+    }
+
+    @Test
+    fun nextUnusedTransparentAddress_floorAtTheLastIndex_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> {
+            wallet.nextUnusedTransparentAddress(id, emptyList(), minIndexExclusive = Int.MAX_VALUE)
+        }
+    }
+
+    @Test
+    fun reserveTransparentAddressesThrough_freshAccount_storesOnlyTheMissingRows() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        assertEquals(0, wallet.highestStoredTransparentAddressIndex(id))
+
+        assertEquals(3, wallet.reserveTransparentAddressesThrough(id, 3))
+        assertEquals(0, wallet.reserveTransparentAddressesThrough(id, 3))
+
+        assertEquals(3, wallet.highestStoredTransparentAddressIndex(id))
+        assertNull(wallet.highestUsedTransparentAddressIndex(id))
+    }
+
+    @Test
+    fun reserveTransparentAddressesThrough_negativeIndex_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> { wallet.reserveTransparentAddressesThrough(id, -1) }
+    }
+
+    @Test
+    fun discoverTransparentAddressRange_emptyOrNegativeRange_isRejectedBeforeTheNativeCall() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            assertFailsWith<IllegalArgumentException> { wallet.discoverTransparentAddressRange(id, 5, 5) }
+            assertFailsWith<IllegalArgumentException> { wallet.discoverTransparentAddressRange(id, -1, 5) }
+        }
+
+    @Test
     fun transparentCoverage_onAFreshAccount_reportsUncertified() = withWallet { wallet ->
         val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
 
