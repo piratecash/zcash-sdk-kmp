@@ -21,6 +21,8 @@ private const val DEFAULT_CHECKPOINT_AGE = 10_000
 private const val DEFAULT_GAP_LIMIT = 20
 private const val DEFAULT_DISCOVERY_CONCURRENCY = 8
 private const val PROGRESS_SAMPLE_MS = 250L
+/** Healthy servers differ by a few blocks; the app's selector already admits up to nine of lag. */
+private const val STALE_TIP_TOLERANCE = 10
 private const val MEMPOOL_POLL_MS = 500L
 private const val SPEND_AUTH_SIGNATURE_SIZE = 64
 private val logger = Logger.withTag("ZEC")
@@ -59,7 +61,7 @@ internal fun syncFlow(
 ): Flow<SyncState> = flow {
     emit(SyncState.Connecting)
     val target = try {
-        backend.latestHeight()
+        backend.latestHeight().also { target -> checkTargetNotStale(target, accountIds, backend) }
     } catch (error: CancellationException) {
         throw error
     } catch (error: Throwable) {
@@ -86,6 +88,15 @@ internal fun syncFlow(
         logSyncTerminal(terminal, target, result.madeProgress)
     }
 }.distinctUntilChanged()
+
+/** A backend re-syncing from scratch answers a tip far below what this wallet has already scanned. */
+private suspend fun checkTargetNotStale(target: Int, accountIds: List<Int>, backend: SyncBackend) {
+    if (accountIds.isEmpty()) return
+    val synced = backend.syncedHeight(accountIds) ?: return
+    if (target + STALE_TIP_TOLERANCE < synced) {
+        throw ZcashException("Server network tip $target is behind the wallet's $synced")
+    }
+}
 
 private data class NativeSyncResult(
     val error: ZcashException?,

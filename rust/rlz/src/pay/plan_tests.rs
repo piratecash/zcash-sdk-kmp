@@ -301,6 +301,31 @@ async fn plan_transaction_tip_is_last_block_before_nu7_builds_for_nu7() {
     );
 }
 
+/// A backend re-syncing from genesis answers `GetLatestBlock` with a height years old.
+const STALE_SERVER_TIP: u32 = 805_800;
+
+#[tokio::test]
+async fn plan_transaction_server_tip_below_scanned_height_targets_after_scanned_height() {
+    let scanned = NU7_ACTIVATION - 1;
+    let mut connection = memory_db().await;
+    let account = funded_account(&mut connection, scanned, &[50_000]).await;
+    let address = transparent_recipient(&mut connection, account).await;
+
+    let package = plan(
+        &mut connection,
+        &silent_server(&[STALE_SERVER_TIP]),
+        account,
+        Payment::to(address, 10_000),
+    )
+    .await
+    .expect("plan");
+
+    assert_eq!(
+        header_of(&package),
+        (NU7_BRANCH, 6, NU7_ACTIVATION + NU7_EXPIRY_DELTA)
+    );
+}
+
 #[tokio::test]
 async fn plan_transaction_tip_is_last_block_before_nu6_3_pays_the_ua_on_ironwood() {
     let tip = NU6_3_ACTIVATION - 1;
@@ -615,6 +640,25 @@ async fn max_sendable_dust_floor_follows_the_target_height() {
 
         assert_eq!(max, expected, "tip {tip}");
     }
+}
+
+#[tokio::test]
+async fn max_sendable_server_tip_below_scanned_height_uses_scanned_height_fee() {
+    let scanned = FIRST_REDUCED_TARGET - 1;
+    let mut connection = memory_db().await;
+    let account = funded_account(&mut connection, scanned, &[50_000, 999, 1_000]).await;
+    let address = transparent_recipient(&mut connection, account).await;
+    let server = silent_server(&[STALE_SERVER_TIP]);
+
+    let max = quote_max(&mut connection, &server, account, address).await;
+
+    assert_eq!(
+        max,
+        MaxSendable {
+            amount: 49_000,
+            fee: 2_000,
+        }
+    );
 }
 
 #[tokio::test]

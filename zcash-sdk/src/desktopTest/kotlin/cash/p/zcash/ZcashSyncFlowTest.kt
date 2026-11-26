@@ -6,6 +6,7 @@ import co.touchlab.kermit.Severity
 import kotlin.test.Test
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertSame
@@ -104,6 +105,31 @@ class ZcashSyncFlowTest {
         assertEquals(SyncStage.TARGET, thrown.stage)
         assertEquals(failure.message, thrown.message)
         assertSame(failure, thrown.cause)
+    }
+
+    @Test
+    fun syncFlow_serverTipFarBelowSyncedHeight_failsAtTargetStage() = runTest {
+        val backend = FakeSyncBackend(target = LOCAL_HEIGHT - 1_000, heightBeforeSync = LOCAL_HEIGHT)
+
+        val thrown = assertFailsWith<ZcashException> { syncFlowOf(backend).toList() }
+
+        assertEquals(SyncStage.TARGET, thrown.stage)
+        assertEquals(FailureCategory.NETWORK, thrown.category)
+        assertFalse(backend.synchronizeCalled)
+    }
+
+    @Test
+    fun syncFlow_serverTipSlightlyBelowSyncedHeight_syncs() = runTest {
+        val backend = FakeSyncBackend(
+            localHeight = LOCAL_HEIGHT,
+            target = LOCAL_HEIGHT - 5,
+            heightBeforeSync = LOCAL_HEIGHT,
+        )
+
+        val states = syncFlowOf(backend).toList()
+
+        assertTrue(backend.synchronizeCalled)
+        assertEquals(SyncState.Synced, states.last())
     }
 
     @Test
@@ -364,6 +390,8 @@ class ZcashSyncFlowTest {
 
 private class FakeSyncBackend(
     private val localHeight: Int? = TARGET_HEIGHT,
+    private val target: Int = TARGET_HEIGHT,
+    private val heightBeforeSync: Int? = null,
     private val targetFailure: Throwable? = null,
     private val syncFailure: ZcashException? = null,
     private val heightFailure: ZcashException? = null,
@@ -378,9 +406,12 @@ private class FakeSyncBackend(
     var receivedBlockDownload: BlockDownload? = null
         private set
 
+    var synchronizeCalled = false
+        private set
+
     override suspend fun latestHeight(): Int {
         targetFailure?.let { throw it }
-        return TARGET_HEIGHT
+        return target
     }
 
     override suspend fun synchronize(
@@ -391,6 +422,7 @@ private class FakeSyncBackend(
         checkpointAge: Int,
         blockDownload: BlockDownload,
     ) {
+        synchronizeCalled = true
         receivedActionsPerSync = actionsPerSync
         receivedBlockDownload = blockDownload
         delay(syncDelayMs)
@@ -400,6 +432,8 @@ private class FakeSyncBackend(
     override suspend fun progress(): SyncProgress? = progress
 
     override suspend fun syncedHeight(accountIds: List<Int>): Int? {
+        // The read before the sync only guards the target; the height fixtures are about the read after it.
+        if (!synchronizeCalled) return heightBeforeSync
         heightFailure?.let { throw it }
         return localHeight
     }

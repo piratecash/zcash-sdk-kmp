@@ -1555,7 +1555,7 @@ class ZcashWalletIntegrationTest {
         val probe = parseServerProbe(
             """{"chainName":"main","saplingActivationHeight":419200,"consensusBranchId":"c8e71055",""" +
                 """"blockHeight":2800000,"estimatedHeight":2800001,"branchIdMatches":true,""" +
-                """"infoMs":30,"rangeMs":20,"rangeBlocksReceived":10}"""
+                """"infoMs":30,"rangeMs":20,"rangeBlocksReceived":10,"latestHeight":805800}"""
         )
 
         assertEquals(
@@ -1569,6 +1569,7 @@ class ZcashWalletIntegrationTest {
                 infoMs = 30,
                 rangeMs = 20,
                 rangeBlocksReceived = 10,
+                latestHeight = 805_800,
             ),
             probe,
         )

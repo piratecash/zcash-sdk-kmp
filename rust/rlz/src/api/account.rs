@@ -541,6 +541,8 @@ pub struct Tx {
     pub is_change: bool,
     /// The first output that is not ours; absent until transaction details are fetched.
     pub recipient: Option<String>,
+    /// Net ZEC per pool this account touched here, ordered by pool; sums to `value`.
+    pub pool_values: Vec<(u8, i64)>,
 }
 
 pub struct TAddressTxCount {

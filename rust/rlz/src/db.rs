@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::{collections::HashMap, fs::File};
 
 use crate::keys::{SaplingDiversifiedAddress, ScopeExt};
 use anyhow::{anyhow, Result};
@@ -1916,7 +1916,7 @@ pub async fn fetch_txs(connection: &mut SqliteConnection, account: u32) -> Resul
     // join transactions with v by id_tx and filter by account
     // order by height desc to get latest transactions first
     tracing::debug!("fetch_txs: starting for account {}", account);
-    let transactions = sqlx::query(
+    let mut transactions = sqlx::query(
         "SELECT t.id_tx, t.txid, t.height, t.time, t.value, t.tpe, c.name, t.zsa_value, t.price, t.asset_id,
             a.asset_name, a.asset_desc_hash,
             COALESCE(NULLIF(um.user_memo, ''), (SELECT m.memo_text FROM memos m
@@ -1996,12 +1996,48 @@ pub async fn fetch_txs(connection: &mut SqliteConnection, account: u32) -> Resul
             total_received: total_received as u64,
             is_change: received_count > 0 && received_count == change_count,
             recipient,
+            pool_values: Vec::new(),
         }
     })
     .fetch_all(&mut *connection)
     .await?;
+    let mut pool_values = fetch_pool_values(connection, account).await?;
+    for tx in transactions.iter_mut() {
+        tx.pool_values = pool_values.remove(&tx.id).unwrap_or_default();
+    }
     tracing::debug!("fetch_txs: completed with {} txs", transactions.len());
     Ok(transactions)
+}
+
+/// The rows `summarize_tx` sums into `transactions.value`, split by pool.
+async fn fetch_pool_values(
+    connection: &mut SqliteConnection,
+    account: u32,
+) -> Result<HashMap<u32, Vec<(u8, i64)>>> {
+    let rows = sqlx::query(
+        "SELECT tx, pool, SUM(value) FROM (
+            SELECT n.tx, n.pool, n.value FROM notes n
+                WHERE n.account = ?1 AND n.id_asset IS NULL
+            UNION ALL
+            SELECT s.tx, s.pool, s.value FROM spends s JOIN notes n ON n.id_note = s.id_note
+                WHERE s.account = ?1 AND n.id_asset IS NULL)
+        GROUP BY tx, pool ORDER BY tx, pool",
+    )
+    .bind(account)
+    .map(|row: SqliteRow| {
+        (
+            row.get::<u32, _>(0),
+            row.get::<u8, _>(1),
+            row.get::<i64, _>(2),
+        )
+    })
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut by_tx: HashMap<u32, Vec<(u8, i64)>> = HashMap::new();
+    for (tx, pool, value) in rows {
+        by_tx.entry(tx).or_default().push((pool, value));
+    }
+    Ok(by_tx)
 }
 
 pub async fn get_memos(pool: &mut SqliteConnection, account: u32) -> Result<Vec<Memo>> {
@@ -3581,6 +3617,45 @@ pub(crate) mod tests {
         insert_note(&mut connection, 2, TX, 3, 100, 400, Some(0)).await;
 
         assert!(!single_tx(&mut connection).await.is_change);
+    }
+
+    async fn spend_note_in(connection: &mut SqliteConnection, id_note: u32, tx: u32) {
+        sqlx::query(
+            "INSERT INTO spends(id_note, height, account, pool, tx, value)
+             SELECT id_note, height, account, pool, ?2, -value FROM notes WHERE id_note = ?1",
+        )
+        .bind(id_note)
+        .bind(tx)
+        .execute(connection)
+        .await
+        .expect("spend");
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_pool_values_split_a_shielding_by_pool() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, -6_000, 6_000).await;
+        insert_note(&mut connection, 1, TX + 1, 0, 90, 153_400, Some(0)).await;
+        spend_note_in(&mut connection, 1, TX).await;
+        insert_note(&mut connection, 2, TX, 2, 100, 147_400, Some(0)).await;
+
+        let tx = single_tx(&mut connection).await;
+
+        assert_eq!(vec![(0, -153_400), (2, 147_400)], tx.pool_values);
+        assert_eq!(tx.value, tx.pool_values.iter().map(|(_, v)| v).sum::<i64>());
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_pool_values_leave_out_asset_notes() {
+        let mut connection = memory_db().await;
+        insert_tx(&mut connection, TX, 0, 0).await;
+        insert_note(&mut connection, 1, TX, 2, 100, 500, Some(0)).await;
+        sqlx::query("UPDATE notes SET id_asset = 1 WHERE id_note = 1")
+            .execute(&mut connection)
+            .await
+            .expect("asset note");
+
+        assert!(single_tx(&mut connection).await.pool_values.is_empty());
     }
 
     #[tokio::test]
