@@ -110,6 +110,20 @@ jobs:
       - name: Test desktop target
         shell: bash
         run: ./gradlew :zcash-sdk:desktopTest -PzcashSdk.rustRelease=true --console=plain
+      - name: Refuse a native that links outside the OS
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          lib=zcash-sdk/build/rust/desktopResources/native/aarch64-apple-darwin/libzcash_sdk_kmp.dylib
+          commands=$(otool -arch all -l "$lib")
+          # A user's Mac has only the OS libraries: an absolute import elsewhere (Homebrew, /usr/local) fails to load.
+          # Only a canonical spelling counts as the OS: `..` cannot be resolved against the user's filesystem.
+          foreign=$(echo "$commands" | awk '
+            $1 == "cmd" { imports = $2 ~ /^LC_(LOAD|LOAD_WEAK|REEXPORT|LAZY_LOAD|LOAD_UPWARD)_DYLIB$/ }
+            imports && $1 == "name" { sub(/^[ \t]*name /, ""); sub(/ \(offset [0-9]+\)$/, "")
+                                      if (/^\// && (!/^\/(usr\/lib|System\/Library)\// || /\/(\.\.?)?(\/|$)/)) print }' | sort -u)
+          otool -arch all -L "$lib"
+          [ -z "$foreign" ] || { echo "::error::$lib links outside the OS: $foreign"; exit 1; }
       - name: Upload native library
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

@@ -14,7 +14,8 @@ class TransactionDtoTest {
             """
             [{"id":3,"txid":"ab0201","height":2500000,"time":1700000000,
               "value":-5000,"memo":"lunch","fee":15000,"totalReceived":1000,
-              "isChange":false,"recipient":"u1recipient"}]
+              "isChange":false,"recipient":"u1recipient",
+              "poolValues":[{"pool":0,"value":-153400},{"pool":2,"value":147400}]}]
             """
         )
 
@@ -31,6 +32,7 @@ class TransactionDtoTest {
                     totalReceived = 1_000,
                     isChange = false,
                     recipient = "u1recipient",
+                    poolValues = mapOf(Pool.TRANSPARENT to -153_400L, Pool.ORCHARD to 147_400L),
                 )
             ),
             transactions,
@@ -62,6 +64,17 @@ class TransactionDtoTest {
         assertEquals(0, transaction.totalReceived)
         assertFalse(transaction.isChange)
         assertNull(transaction.recipient)
+        assertEquals(emptyMap(), transaction.poolValues)
+    }
+
+    @Test
+    fun parseTransactions_unknownPoolCode_keepsTheKnownPools() {
+        val transaction = parseTransactions(
+            """[{"id":1,"txid":"00","height":1,"time":2,"value":10,
+              "poolValues":[{"pool":2,"value":10},{"pool":9,"value":0}]}]"""
+        ).single()
+
+        assertEquals(mapOf(Pool.ORCHARD to 10L), transaction.poolValues)
     }
 
     @Test

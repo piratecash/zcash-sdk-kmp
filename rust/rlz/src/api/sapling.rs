@@ -6,7 +6,7 @@ use anyhow::Result;
 use anyhow::{anyhow, Context};
 #[cfg(not(feature = "bundled-sapling-params"))]
 use std::{
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, Read, Write},
     path::Path,
     time::Duration,
 };
@@ -195,10 +195,12 @@ async fn download_param_file(
         }
         ResumePlan::Complete => {
             let _ = std::fs::remove_file(&part);
-            fetch_and_write(&client, &url, &part, None).await?;
+            fetch_and_write(&client, &url, &part, None, expected_len).await?;
         }
-        ResumePlan::Restart => fetch_and_write(&client, &url, &part, None).await?,
-        ResumePlan::Resume(offset) => fetch_and_write(&client, &url, &part, Some(offset)).await?,
+        ResumePlan::Restart => fetch_and_write(&client, &url, &part, None, expected_len).await?,
+        ResumePlan::Resume(offset) => {
+            fetch_and_write(&client, &url, &part, Some(offset), expected_len).await?
+        }
     }
 
     verify_downloaded_part(&part, expected_len, expected_hash, name)?;
@@ -225,6 +227,7 @@ async fn fetch_and_write(
     url: &str,
     part: &Path,
     offset: Option<u64>,
+    expected_len: u64,
 ) -> Result<()> {
     let mut request = client.get(url);
     if let Some(offset) = offset {
@@ -235,9 +238,9 @@ async fn fetch_and_write(
         .await
         .with_context(|| format!("Failed to request {url}"))?;
 
-    let append = match response.status() {
-        reqwest::StatusCode::PARTIAL_CONTENT if offset.is_some() => true,
-        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT => false,
+    let resumed_from = match response.status() {
+        reqwest::StatusCode::PARTIAL_CONTENT if offset.is_some() => offset,
+        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT => None,
         reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
             let _ = std::fs::remove_file(part);
             return Err(anyhow!("{url}: server rejected resume offset (416)"));
@@ -245,9 +248,10 @@ async fn fetch_and_write(
         status => return Err(anyhow!("{url}: unexpected HTTP status {status}")),
     };
 
-    let file =
-        open_part_file(part, append).with_context(|| format!("Failed to open {part:?} for writing"))?;
-    write_response_body(&mut response, file).await
+    let file = open_part_file(part, resumed_from.is_some())
+        .with_context(|| format!("Failed to open {part:?} for writing"))?;
+    let max_len = expected_len.saturating_sub(resumed_from.unwrap_or(0));
+    write_response_body(&mut response, file, part, max_len).await
 }
 
 #[cfg(not(feature = "bundled-sapling-params"))]
@@ -263,18 +267,60 @@ fn open_part_file(part: &Path, append: bool) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(feature = "bundled-sapling-params"))]
-async fn write_response_body(response: &mut reqwest::Response, file: std::fs::File) -> Result<()> {
-    let mut writer = BufWriter::new(file);
+async fn write_response_body(
+    response: &mut reqwest::Response,
+    file: std::fs::File,
+    part: &Path,
+    max_len: u64,
+) -> Result<()> {
+    match copy_capped(response, file, max_len).await {
+        Ok(()) => Ok(()),
+        Err(BodyError::Interrupted(error)) => Err(error),
+        Err(BodyError::Discard(error)) => match std::fs::remove_file(part) {
+            Ok(()) => Err(error),
+            Err(remove_error) => {
+                Err(error.context(format!("also failed to remove {part:?}: {remove_error}")))
+            }
+        },
+    }
+}
+
+#[cfg(not(feature = "bundled-sapling-params"))]
+enum BodyError {
+    /// The connection broke: what is on disk is a valid prefix to resume from.
+    Interrupted(anyhow::Error),
+    /// An over-long body or a local disk failure: the file can be neither trusted nor resumed.
+    Discard(anyhow::Error),
+}
+
+/// Never writes past `max_len`, so an endless body cannot fill the disk before verification.
+/// Writes go straight to the file: a buffer's flush on drop would swallow a disk error.
+#[cfg(not(feature = "bundled-sapling-params"))]
+async fn copy_capped(
+    response: &mut reqwest::Response,
+    mut file: std::fs::File,
+    max_len: u64,
+) -> Result<(), BodyError> {
+    let mut written = 0u64;
     while let Some(chunk) = response
         .chunk()
         .await
-        .context("Failed reading response chunk")?
+        .context("Failed reading response chunk")
+        .map_err(BodyError::Interrupted)?
     {
-        writer.write_all(&chunk).context("Failed writing chunk to disk")?;
+        written += chunk.len() as u64;
+        if written > max_len {
+            return Err(BodyError::Discard(anyhow!(
+                "Server sent more than the expected {max_len} bytes"
+            )));
+        }
+        file.write_all(&chunk)
+            .context("Failed writing chunk to disk")
+            .map_err(BodyError::Discard)?;
     }
-    writer.flush().context("Failed flushing part file")?;
-    writer.get_ref().sync_all().context("Failed to fsync part file")?;
-    Ok(())
+    file.sync_all()
+        .context("Failed to fsync part file")
+        .map_err(BodyError::Discard)
 }
 
 #[cfg(not(feature = "bundled-sapling-params"))]
@@ -358,13 +404,165 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_file(content: &[u8]) -> PathBuf {
+    fn temp_path() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rlz-sapling-test-{}-{n}", std::process::id()));
+        std::env::temp_dir().join(format!("rlz-sapling-test-{}-{n}", std::process::id()))
+    }
+
+    fn temp_file(content: &[u8]) -> PathBuf {
+        let path = temp_path();
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    fn http_response(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut response =
+            format!("HTTP/1.1 {status}\r\n{headers}Connection: close\r\n\r\n").into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// Answers one request with `response` verbatim, then closes the connection.
+    async fn serve_once(response: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!(
+            "http://{}/params",
+            listener.local_addr().expect("local addr")
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            // Drain the request first: closing with unread bytes resets the connection.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.expect("read request");
+                assert!(read > 0, "client closed before sending the request");
+                request.extend_from_slice(&buf[..read]);
+            }
+            socket.write_all(&response).await.expect("write response");
+        });
+        url
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client")
+    }
+
+    #[tokio::test]
+    async fn fetch_and_write_body_longer_than_expected_fails_and_removes_part() {
+        let part = temp_path();
+        let url = serve_once(http_response("200 OK", "", &[7; 101])).await;
+
+        assert!(fetch_and_write(&test_client(), &url, &part, None, 100)
+            .await
+            .is_err());
+        assert!(!part.exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_and_write_resumed_body_longer_than_remainder_fails_and_removes_part() {
+        let part = temp_file(&[1; 40]);
+        let url = serve_once(http_response("206 Partial Content", "", &[2; 61])).await;
+
+        assert!(fetch_and_write(&test_client(), &url, &part, Some(40), 100)
+            .await
+            .is_err());
+        assert!(!part.exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_and_write_resumed_body_with_exact_remainder_completes_part() {
+        let part = temp_file(&[1; 40]);
+        let url = serve_once(http_response("206 Partial Content", "", &[2; 60])).await;
+
+        fetch_and_write(&test_client(), &url, &part, Some(40), 100)
+            .await
+            .expect("resume");
+
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            [[1; 40].as_slice(), &[2; 60]].concat()
+        );
+        std::fs::remove_file(&part).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_write_full_body_for_range_request_restarts_from_zero() {
+        let part = temp_file(&[1; 40]);
+        let url = serve_once(http_response("200 OK", "", &[2; 100])).await;
+
+        fetch_and_write(&test_client(), &url, &part, Some(40), 100)
+            .await
+            .expect("restart");
+
+        assert_eq!(std::fs::read(&part).unwrap(), [2; 100]);
+        std::fs::remove_file(&part).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_write_connection_dropped_mid_body_keeps_part() {
+        let part = temp_path();
+        let url = serve_once(http_response("200 OK", "Content-Length: 100\r\n", &[3; 40])).await;
+
+        assert!(fetch_and_write(&test_client(), &url, &part, None, 100)
+            .await
+            .is_err());
+
+        assert_eq!(std::fs::read(&part).unwrap(), [3; 40]);
+        std::fs::remove_file(&part).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_response_body_disk_write_fails_removes_part() {
+        let part = temp_file(b"");
+        let url = serve_once(http_response("200 OK", "", &[4; 10])).await;
+        let mut response = test_client().get(&url).send().await.expect("response");
+        // A read-only handle makes the disk write fail on every platform.
+        let read_only = std::fs::File::open(&part).unwrap();
+
+        assert!(write_response_body(&mut response, read_only, &part, 100)
+            .await
+            .is_err());
+        assert!(!part.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_response_body_part_cannot_be_removed_reports_both_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_path();
+        std::fs::create_dir(&dir).unwrap();
+        let part = dir.join("params.part");
+        std::fs::write(&part, [1; 40]).unwrap();
+        // The open file stays writable, but a read-only directory refuses to unlink it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let url = serve_once(http_response("206 Partial Content", "", &[2; 61])).await;
+
+        let result = fetch_and_write(&test_client(), &url, &part, Some(40), 100).await;
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let message = format!("{:#}", result.expect_err("over-long body must fail"));
+        assert!(message.contains("failed to remove"), "{message}");
+        assert!(message.contains("more than the expected"), "{message}");
+    }
+
+    #[test]
+    fn verify_downloaded_part_hash_mismatch_removes_part() {
+        let part = temp_file(b"hello world");
+
+        assert!(verify_downloaded_part(&part, 11, "0000", "params").is_err());
+        assert!(!part.exists());
     }
 
     #[test]

@@ -117,6 +117,7 @@ internal data class TransactionDto(
     val totalReceived: Long = 0,
     val isChange: Boolean = false,
     val recipient: String? = null,
+    val poolValues: List<PoolValueDto> = emptyList(),
 ) {
     fun toTransaction(): Transaction = Transaction(
         id = id,
@@ -129,8 +130,13 @@ internal data class TransactionDto(
         totalReceived = totalReceived,
         isChange = isChange,
         recipient = recipient,
+        // A pool this SDK version does not know must not hide the rest of the history.
+        poolValues = poolValues.mapNotNull { dto -> dto.pool.toPoolOrNull()?.to(dto.value) }.toMap(),
     )
 }
+
+@Serializable
+internal data class PoolValueDto(val pool: Int, val value: Long)
 
 internal fun parseAccounts(json: String): List<AccountInfo> =
     nativeJson.decodeFromString<List<AccountDto>>(json).map(AccountDto::toAccountInfo)
@@ -143,6 +149,8 @@ internal fun parseAddresses(json: String): Addresses =
 
 internal fun encodeRecipients(recipients: List<Recipient>): String =
     nativeJson.encodeToString(recipients.map(Recipient::toDto))
+
+internal fun encodeAddresses(addresses: List<String>): String = nativeJson.encodeToString(addresses)
 
 internal fun parseTransactionPlan(json: String): TransactionPlan =
     nativeJson.decodeFromString<TxPlanDto>(json).toTransactionPlan()
@@ -382,8 +390,9 @@ internal fun LongArray.toPoolBalance(): PoolBalance =
 private const val BALANCE_FIELDS = 4
 
 /** [Pool.bit] is the wire index for a single pool (distinct from [PoolSet]'s bitmask). */
-private fun Int.toPool(): Pool =
-    checkNotNull(Pool.entries.firstOrNull { it.bit == this }) { "Unknown pool bit: $this" }
+private fun Int.toPool(): Pool = checkNotNull(toPoolOrNull()) { "Unknown pool bit: $this" }
+
+private fun Int.toPoolOrNull(): Pool? = Pool.entries.firstOrNull { it.bit == this }
 
 @Serializable
 internal data class MigrationStatusDto(

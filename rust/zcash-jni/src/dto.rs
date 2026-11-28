@@ -186,6 +186,13 @@ pub struct TxDto {
     pub total_received: u64,
     pub is_change: bool,
     pub recipient: Option<String>,
+    pub pool_values: Vec<PoolValueDto>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoolValueDto {
+    pub pool: u8,
+    pub value: i64,
 }
 
 impl From<&Tx> for TxDto {
@@ -208,6 +215,11 @@ impl From<&Tx> for TxDto {
             total_received: t.total_received,
             is_change: t.is_change,
             recipient: t.recipient.clone(),
+            pool_values: t
+                .pool_values
+                .iter()
+                .map(|&(pool, value)| PoolValueDto { pool, value })
+                .collect(),
         }
     }
 }
@@ -323,6 +335,7 @@ pub struct ServerProbeDto {
     pub info_ms: u64,
     pub range_ms: u64,
     pub range_blocks_received: u32,
+    pub latest_height: u32,
 }
 
 impl From<ServerProbe> for ServerProbeDto {
@@ -337,6 +350,7 @@ impl From<ServerProbe> for ServerProbeDto {
             info_ms: probe.info_ms,
             range_ms: probe.range_ms,
             range_blocks_received: probe.range_blocks_received,
+            latest_height: probe.latest_height,
         }
     }
 }
@@ -608,6 +622,7 @@ mod tests {
             info_ms: 30,
             range_ms: 20,
             range_blocks_received: 10,
+            latest_height: 805_800,
         });
 
         assert_eq!(
@@ -621,6 +636,7 @@ mod tests {
                 "infoMs": 30,
                 "rangeMs": 20,
                 "rangeBlocksReceived": 10,
+                "latestHeight": 805_800,
             }),
             serde_json::to_value(&dto).unwrap()
         );
@@ -740,6 +756,7 @@ mod tests {
             total_received: 1_000,
             is_change: false,
             recipient: Some("u1recipient".to_string()),
+            pool_values: Vec::new(),
         };
 
         let dto = TxDto::from(&tx);
@@ -774,10 +791,13 @@ mod tests {
             total_received: 1_000,
             is_change: true,
             recipient: None,
+            pool_values: vec![(0, -1_534), (2, 2_534)],
         };
 
         let json = serde_json::to_string(&TxDto::from(&tx)).unwrap();
 
+        assert!(json
+            .contains("\"poolValues\":[{\"pool\":0,\"value\":-1534},{\"pool\":2,\"value\":2534}]"));
         assert!(json.contains("\"totalReceived\":1000"));
         assert!(json.contains("\"isChange\":true"));
         assert!(json.contains("\"recipient\":null"));

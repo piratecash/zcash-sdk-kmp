@@ -153,8 +153,8 @@ async fn resolve_over_nym(tunnel: &Tunnel, host: &str) -> Result<Option<IpAddr>>
 /// `Ok(None)` means the server responded without a usable A record.
 async fn dns_query(tunnel: &Tunnel, host: &str) -> Result<Option<IpAddr>> {
     let udp = tunnel.udp_socket().await?;
-    let mut query = Message::new();
-    query.set_recursion_desired(true);
+    let mut query = Message::query();
+    query.metadata.recursion_desired = true;
     query.add_query(Query::query(Name::from_ascii(host)?, RecordType::A));
     udp.send_to(&query.to_vec()?, "1.1.1.1:53".parse()?).await?;
     let mut buf = [0u8; 1500];
@@ -179,8 +179,8 @@ fn dns_cache_put(host: &str, ip: IpAddr) {
 
 /// First A record in a DNS response, if any.
 fn first_a_record(msg: &Message) -> Option<IpAddr> {
-    msg.answers().iter().find_map(|record| match record.data() {
-        Some(RData::A(a)) => Some(IpAddr::V4(a.0)),
+    msg.answers.iter().find_map(|record| match &record.data {
+        RData::A(a) => Some(IpAddr::V4(a.0)),
         _ => None,
     })
 }
@@ -190,7 +190,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::str::FromStr;
 
-    use hickory_proto::op::{Message, MessageType, Query};
+    use hickory_proto::op::{Message, OpCode, Query};
     use hickory_proto::rr::{rdata, Name, RData, Record, RecordType};
 
     use super::*;
@@ -198,8 +198,7 @@ mod tests {
     #[test]
     fn first_a_record_skips_cname_and_picks_a() {
         let name = Name::from_str("example.com.").unwrap();
-        let mut msg = Message::new();
-        msg.set_message_type(MessageType::Response);
+        let mut msg = Message::response(0, OpCode::Query);
         msg.add_query(Query::query(name.clone(), RecordType::A));
         msg.add_answer(Record::from_rdata(
             name.clone(),
@@ -219,7 +218,7 @@ mod tests {
 
     #[test]
     fn first_a_record_none_when_no_a_answer() {
-        let msg = Message::new();
+        let msg = Message::query();
         assert_eq!(first_a_record(&msg), None);
     }
 

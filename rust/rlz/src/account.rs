@@ -7,9 +7,9 @@ use crate::{
     },
     bip38,
     db::{
-        init_account_orchard, init_account_sapling, init_account_transparent,
-        read_transparent_coverage, store_account_orchard_vk, store_account_sapling_vk,
-        store_account_seed_fingerprint, store_account_transparent_addr,
+        highest_stored_dindex, init_account_orchard, init_account_sapling,
+        init_account_transparent, read_transparent_coverage, store_account_orchard_vk,
+        store_account_sapling_vk, store_account_seed_fingerprint, store_account_transparent_addr,
         store_account_transparent_vk, transparent_address_is_used, update_dindex,
     },
     key::{
@@ -883,8 +883,9 @@ pub struct NextUnusedAddress {
     pub gap: u32,
 }
 
-/// The lowest receive-scope index of `account` that is neither used nor in `excluded`, stored so
-/// `transparent_sync` picks it up. `None` when the account has no transparent key.
+/// The lowest receive-scope index of `account` above `min_index_exclusive` that is neither used
+/// nor in `excluded`, stored so `transparent_sync` picks it up. `None` when the account has no
+/// transparent key.
 ///
 /// Candidates are derived, not read: discovery only stores addresses with history, so a wallet
 /// used at 0 and 2 has no row for 1 and a stored-rows-only query would answer 3.
@@ -898,6 +899,7 @@ pub async fn next_unused_receive_address(
     connection: &mut SqliteConnection,
     account: u32,
     excluded: &[String],
+    min_index_exclusive: Option<u32>,
 ) -> Result<Option<NextUnusedAddress>> {
     let (xsk, xvk) = get_transparent_keys(connection, account).await?;
     let Some(tvk) = xvk.as_ref() else {
@@ -911,11 +913,15 @@ pub async fn next_unused_receive_address(
     .fetch_one(&mut *connection)
     .await?;
 
-    // Pigeonhole bound, and the reason there is no fallback branch: at most `MAX(stored dindex)
-    // + 1` candidates can be used and at most `excluded.len()` more reserved, so the last index
-    // of this range can be neither.
-    let last = max_stored.map_or(0, |dindex| dindex + 1) + excluded.len() as u32;
-    for dindex in 0..=last {
+    // Pigeonhole bound, and the reason there is no fallback branch: above the floor at most
+    // `MAX(stored dindex) - floor` candidates can be used and at most `excluded.len()` more
+    // reserved, so the last index of this range can be neither.
+    let last = max_stored
+        .max(min_index_exclusive)
+        .map_or(0, |dindex| dindex + 1)
+        + excluded.len() as u32;
+    let first = min_index_exclusive.map_or(0, |floor| floor + 1);
+    for dindex in first..=last {
         let (pk, address) = derive_transparent_address(tvk, 0, dindex, false)?;
         let address = address.encode(network);
         if excluded.iter().any(|reserved| reserved == &address)
@@ -924,19 +930,14 @@ pub async fn next_unused_receive_address(
             continue;
         }
 
-        let sk = xsk
-            .as_ref()
-            .map(|tsk| derive_transparent_sk(tsk, 0, dindex))
-            .transpose()?;
-        store_account_transparent_addr(
+        store_derived_transparent_address(
             &mut *connection,
             account,
+            xsk.as_ref(),
             0,
             dindex,
-            sk,
             &pk,
             &address,
-            false,
         )
         .await?;
         let coverage = read_transparent_coverage(&mut *connection, account).await?;
@@ -976,21 +977,17 @@ async fn generate_next_transparent_address(
             .await?
             .map_or(0, |dindex| dindex + 1);
 
-            let sk = xsk
-                .as_ref()
-                .map(|tsk| derive_transparent_sk(tsk, scope, dindex).unwrap());
             let (pk, address) = derive_transparent_address(tvk, scope, dindex, false)?;
             let address = address.encode(network);
 
-            let stored = store_account_transparent_addr(
+            let stored = store_derived_transparent_address(
                 &mut *connection,
                 account,
+                xsk.as_ref(),
                 scope,
                 dindex,
-                sk,
                 &pk,
                 &address,
-                false,
             )
             .await?;
 
@@ -1005,6 +1002,62 @@ async fn generate_next_transparent_address(
     }
 
     Ok(None)
+}
+
+/// Stores every receive-scope address of `account` above the highest stored index through
+/// `through`, in one transaction, so `transparent_sync` polls them. Returns how many rows it
+/// created; 0 when the account has no transparent key.
+pub async fn reserve_receive_addresses_through(
+    network: &Network,
+    connection: &mut SqliteConnection,
+    account: u32,
+    through: u32,
+) -> Result<u32> {
+    let mut db_tx = connection.begin().await?;
+    let (xsk, xvk) = get_transparent_keys(&mut db_tx, account).await?;
+    let Some(tvk) = xvk.as_ref() else {
+        return Ok(0);
+    };
+
+    let first = highest_stored_dindex(&mut db_tx, account, 0)
+        .await?
+        .map_or(0, |dindex| dindex + 1);
+    let mut created = 0;
+    for dindex in first..=through {
+        let (pk, address) = derive_transparent_address(tvk, 0, dindex, false)?;
+        if store_derived_transparent_address(
+            &mut db_tx,
+            account,
+            xsk.as_ref(),
+            0,
+            dindex,
+            &pk,
+            &address.encode(network),
+        )
+        .await?
+        {
+            created += 1;
+        }
+    }
+    db_tx.commit().await?;
+
+    Ok(created)
+}
+
+/// Stores the row of an address the caller has already derived; `false` when it exists already.
+async fn store_derived_transparent_address(
+    connection: &mut SqliteConnection,
+    account: u32,
+    xsk: Option<&AccountPrivKey>,
+    scope: u32,
+    dindex: u32,
+    pk: &[u8],
+    address: &str,
+) -> Result<bool> {
+    let sk = xsk
+        .map(|tsk| derive_transparent_sk(tsk, scope, dindex))
+        .transpose()?;
+    store_account_transparent_addr(connection, account, scope, dindex, sk, pk, address, false).await
 }
 
 async fn get_transparent_keys(
@@ -2085,10 +2138,25 @@ pub(crate) mod tests {
         account: u32,
         excluded: &[String],
     ) -> NextUnusedAddress {
-        next_unused_receive_address(&Network::Main, connection, account, excluded)
-            .await
-            .expect("select")
-            .expect("the fixture account has a transparent key")
+        select_above(connection, account, excluded, None).await
+    }
+
+    async fn select_above(
+        connection: &mut SqliteConnection,
+        account: u32,
+        excluded: &[String],
+        min_index_exclusive: Option<u32>,
+    ) -> NextUnusedAddress {
+        next_unused_receive_address(
+            &Network::Main,
+            connection,
+            account,
+            excluded,
+            min_index_exclusive,
+        )
+        .await
+        .expect("select")
+        .expect("the fixture account has a transparent key")
     }
 
     #[tokio::test]
@@ -2221,9 +2289,10 @@ pub(crate) mod tests {
             .await
             .expect("restore sapling-only account");
 
-        let answer = next_unused_receive_address(&Network::Main, &mut connection, account, &[])
-            .await
-            .expect("select");
+        let answer =
+            next_unused_receive_address(&Network::Main, &mut connection, account, &[], None)
+                .await
+                .expect("select");
 
         assert!(answer.is_none());
     }
@@ -2281,6 +2350,172 @@ pub(crate) mod tests {
 
         assert!(!answer.certified);
         assert_eq!(answer.gap, 0);
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_with_a_floor_above_the_stored_rows_stores_the_next_index()
+    {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let expected = receive_address_at(&mut connection, account, 6).await;
+
+        let answer = select_above(&mut connection, account, &[], Some(5)).await;
+
+        assert_eq!(answer.address, expected);
+        assert!(
+            crate::db::transparent_address_row(&mut connection, account, 0, 6)
+                .await
+                .expect("row query")
+                .is_some(),
+            "the answer must be stored so transparent_sync picks it up"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_skips_an_unused_row_at_the_floor() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        store_receive_row(&mut connection, account, 1).await;
+        let expected = receive_address_at(&mut connection, account, 2).await;
+
+        let answer = select_above(&mut connection, account, &[], Some(1)).await;
+
+        assert_eq!(answer.address, expected);
+    }
+
+    #[tokio::test]
+    async fn next_unused_receive_address_with_a_floor_still_skips_an_excluded_address() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        let excluded = receive_address_at(&mut connection, account, 6).await;
+        let expected = receive_address_at(&mut connection, account, 7).await;
+
+        let answer = select_above(&mut connection, account, &[excluded], Some(5)).await;
+
+        assert_eq!(answer.address, expected);
+    }
+
+    async fn receive_rows(
+        connection: &mut SqliteConnection,
+        account: u32,
+    ) -> Vec<(u32, String, Vec<u8>, Option<Vec<u8>>)> {
+        sqlx::query_as(
+            "SELECT dindex, address, pk, sk FROM transparent_address_accounts
+            WHERE account = ? AND scope = 0 ORDER BY dindex",
+        )
+        .bind(account)
+        .fetch_all(&mut *connection)
+        .await
+        .expect("receive rows")
+    }
+
+    async fn reserve_through(connection: &mut SqliteConnection, account: u32, through: u32) -> u32 {
+        reserve_receive_addresses_through(&Network::Main, connection, account, through)
+            .await
+            .expect("reserve")
+    }
+
+    #[tokio::test]
+    async fn reserve_receive_addresses_through_creates_only_the_missing_rows() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+
+        assert_eq!(reserve_through(&mut connection, account, 3).await, 3);
+        let mut expected = vec![];
+        for dindex in 0..=3 {
+            expected.push(receive_address_at(&mut connection, account, dindex).await);
+        }
+        let stored: Vec<String> = receive_rows(&mut connection, account)
+            .await
+            .into_iter()
+            .map(|(_, address, _, _)| address)
+            .collect();
+        assert_eq!(stored, expected);
+    }
+
+    #[tokio::test]
+    async fn reserve_receive_addresses_through_is_idempotent() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        reserve_through(&mut connection, account, 3).await;
+
+        assert_eq!(reserve_through(&mut connection, account, 3).await, 0);
+        assert_eq!(reserve_through(&mut connection, account, 1).await, 0);
+        assert_eq!(reserve_through(&mut connection, account, 5).await, 2);
+        let dindexes: Vec<u32> = receive_rows(&mut connection, account)
+            .await
+            .into_iter()
+            .map(|(dindex, _, _, _)| dindex)
+            .collect();
+        assert_eq!(dindexes, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn reserve_receive_addresses_through_stores_the_row_the_allocator_would() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        reserve_through(&mut connection, account, 1).await;
+        let reserved = receive_rows(&mut connection, account).await;
+        sqlx::query("DELETE FROM transparent_address_accounts WHERE account = ? AND dindex = 1")
+            .bind(account)
+            .execute(&mut connection)
+            .await
+            .expect("drop the reserved row");
+
+        generate_next_receive_address(&Network::Main, &mut connection, account)
+            .await
+            .expect("allocate")
+            .expect("transparent key");
+
+        assert_eq!(receive_rows(&mut connection, account).await, reserved);
+    }
+
+    #[tokio::test]
+    async fn reserve_receive_addresses_through_rows_are_scanned_by_transparent_sync() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, None)
+            .await
+            .expect("restore");
+        reserve_through(&mut connection, account, 4).await;
+
+        let scanned: Vec<String> =
+            crate::db::transparent_addresses_to_scan(&mut connection, account, 0)
+                .await
+                .expect("scan set")
+                .into_iter()
+                .map(|(_, address)| address)
+                .collect();
+
+        for dindex in 0..=4 {
+            let address = receive_address_at(&mut connection, account, dindex).await;
+            assert!(
+                scanned.contains(&address),
+                "d{dindex} missing from {scanned:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reserve_receive_addresses_through_without_a_transparent_key_creates_nothing() {
+        let mut connection = memory_db().await;
+        let account = restore(&mut connection, TEST_PHRASE, 0, Some(2))
+            .await
+            .expect("restore sapling-only account");
+
+        assert_eq!(reserve_through(&mut connection, account, 3).await, 0);
+        assert!(receive_rows(&mut connection, account).await.is_empty());
     }
 
     #[tokio::test]

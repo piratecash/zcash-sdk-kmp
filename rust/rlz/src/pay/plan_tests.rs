@@ -42,15 +42,21 @@ pub(crate) enum BroadcastReply {
 }
 
 /// Reports heights from a script, its last entry repeating, and answers a broadcast as told.
+/// A `None` entry is a height read that fails.
 #[derive(Clone)]
 pub(crate) struct ScriptedServer {
-    heights: Arc<Mutex<VecDeque<u32>>>,
+    heights: Arc<Mutex<VecDeque<Option<u32>>>>,
     height_reads: Arc<AtomicUsize>,
     reply: BroadcastReply,
 }
 
 impl ScriptedServer {
     pub(crate) fn new(heights: &[u32], reply: BroadcastReply) -> Self {
+        let script: Vec<_> = heights.iter().copied().map(Some).collect();
+        Self::scripted(&script, reply)
+    }
+
+    pub(crate) fn scripted(heights: &[Option<u32>], reply: BroadcastReply) -> Self {
         Self {
             heights: Arc::new(Mutex::new(heights.iter().copied().collect())),
             height_reads: Arc::new(AtomicUsize::new(0)),
@@ -76,13 +82,12 @@ impl LwdServer for ScriptedServer {
     async fn latest_height(&mut self) -> Result<u32> {
         self.height_reads.fetch_add(1, Ordering::SeqCst);
         let mut heights = self.heights.lock().unwrap();
-        if heights.len() > 1 {
-            return Ok(heights.pop_front().expect("scripted height"));
-        }
-        heights
-            .front()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("height unavailable"))
+        let height = if heights.len() > 1 {
+            heights.pop_front().expect("scripted height")
+        } else {
+            heights.front().copied().flatten()
+        };
+        height.ok_or_else(|| anyhow::anyhow!("height unavailable"))
     }
 
     async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {
@@ -284,6 +289,31 @@ async fn plan_transaction_tip_is_last_block_before_nu7_builds_for_nu7() {
     let package = plan(
         &mut connection,
         &silent_server(&[tip]),
+        account,
+        Payment::to(address, 10_000),
+    )
+    .await
+    .expect("plan");
+
+    assert_eq!(
+        header_of(&package),
+        (NU7_BRANCH, 6, NU7_ACTIVATION + NU7_EXPIRY_DELTA)
+    );
+}
+
+/// A backend re-syncing from genesis answers `GetLatestBlock` with a height years old.
+const STALE_SERVER_TIP: u32 = 805_800;
+
+#[tokio::test]
+async fn plan_transaction_server_tip_below_scanned_height_targets_after_scanned_height() {
+    let scanned = NU7_ACTIVATION - 1;
+    let mut connection = memory_db().await;
+    let account = funded_account(&mut connection, scanned, &[50_000]).await;
+    let address = transparent_recipient(&mut connection, account).await;
+
+    let package = plan(
+        &mut connection,
+        &silent_server(&[STALE_SERVER_TIP]),
         account,
         Payment::to(address, 10_000),
     )
@@ -610,6 +640,25 @@ async fn max_sendable_dust_floor_follows_the_target_height() {
 
         assert_eq!(max, expected, "tip {tip}");
     }
+}
+
+#[tokio::test]
+async fn max_sendable_server_tip_below_scanned_height_uses_scanned_height_fee() {
+    let scanned = FIRST_REDUCED_TARGET - 1;
+    let mut connection = memory_db().await;
+    let account = funded_account(&mut connection, scanned, &[50_000, 999, 1_000]).await;
+    let address = transparent_recipient(&mut connection, account).await;
+    let server = silent_server(&[STALE_SERVER_TIP]);
+
+    let max = quote_max(&mut connection, &server, account, address).await;
+
+    assert_eq!(
+        max,
+        MaxSendable {
+            amount: 49_000,
+            fee: 2_000,
+        }
+    );
 }
 
 #[tokio::test]

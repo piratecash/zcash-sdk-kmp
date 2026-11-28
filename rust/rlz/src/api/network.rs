@@ -119,6 +119,9 @@ pub struct ServerProbe {
     pub info_ms: u64,
     pub range_ms: u64,
     pub range_blocks_received: u32,
+    /// What `GetLatestBlock` answered on the same connection; a lagging backend can report
+    /// a healthy `GetLightdInfo` while this lags far behind.
+    pub latest_height: u32,
 }
 
 /// Connects afresh and measures the server; the whole probe gives up after `timeout`.
@@ -150,6 +153,7 @@ async fn within<T>(timeout: Duration, probe: impl Future<Output = Result<T>>) ->
 async fn measure(client: &mut Client, started: Instant, range_blocks: u32) -> Result<ServerProbe> {
     let info = client.lightd_info().await?;
     let info_ms = started.elapsed().as_millis() as u64;
+    let latest_height = client.latest_height().await?;
 
     let range_started = Instant::now();
     let tip = info.block_height as u32;
@@ -172,6 +176,7 @@ async fn measure(client: &mut Client, started: Instant, range_blocks: u32) -> Re
         info_ms,
         range_ms,
         range_blocks_received,
+        latest_height,
     })
 }
 
@@ -249,6 +254,7 @@ mod tests {
         blocks_served: u32,
         range_delay: Duration,
         ranges: Arc<Mutex<Vec<(u32, u32)>>>,
+        latest_height: u32,
     }
 
     impl FakeLightwalletd {
@@ -266,6 +272,7 @@ mod tests {
                 blocks_served: u32::MAX,
                 range_delay: Duration::from_millis(20),
                 ranges: Arc::new(Mutex::new(vec![])),
+                latest_height: block_height as u32,
             }
         }
     }
@@ -277,7 +284,7 @@ mod tests {
         }
 
         async fn latest_height(&mut self) -> Result<u32> {
-            unimplemented!()
+            Ok(self.latest_height)
         }
 
         async fn block(&mut self, _network: &Network, _height: u32) -> Result<CompactBlock> {
@@ -370,8 +377,22 @@ mod tests {
         assert_eq!(probe.info_ms, 30);
         assert_eq!(probe.range_ms, 20);
         assert_eq!(probe.range_blocks_received, 10);
+        assert_eq!(probe.latest_height, NU6_HEIGHT as u32);
         let tip = NU6_HEIGHT as u32;
         assert_eq!(*server.ranges.lock().unwrap(), vec![(tip - 9, tip)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn measure_stale_latest_block_reports_it_beside_the_info_height() {
+        let server = FakeLightwalletd {
+            latest_height: 805_800,
+            ..FakeLightwalletd::new(NU6_HEIGHT, NU6_BRANCH_ID)
+        };
+
+        let probe = measure_fake(&server, 10).await.expect("probe");
+
+        assert_eq!(probe.block_height, NU6_HEIGHT);
+        assert_eq!(probe.latest_height, 805_800);
     }
 
     #[tokio::test(start_paused = true)]

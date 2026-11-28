@@ -8,6 +8,7 @@ import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.absolutePathString
@@ -16,6 +17,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -24,6 +26,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 
 /** Published BIP-39 test vector (all-zero entropy) — never holds funds. */
@@ -46,9 +49,10 @@ private val JSONRPC_ID = Regex(""""id"\s*:\s*("[^"]*"|[0-9]+)""")
 
 /**
  * A Zebra stand-in on loopback that answers the JSON-RPC calls a discovery walk makes and records
- * how many address probes were ever on the wire at once.
+ * how many address probes were ever on the wire at once, and which methods it was asked.
  */
 private class LoopbackZebra : AutoCloseable {
+    private val asked = ConcurrentLinkedQueue<String>()
     private val inFlight = AtomicInteger()
     private val peakSeen = AtomicInteger()
     private val executor = Executors.newCachedThreadPool()
@@ -63,6 +67,8 @@ private class LoopbackZebra : AutoCloseable {
 
     val peak: Int get() = peakSeen.get()
 
+    val methods: List<String> get() = asked.toList()
+
     override fun close() {
         server.stop(0)
         executor.shutdownNow()
@@ -72,6 +78,7 @@ private class LoopbackZebra : AutoCloseable {
         val body = requestBody.use { it.readBytes() }.decodeToString()
         val method = JSONRPC_METHOD.find(body)?.groupValues?.get(1).orEmpty()
         val id = JSONRPC_ID.find(body)?.groupValues?.get(1) ?: "\"1\""
+        asked += method
         val payload = when (method) {
             "getblockcount" -> """{"result":$LOOPBACK_TIP,"error":null,"id":$id}"""
             "getaddresstxids" -> {
@@ -359,6 +366,61 @@ class ZcashWalletIntegrationTest {
         assertTrue(second.address.startsWith("t1"))
         assertNotEquals(first.address, second.address)
     }
+
+    @Test
+    fun nextUnusedTransparentAddress_withAFloor_returnsTheIndexPastIt() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        val answer = assertNotNull(wallet.nextUnusedTransparentAddress(id, emptyList(), minIndexExclusive = 5))
+
+        assertEquals(6, wallet.transparentAddressIndex(id, answer.address))
+    }
+
+    @Test
+    fun nextUnusedTransparentAddress_negativeFloor_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> {
+            wallet.nextUnusedTransparentAddress(id, emptyList(), minIndexExclusive = -1)
+        }
+    }
+
+    @Test
+    fun nextUnusedTransparentAddress_floorAtTheLastIndex_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> {
+            wallet.nextUnusedTransparentAddress(id, emptyList(), minIndexExclusive = Int.MAX_VALUE)
+        }
+    }
+
+    @Test
+    fun reserveTransparentAddressesThrough_freshAccount_storesOnlyTheMissingRows() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        assertEquals(0, wallet.highestStoredTransparentAddressIndex(id))
+
+        assertEquals(3, wallet.reserveTransparentAddressesThrough(id, 3))
+        assertEquals(0, wallet.reserveTransparentAddressesThrough(id, 3))
+
+        assertEquals(3, wallet.highestStoredTransparentAddressIndex(id))
+        assertNull(wallet.highestUsedTransparentAddressIndex(id))
+    }
+
+    @Test
+    fun reserveTransparentAddressesThrough_negativeIndex_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> { wallet.reserveTransparentAddressesThrough(id, -1) }
+    }
+
+    @Test
+    fun discoverTransparentAddressRange_emptyOrNegativeRange_isRejectedBeforeTheNativeCall() =
+        withWallet { wallet ->
+            val id = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+            assertFailsWith<IllegalArgumentException> { wallet.discoverTransparentAddressRange(id, 5, 5) }
+            assertFailsWith<IllegalArgumentException> { wallet.discoverTransparentAddressRange(id, -1, 5) }
+        }
 
     @Test
     fun transparentCoverage_onAFreshAccount_reportsUncertified() = withWallet { wallet ->
@@ -1243,6 +1305,32 @@ class ZcashWalletIntegrationTest {
         }
 
     @Test
+    fun rememberSentAddresses_unifiedAddress_succeeds() = withWallet { wallet ->
+        val account = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+        val address = assertNotNull(wallet.addresses(account).unified)
+
+        wallet.rememberSentAddresses(account, FOREIGN_TRANSACTION_HEX.hexToBytes(), listOf(address))
+    }
+
+    @Test
+    fun rememberSentAddresses_blankAddress_isRejectedBeforeTheNativeCall() = withWallet { wallet ->
+        val account = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<IllegalArgumentException> {
+            wallet.rememberSentAddresses(account, FOREIGN_TRANSACTION_HEX.hexToBytes(), listOf(" "))
+        }
+    }
+
+    @Test
+    fun rememberSentAddresses_invalidAddress_fails() = withWallet { wallet ->
+        val account = wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
+
+        assertFailsWith<ZcashException> {
+            wallet.rememberSentAddresses(account, FOREIGN_TRANSACTION_HEX.hexToBytes(), listOf("not-an-address"))
+        }
+    }
+
+    @Test
     fun reserveForBroadcast_foreignTransactionByDefault_isRejected() = withWallet { wallet ->
         val account =
             wallet.restoreAccount(name = "vector", key = TEST_PHRASE, birthHeight = BIRTH_HEIGHT)
@@ -1338,6 +1426,25 @@ class ZcashWalletIntegrationTest {
             zebra.close()
         }
     }
+
+    /** `z_gettreestate` is left unanswered, so the pass fails right after crossing into native. */
+    @Test
+    fun sync_explicitBlockDownload_reachesTheNativeSynchronize() =
+        LoopbackZebra().use { zebra ->
+            withWallet(ServerType.ZEBRA, zebra.url) { wallet ->
+                val account = wallet.restoreAccount(
+                    name = "vector",
+                    key = TEST_PHRASE,
+                    birthHeight = BIRTH_HEIGHT,
+                )
+
+                val states =
+                    wallet.sync(listOf(account), blockDownload = BlockDownload(2, 8)).toList()
+
+                assertIs<SyncState.Failed>(states.last())
+                assertTrue("z_gettreestate" in zebra.methods, zebra.methods.toString())
+            }
+        }
 
     @Test
     fun setServer_fromAnUnreachableServerToLoopbackZebra_latestHeightSucceeds() =
@@ -1448,7 +1555,7 @@ class ZcashWalletIntegrationTest {
         val probe = parseServerProbe(
             """{"chainName":"main","saplingActivationHeight":419200,"consensusBranchId":"c8e71055",""" +
                 """"blockHeight":2800000,"estimatedHeight":2800001,"branchIdMatches":true,""" +
-                """"infoMs":30,"rangeMs":20,"rangeBlocksReceived":10}"""
+                """"infoMs":30,"rangeMs":20,"rangeBlocksReceived":10,"latestHeight":805800}"""
         )
 
         assertEquals(
@@ -1462,6 +1569,7 @@ class ZcashWalletIntegrationTest {
                 infoMs = 30,
                 rangeMs = 20,
                 rangeBlocksReceived = 10,
+                latestHeight = 805_800,
             ),
             probe,
         )

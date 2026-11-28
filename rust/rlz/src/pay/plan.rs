@@ -328,6 +328,20 @@ async fn notes_in_source_pools(
     Ok(input_pools)
 }
 
+/// The next block is the earliest a transaction can be mined in, so it decides the branch and the
+/// fee. A lagging server must not pull it below the height this account has already scanned.
+async fn target_height(
+    connection: &mut SqliteConnection,
+    client: &mut Client,
+    account: u32,
+) -> Result<u32> {
+    let tip = client.latest_height().await?;
+    let scanned = crate::db::get_sync_height(connection, account)
+        .await?
+        .unwrap_or_default();
+    Ok(tip.max(scanned).saturating_add(1))
+}
+
 /// What sending every spendable ZEC note to `recipient` delivers. Reach it with
 /// `recipient_pays_fee` and `amount + fee`: a plain plan for `amount` may leave a note behind.
 pub async fn max_sendable(
@@ -338,7 +352,7 @@ pub async fn max_sendable(
     recipient: &Recipient,
     options: &PaymentOptions,
 ) -> Result<MaxSendable> {
-    let target_height = client.latest_height().await?.saturating_add(1);
+    let target_height = target_height(connection, client, account).await?;
     let mut input_pools = notes_in_source_pools(
         connection,
         account,
@@ -415,8 +429,7 @@ pub async fn plan_transaction(
     external_pczt_signing: bool,
 ) -> Result<PcztPackage> {
     let usable_pools = usable_pools(external_pczt_signing);
-    // The next block is the earliest this can be mined in, so it decides the branch and the fee.
-    let target_height = client.latest_height().await?.saturating_add(1);
+    let target_height = target_height(connection, client, account).await?;
     let cost = cost_per_action(network, target_height);
     let mut input_pools = notes_in_source_pools(
         connection,

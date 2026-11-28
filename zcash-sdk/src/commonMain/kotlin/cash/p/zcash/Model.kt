@@ -113,6 +113,17 @@ public data class AccountInfo(
 /** The last block a running sync reported. */
 public data class SyncProgress(val height: Int, val time: Long)
 
+/**
+ * Limits of a sync's compact-block download over a direct lightwalletd connection: at most
+ * [maxStreams] block streams open at once, and about [bufferMegabytes] MiB of blocks held ahead of
+ * the scan (a target, not a hard cap: blocks that fill a gap at the head are still read). Values
+ * below 1 are treated as 1. Tor, Zebra and Nym servers always use one stream.
+ */
+public data class BlockDownload(
+    val maxStreams: Int = 16,
+    val bufferMegabytes: Int = 128,
+)
+
 /** One payment output. [pools] picks which pool receives it; `null` derives that from the address. */
 public data class Recipient(
     val address: String,
@@ -167,6 +178,8 @@ public data class Transaction(
     val isChange: Boolean,
     /** First output that is not ours; null until transaction details are fetched. */
     val recipient: String?,
+    /** Net zatoshi per pool this account touched here; the values sum to [value]. */
+    public val poolValues: Map<Pool, Long> = emptyMap(),
 )
 
 /** What [ZcashWallet.plan] reports before a transaction is signed or broadcast. */
@@ -524,6 +537,11 @@ public data class ServerProbe(
     public val infoMs: Long,
     public val rangeMs: Long,
     public val rangeBlocksReceived: Int,
+    /**
+     * What `GetLatestBlock` answered on the same connection. A lagging backend behind a balancer
+     * can report it far below [blockHeight].
+     */
+    public val latestHeight: Int,
 )
 
 @Serializable
@@ -537,6 +555,7 @@ internal data class ServerProbeDto(
     val infoMs: Long,
     val rangeMs: Long,
     val rangeBlocksReceived: Int,
+    val latestHeight: Int,
 ) {
     fun toServerProbe(): ServerProbe = ServerProbe(
         chainName = chainName,
@@ -548,6 +567,7 @@ internal data class ServerProbeDto(
         infoMs = infoMs,
         rangeMs = rangeMs,
         rangeBlocksReceived = rangeBlocksReceived,
+        latestHeight = latestHeight,
     )
 }
 
